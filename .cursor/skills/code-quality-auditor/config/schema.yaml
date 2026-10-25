@@ -1,0 +1,64 @@
+# Configuration schema notes. version 1.1.0
+version: 1
+documents:
+  metrics:
+    required:
+      - "version"
+      - "metrics"
+    item_required:
+      - "id"
+      - "sector"
+      - "name"
+      - "description"
+      - "criticality"
+      - "verifies"
+      - "calculation"
+      - "result_range"
+      - "red_line"
+      - "evaluation_method"
+      - "recommended_tools"
+      - "applicability"
+      - "evidence_requirements"
+      - "kind"
+      - "classification"
+  checks:
+    required:
+      - "version"
+      - "checks"
+    item_required:
+      - "id"
+      - "description"
+      - "metrics"
+      - "evidence"
+      - "languages"
+      - "tools"
+      - "depends_on"
+      - "default_enabled"
+  tools:
+    required:
+      - "version"
+      - "registry_version"
+      - "tools"
+    item_required:
+      - "id"
+      - "purpose"
+      - "languages"
+      - "checks"
+      - "prerequisites"
+      - "inputs"
+      - "outputs"
+      - "version_constraint"
+      - "cost_class"
+      - "safety"
+  quality_auditor:
+    required:
+      - "version"
+      - "default_profile"
+      - "profiles"
+    security_not_overridable:
+      - "allow_tools"
+      - "allow_repo_execution"
+      - "sandbox_confirmed"
+      - "allow_install"
+      - "allow_network"
+      - "allow_write"

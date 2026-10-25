@@ -1,0 +1,44 @@
+# Example project configuration. Registries stay with the skill and are not copied here.
+version: 1
+default_profile: full
+scope: repository
+languages: []
+paths: []
+thresholds:
+  TEST-002: 90
+budgets:
+  time_seconds: 900
+  concurrency: 4
+  max_retries: 2
+  retry_backoff_seconds: 0.2
+  task_timeout_seconds: 120
+architecture:
+  layers:
+    - name: domain
+      paths:
+        - src/domain
+      allowed_dependencies: []
+    - name: api
+      paths:
+        - src/api
+      allowed_dependencies:
+        - domain
+exceptions:
+  - id: EX-EXAMPLE
+    metric_id: CC-014
+    file: src/legacy.py
+    justification: Third-party snippet retained until the license review finishes.
+    scope: file
+profiles:
+  pre-release:
+    extends: full
+    exclude:
+      - performance_benchmarks
+    scope: repository
+  deep-quant:
+    extends: expensive
+    include:
+      - quantitative
+      - mutation_testing
+      - requirements_trace
+check_overrides: {}

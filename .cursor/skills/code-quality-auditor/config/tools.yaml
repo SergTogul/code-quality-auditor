@@ -1,0 +1,403 @@
+# Approved analyzer registry. version 1.1.0. This file does not authorize downloads or execution.
+version: 1
+registry_version: "1.1.0"
+tools:
+  cqa-builtin:
+    id: "cqa-builtin"
+    purpose: "In-process static analysis and orchestration"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    checks:
+      - "syntax_static"
+      - "symbol_index"
+      - "dead_code"
+      - "clean_code"
+      - "architecture"
+      - "duplication"
+      - "semantic_duplication"
+      - "secrets"
+      - "security_sast"
+      - "dependency_audit"
+      - "insecure_config"
+      - "testing"
+      - "coverage"
+      - "concurrency"
+      - "requirements_trace"
+      - "ai_evaluation"
+      - "performance_benchmarks"
+      - "maintainability"
+      - "observability"
+      - "reliability"
+      - "quantitative"
+    prerequisites:
+      - "Python 3.12+ proposed runtime"
+    inputs: "Repository source files"
+    outputs: "Findings, graph, and metric measurements"
+    version_constraint: "1.1.0"
+    cost_class: "cheap"
+    safety: "Read-only. Does not install software and does not execute repository code unless a separate authorized sandbox run is requested."
+  ruff:
+    id: "ruff"
+    purpose: "Python lint and format checks"
+    languages:
+      - "python"
+    checks:
+      - "syntax_static"
+      - "clean_code"
+      - "reliability"
+    prerequisites:
+      - "ruff on PATH"
+    inputs: "Python source"
+    outputs: "JSON diagnostics"
+    version_constraint: ">=0.6"
+    cost_class: "cheap"
+    safety: "Approved static analyzer. Running it requires tool approval. The registry does not authorize installation."
+  vulture:
+    id: "vulture"
+    purpose: "Python unused-code analysis"
+    languages:
+      - "python"
+    checks:
+      - "symbol_index"
+      - "dead_code"
+      - "architecture"
+    prerequisites:
+      - "vulture on PATH"
+    inputs: "Python source"
+    outputs: "Unused-name report"
+    version_constraint: ">=2.0"
+    cost_class: "cheap"
+    safety: "Corroborates dead code. Dynamic behavior remains uncertain. Tool approval required."
+  semgrep:
+    id: "semgrep"
+    purpose: "Multi-language static security rules"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    checks:
+      - "security_sast"
+      - "insecure_config"
+    prerequisites:
+      - "semgrep on PATH and local rules"
+    inputs: "Source files"
+    outputs: "JSON findings"
+    version_constraint: ">=1.50"
+    cost_class: "moderate"
+    safety: "Do not download remote rules without network approval. Tool approval required."
+  bandit:
+    id: "bandit"
+    purpose: "Python security patterns"
+    languages:
+      - "python"
+    checks:
+      - "security_sast"
+      - "insecure_config"
+    prerequisites:
+      - "bandit on PATH"
+    inputs: "Python source"
+    outputs: "JSON findings"
+    version_constraint: ">=1.7"
+    cost_class: "cheap"
+    safety: "Static only. Tool approval required."
+  jscpd:
+    id: "jscpd"
+    purpose: "Copy-paste detection"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    checks:
+      - "duplication"
+      - "semantic_duplication"
+    prerequisites:
+      - "jscpd on PATH"
+    inputs: "Source files"
+    outputs: "JSON clone report"
+    version_constraint: ">=3.0"
+    cost_class: "moderate"
+    safety: "Corroborates duplication. Tool approval required."
+  knip:
+    id: "knip"
+    purpose: "JavaScript and TypeScript unused exports"
+    languages:
+      - "javascript"
+      - "typescript"
+    checks:
+      - "symbol_index"
+      - "dead_code"
+      - "architecture"
+    prerequisites:
+      - "knip on PATH"
+    inputs: "JS/TS project"
+    outputs: "Unused export report"
+    version_constraint: ">=5.0"
+    cost_class: "moderate"
+    safety: "Does not execute application code. Tool approval required."
+  eslint:
+    id: "eslint"
+    purpose: "JavaScript and TypeScript lint"
+    languages:
+      - "javascript"
+      - "typescript"
+    checks:
+      - "syntax_static"
+      - "clean_code"
+      - "reliability"
+    prerequisites:
+      - "eslint on PATH"
+    inputs: "JS/TS source"
+    outputs: "JSON diagnostics"
+    version_constraint: ">=8.0"
+    cost_class: "cheap"
+    safety: "Use the repository config only as data. Tool approval required."
+  clang-tidy:
+    id: "clang-tidy"
+    purpose: "C++ static analysis"
+    languages:
+      - "cpp"
+    checks:
+      - "symbol_index"
+      - "dead_code"
+      - "clean_code"
+      - "architecture"
+      - "reliability"
+    prerequisites:
+      - "clang-tidy on PATH"
+    inputs: "C++ translation units"
+    outputs: "Diagnostics"
+    version_constraint: ">=16"
+    cost_class: "expensive"
+    safety: "Do not run repository build scripts. Tool approval required."
+  clang:
+    id: "clang"
+    purpose: "C++ parse check"
+    languages:
+      - "cpp"
+    checks:
+      - "syntax_static"
+    prerequisites:
+      - "clang on PATH"
+    inputs: "C++ source"
+    outputs: "Syntax diagnostics"
+    version_constraint: ">=16"
+    cost_class: "moderate"
+    safety: "Invoke -fsyntax-only only. Do not link or run the program. Tool approval required."
+  pytest:
+    id: "pytest"
+    purpose: "Python test runner"
+    languages:
+      - "python"
+    checks:
+      - "testing"
+      - "concurrency"
+      - "quantitative"
+    prerequisites:
+      - "pytest on PATH"
+    inputs: "Python tests"
+    outputs: "JUnit or console result"
+    version_constraint: ">=7.0"
+    cost_class: "moderate"
+    safety: "Executes repository tests. Requires repository-execution approval and a real sandbox."
+  jest:
+    id: "jest"
+    purpose: "JavaScript and TypeScript test runner"
+    languages:
+      - "javascript"
+      - "typescript"
+    checks:
+      - "testing"
+      - "concurrency"
+      - "quantitative"
+    prerequisites:
+      - "jest on PATH"
+    inputs: "JS/TS tests"
+    outputs: "JSON result"
+    version_constraint: ">=29.0"
+    cost_class: "moderate"
+    safety: "Executes repository tests. Requires repository-execution approval and a real sandbox."
+  ctest:
+    id: "ctest"
+    purpose: "C++ test runner"
+    languages:
+      - "cpp"
+    checks:
+      - "testing"
+      - "concurrency"
+      - "quantitative"
+    prerequisites:
+      - "ctest on PATH"
+    inputs: "CTest tests"
+    outputs: "Console result"
+    version_constraint: ">=3.20"
+    cost_class: "moderate"
+    safety: "Executes repository tests. Requires repository-execution approval and a real sandbox."
+  coverage:
+    id: "coverage"
+    purpose: "Python line and branch coverage"
+    languages:
+      - "python"
+    checks:
+      - "coverage"
+    prerequisites:
+      - "coverage on PATH"
+    inputs: "Python tests"
+    outputs: "Coverage JSON"
+    version_constraint: ">=7.0"
+    cost_class: "moderate"
+    safety: "Executes repository tests. Requires repository-execution approval and a real sandbox."
+  c8:
+    id: "c8"
+    purpose: "JavaScript and TypeScript coverage"
+    languages:
+      - "javascript"
+      - "typescript"
+    checks:
+      - "coverage"
+    prerequisites:
+      - "c8 or nyc on PATH"
+    inputs: "JS/TS tests"
+    outputs: "Coverage JSON"
+    version_constraint: ">=8.0"
+    cost_class: "moderate"
+    safety: "Executes repository tests. Requires repository-execution approval and a real sandbox."
+  mutmut:
+    id: "mutmut"
+    purpose: "Python mutation testing"
+    languages:
+      - "python"
+    checks:
+      - "mutation_testing"
+    prerequisites:
+      - "mutmut on PATH"
+    inputs: "Python tests and source"
+    outputs: "Mutation score"
+    version_constraint: ">=2.4"
+    cost_class: "expensive"
+    safety: "Executes mutated repository code. Requires repository-execution approval and a real sandbox."
+  stryker:
+    id: "stryker"
+    purpose: "JavaScript and TypeScript mutation testing"
+    languages:
+      - "javascript"
+      - "typescript"
+    checks:
+      - "mutation_testing"
+    prerequisites:
+      - "stryker on PATH"
+    inputs: "JS/TS tests and source"
+    outputs: "Mutation score"
+    version_constraint: ">=8.0"
+    cost_class: "expensive"
+    safety: "Executes mutated repository code. Requires repository-execution approval and a real sandbox."
+  pip-audit:
+    id: "pip-audit"
+    purpose: "Python dependency advisories"
+    languages:
+      - "python"
+    checks:
+      - "dependency_audit"
+    prerequisites:
+      - "pip-audit on PATH and a local database or approved network"
+    inputs: "Python dependency manifests"
+    outputs: "Advisory JSON"
+    version_constraint: ">=2.6"
+    cost_class: "moderate"
+    safety: "Do not install dependencies. Network access requires separate approval."
+  npm-audit:
+    id: "npm-audit"
+    purpose: "JavaScript dependency advisories"
+    languages:
+      - "javascript"
+      - "typescript"
+    checks:
+      - "dependency_audit"
+    prerequisites:
+      - "npm on PATH and approved network or a local advisory file"
+    inputs: "package manifests"
+    outputs: "Advisory JSON"
+    version_constraint: ">=9.0"
+    cost_class: "moderate"
+    safety: "Do not run package lifecycle scripts. Network access requires separate approval."
+  gitleaks:
+    id: "gitleaks"
+    purpose: "Secret detection"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    checks:
+      - "secrets"
+    prerequisites:
+      - "gitleaks on PATH"
+    inputs: "Source and history"
+    outputs: "Secret findings"
+    version_constraint: ">=8.0"
+    cost_class: "cheap"
+    safety: "Read-only scan. Tool approval required. Findings stay redacted in reports."
+  detect-secrets:
+    id: "detect-secrets"
+    purpose: "Secret detection"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    checks:
+      - "secrets"
+    prerequisites:
+      - "detect-secrets on PATH"
+    inputs: "Source files"
+    outputs: "Secret findings"
+    version_constraint: ">=1.4"
+    cost_class: "cheap"
+    safety: "Read-only scan. Tool approval required."
+  radon:
+    id: "radon"
+    purpose: "Python complexity"
+    languages:
+      - "python"
+    checks:
+      - "clean_code"
+      - "reliability"
+    prerequisites:
+      - "radon on PATH"
+    inputs: "Python source"
+    outputs: "Complexity JSON"
+    version_constraint: ">=6.0"
+    cost_class: "cheap"
+    safety: "Static only. Tool approval required."
+  pytest-benchmark:
+    id: "pytest-benchmark"
+    purpose: "Python benchmarks"
+    languages:
+      - "python"
+    checks:
+      - "performance_benchmarks"
+    prerequisites:
+      - "pytest-benchmark installed in an approved environment"
+    inputs: "Benchmark tests"
+    outputs: "Benchmark JSON"
+    version_constraint: ">=4.0"
+    cost_class: "expensive"
+    safety: "Executes repository code. Requires repository-execution approval and a real sandbox."
+  google-benchmark:
+    id: "google-benchmark"
+    purpose: "C++ benchmarks"
+    languages:
+      - "cpp"
+    checks:
+      - "performance_benchmarks"
+    prerequisites:
+      - "built benchmark binary supplied by an approved build"
+    inputs: "Benchmark binary"
+    outputs: "Console measurements"
+    version_constraint: ">=1.8"
+    cost_class: "expensive"
+    safety: "Running a repository binary requires repository-execution approval and a real sandbox. The auditor does not build it."

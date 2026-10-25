@@ -1,0 +1,524 @@
+# Authoritative check registry. version 1.1.0
+version: 1
+checks:
+  syntax_static:
+    id: "syntax_static"
+    description: "Parse supported source and report confirmed syntax errors."
+    metrics:
+      - "REL-004"
+    evidence:
+      - "parser diagnostics"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "cqa-builtin"
+      - "ruff"
+      - "eslint"
+      - "clang"
+    depends_on: []
+    default_enabled: true
+  symbol_index:
+    id: "symbol_index"
+    description: "Build the shared cross-language code graph and its completeness record."
+    metrics:
+      - "GRAPH-005"
+      - "GRAPH-006"
+      - "GRAPH-007"
+      - "GRAPH-008"
+    evidence:
+      - "code graph"
+      - "completeness record"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "cqa-builtin"
+      - "vulture"
+      - "knip"
+      - "clang-tidy"
+    depends_on:
+      - "syntax_static"
+    default_enabled: true
+  dead_code:
+    id: "dead_code"
+    description: "Find unreachable functions, classes, modules, and constant-dead branches."
+    metrics:
+      - "GRAPH-001"
+      - "GRAPH-002"
+      - "GRAPH-003"
+      - "GRAPH-004"
+    evidence:
+      - "reachability"
+      - "control-flow constants"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "cqa-builtin"
+      - "vulture"
+      - "knip"
+      - "clang-tidy"
+    depends_on:
+      - "symbol_index"
+    default_enabled: true
+  clean_code:
+    id: "clean_code"
+    description: "Measure naming, size, complexity, consistency, unused names, and commented-out code."
+    metrics:
+      - "CC-001"
+      - "CC-002"
+      - "CC-003"
+      - "CC-004"
+      - "CC-005"
+      - "CC-006"
+      - "CC-007"
+      - "CC-008"
+      - "CC-009"
+      - "CC-010"
+      - "CC-011"
+      - "CC-012"
+      - "CC-013"
+      - "CC-014"
+    evidence:
+      - "symbol table"
+      - "style scan"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "cqa-builtin"
+      - "ruff"
+      - "eslint"
+      - "radon"
+      - "clang-tidy"
+    depends_on:
+      - "syntax_static"
+      - "symbol_index"
+    default_enabled: true
+  architecture:
+    id: "architecture"
+    description: "Evaluate SOLID signals, coupling, cohesion, layering, and dependency direction."
+    metrics:
+      - "ARCH-001"
+      - "ARCH-002"
+      - "ARCH-003"
+      - "ARCH-004"
+      - "ARCH-005"
+      - "ARCH-006"
+      - "ARCH-007"
+      - "ARCH-008"
+      - "ARCH-009"
+      - "ARCH-010"
+      - "ARCH-011"
+      - "ARCH-012"
+    evidence:
+      - "import graph"
+      - "layer rules"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "cqa-builtin"
+      - "vulture"
+      - "knip"
+      - "clang-tidy"
+    depends_on:
+      - "symbol_index"
+    default_enabled: true
+  duplication:
+    id: "duplication"
+    description: "Detect exact, token, and structural duplication."
+    metrics:
+      - "DUP-001"
+      - "DUP-002"
+      - "DUP-003"
+    evidence:
+      - "clone groups"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "cqa-builtin"
+      - "jscpd"
+    depends_on:
+      - "syntax_static"
+    default_enabled: true
+  semantic_duplication:
+    id: "semantic_duplication"
+    description: "Investigate semantic and cross-language redundancy without treating similarity as proof."
+    metrics:
+      - "DUP-004"
+      - "DUP-005"
+      - "DUP-006"
+    evidence:
+      - "candidate pairs"
+      - "justification records"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "cqa-builtin"
+      - "jscpd"
+    depends_on:
+      - "duplication"
+      - "symbol_index"
+    default_enabled: true
+  secrets:
+    id: "secrets"
+    description: "Detect confirmed secrets and hard-coded credentials."
+    metrics:
+      - "SEC-001"
+      - "SEC-007"
+    evidence:
+      - "redacted match"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "cqa-builtin"
+      - "gitleaks"
+      - "detect-secrets"
+    depends_on:
+      - "syntax_static"
+    default_enabled: true
+  security_sast:
+    id: "security_sast"
+    description: "Detect injection, validation, authorization, deserialization, traversal, XSS, and crypto issues."
+    metrics:
+      - "SEC-003"
+      - "SEC-004"
+      - "SEC-005"
+      - "SEC-008"
+      - "SEC-009"
+      - "SEC-010"
+      - "SEC-011"
+    evidence:
+      - "sink locations"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "cqa-builtin"
+      - "semgrep"
+      - "bandit"
+    depends_on:
+      - "syntax_static"
+    default_enabled: true
+  dependency_audit:
+    id: "dependency_audit"
+    description: "Check declared dependencies against an approved local advisory source."
+    metrics:
+      - "SEC-002"
+    evidence:
+      - "advisory report or unavailable reason"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "pip-audit"
+      - "npm-audit"
+      - "cqa-builtin"
+    depends_on: []
+    default_enabled: true
+  insecure_config:
+    id: "insecure_config"
+    description: "Detect insecure shipped configuration."
+    metrics:
+      - "SEC-006"
+      - "SEC-012"
+    evidence:
+      - "configuration locations"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "cqa-builtin"
+      - "semgrep"
+      - "bandit"
+    depends_on: []
+    default_enabled: true
+  testing:
+    id: "testing"
+    description: "Evaluate test presence, boundaries, properties, invariants, integration, regression, assertions, and independence."
+    metrics:
+      - "TEST-001"
+      - "TEST-005"
+      - "TEST-006"
+      - "TEST-007"
+      - "TEST-008"
+      - "TEST-009"
+      - "TEST-011"
+      - "TEST-012"
+    evidence:
+      - "test inventory"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "cqa-builtin"
+      - "pytest"
+      - "jest"
+      - "ctest"
+    depends_on:
+      - "syntax_static"
+    default_enabled: true
+  coverage:
+    id: "coverage"
+    description: "Measure line and branch coverage when an approved runner produces data."
+    metrics:
+      - "TEST-002"
+      - "TEST-003"
+    evidence:
+      - "coverage report"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "coverage"
+      - "c8"
+      - "cqa-builtin"
+    depends_on:
+      - "testing"
+    default_enabled: true
+  mutation_testing:
+    id: "mutation_testing"
+    description: "Measure mutation score with an approved mutation tool."
+    metrics:
+      - "TEST-004"
+    evidence:
+      - "mutation report"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "mutmut"
+      - "stryker"
+    depends_on:
+      - "testing"
+    default_enabled: true
+  concurrency:
+    id: "concurrency"
+    description: "Evaluate concurrency tests where concurrent code exists."
+    metrics:
+      - "TEST-010"
+    evidence:
+      - "concurrency primitive inventory"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "cqa-builtin"
+      - "pytest"
+      - "jest"
+      - "ctest"
+    depends_on:
+      - "testing"
+    default_enabled: true
+  requirements_trace:
+    id: "requirements_trace"
+    description: "Trace requirements to implementation and meaningful verification."
+    metrics:
+      - "REQ-001"
+      - "REQ-002"
+      - "REQ-003"
+      - "REQ-004"
+      - "REQ-005"
+      - "REQ-006"
+      - "REQ-007"
+      - "REQ-008"
+    evidence:
+      - "specification index"
+      - "test links"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "cqa-builtin"
+    depends_on: []
+    default_enabled: true
+  ai_evaluation:
+    id: "ai_evaluation"
+    description: "Evaluate hallucination, unjustified behavior, architecture drift, test independence, and semantic redundancy."
+    metrics:
+      - "AI-001"
+      - "AI-002"
+      - "AI-003"
+      - "AI-004"
+      - "AI-005"
+      - "AI-006"
+      - "AI-007"
+      - "AI-008"
+    evidence:
+      - "requirement citations"
+      - "semantic candidates"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "cqa-builtin"
+    depends_on:
+      - "requirements_trace"
+      - "symbol_index"
+      - "semantic_duplication"
+    default_enabled: true
+  performance_benchmarks:
+    id: "performance_benchmarks"
+    description: "Evaluate declared performance targets, benchmark presence, and static efficiency signals."
+    metrics:
+      - "PERF-001"
+      - "PERF-002"
+      - "PERF-003"
+      - "PERF-004"
+      - "PERF-005"
+      - "PERF-006"
+      - "PERF-007"
+      - "PERF-008"
+    evidence:
+      - "requirements"
+      - "benchmark results"
+      - "loop structure"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "pytest-benchmark"
+      - "google-benchmark"
+      - "cqa-builtin"
+    depends_on:
+      - "syntax_static"
+    default_enabled: true
+  maintainability:
+    id: "maintainability"
+    description: "Evaluate churn, debt, co-change, API compatibility, docs, and dependency freshness from real evidence."
+    metrics:
+      - "MAINT-001"
+      - "MAINT-002"
+      - "MAINT-003"
+      - "MAINT-004"
+      - "MAINT-005"
+      - "MAINT-006"
+      - "MAINT-007"
+      - "MAINT-008"
+    evidence:
+      - "git history"
+      - "baseline snapshot"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "cqa-builtin"
+    depends_on:
+      - "symbol_index"
+    default_enabled: true
+  observability:
+    id: "observability"
+    description: "Evaluate logging, metrics, tracing, errors, health, and operational readiness when a service exists."
+    metrics:
+      - "OBS-001"
+      - "OBS-002"
+      - "OBS-003"
+      - "OBS-004"
+      - "OBS-005"
+      - "OBS-006"
+    evidence:
+      - "service entry points"
+      - "operational docs"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "cqa-builtin"
+    depends_on:
+      - "symbol_index"
+    default_enabled: true
+  reliability:
+    id: "reliability"
+    description: "Evaluate error handling, bounded external calls, and determinism."
+    metrics:
+      - "REL-001"
+      - "REL-002"
+      - "REL-003"
+    evidence:
+      - "handler and call inventory"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "cqa-builtin"
+      - "ruff"
+      - "eslint"
+      - "radon"
+      - "clang-tidy"
+    depends_on:
+      - "syntax_static"
+    default_enabled: true
+  quantitative:
+    id: "quantitative"
+    description: "Evaluate numerical, risk, snapshot, attribution, and non-invention constraints for quantitative repositories."
+    metrics:
+      - "QUANT-001"
+      - "QUANT-002"
+      - "QUANT-003"
+      - "QUANT-004"
+      - "QUANT-005"
+      - "QUANT-006"
+    evidence:
+      - "risk symbols"
+      - "reference tests"
+    languages:
+      - "python"
+      - "javascript"
+      - "typescript"
+      - "cpp"
+    tools:
+      - "cqa-builtin"
+      - "pytest"
+      - "jest"
+      - "ctest"
+    depends_on:
+      - "testing"
+      - "requirements_trace"
+    default_enabled: true

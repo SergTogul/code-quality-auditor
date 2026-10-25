@@ -1,0 +1,67 @@
+# Principal skill configuration. Security approvals are invocation-only and are ignored here.
+version: 1
+default_profile: full
+scope: repository
+baseline: null
+budgets:
+  time_seconds: 600
+  concurrency: 4
+  memory_mb: 1024
+  max_retries: 2
+  retry_backoff_seconds: 0.2
+  task_timeout_seconds: 60
+languages: []
+paths: []
+thresholds: {}
+check_overrides: {}
+exceptions: []
+architecture:
+  layers: []
+profiles:
+  full:
+    description: All registered checks. This is the default profile.
+  fast:
+    description: All checks except mutation testing, semantic duplication, and performance benchmarks.
+    exclude:
+      - mutation_testing
+      - semantic_duplication
+      - performance_benchmarks
+    scope: changed
+    budgets:
+      time_seconds: 120
+      concurrency: 2
+  expensive:
+    description: All checks with a larger time budget, including mutation testing.
+    budgets:
+      time_seconds: 3600
+      concurrency: 2
+      task_timeout_seconds: 600
+  pr-review:
+    description: Changed-code review without mutation testing or performance benchmarks.
+    exclude:
+      - mutation_testing
+      - performance_benchmarks
+    scope: changed
+    budgets:
+      time_seconds: 300
+  security:
+    description: Security checks only.
+    include:
+      - secrets
+      - security_sast
+      - dependency_audit
+      - insecure_config
+configuration_precedence:
+  - explicit invocation overrides
+  - nearest directory quality-auditor.yaml
+  - repository quality-auditor.yaml
+  - resolved profile
+  - registry defaults
+profile_resolution: >
+  A profile with neither include nor exclude selects every registered check.
+  include is an allowlist. exclude removes checks after include.
+  When the same profile lists a check in both, exclude wins.
+  extends is resolved from the root profile to the child.
+  A child include adds a check back after a parent exclusion.
+  A child exclude remains authoritative. Cycles, missing profiles, and unknown
+  check IDs are errors.

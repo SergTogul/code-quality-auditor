@@ -1,0 +1,16 @@
+# Place this file in a subdirectory as quality-auditor.yaml.
+# It inherits the repository configuration; user profile and exception keys are preserved on rerun.
+version: 1
+default_profile: fast
+languages:
+  - python
+paths:
+  - services/api
+profiles:
+  fast:
+    extends: full
+    exclude:
+      - mutation_testing
+      - performance_benchmarks
+      - semantic_duplication
+    scope: changed

@@ -1,0 +1,10 @@
+# Default quality policy. version 1.1.0
+version: 1
+zero_confirmed_violations: true
+missing_mandatory_evidence: "incomplete"
+inconclusive_blocking: "incomplete"
+warnings_allow_pass: true
+exception_requires_justification: true
+exception_requires_scope: true
+fail_closed: true
+notes: "The zero confirmed-violation gate cannot be disabled. Thresholds and per-metric blocking classifications are configurable."
