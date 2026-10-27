@@ -205,7 +205,7 @@ class AcceptanceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             auditor.dag({"dead_code"}, {"dead_code": {"id": "dead_code", "depends_on": ["dead_code"]}})
         evidence = {"builds": 0}
-        barrier = threading.Barrier(2)
+        arrived = self.tmp / "parallel-arrived"
 
         def symbol(_task, store):
             store["builds"] += 1
@@ -217,8 +217,15 @@ class AcceptanceTests(unittest.TestCase):
             return {"used": True}
 
         def parallel(task, _store):
-            barrier.wait(timeout=2)
-            return {"task": task}
+            with arrived.open("a", encoding="utf-8") as handle:
+                handle.write(task + "\n")
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                text = arrived.read_text(encoding="utf-8") if arrived.exists() else ""
+                if "left" in text and "right" in text:
+                    return {"task": task}
+                time.sleep(0.01)
+            raise TimeoutError("peer did not start")
 
         plan = execute(
             {"dead_code"},

@@ -3,14 +3,22 @@
 from __future__ import annotations
 
 import json
+import os
+import pickle
+import select
+import signal
+import tempfile
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, wait
 from pathlib import Path
 
 
 class TransientFailure(Exception):
     """A timeout or other failure that may be retried. Deterministic defects are not transient."""
+
+
+class _AttemptCancelled(BaseException):
+    """Injected into a thread only when process isolation is unavailable."""
 
 
 def dag(selected, registry):
@@ -92,11 +100,555 @@ def _write_cache(cache_dir, key, payload):
     path.write_text(encoded, encoding="utf-8")
 
 
+def _isolated_processes():
+    return os.name == "posix" and hasattr(os, "fork") and hasattr(os, "setsid")
+
+
+def _json_key(value):
+    return json.dumps(value, sort_keys=True, default=str)
+
+
+def _extend_unique(existing, extra):
+    seen = {_json_key(item) for item in existing}
+    for item in extra:
+        key = _json_key(item)
+        if key not in seen:
+            existing.append(item)
+            seen.add(key)
+
+
+def _pickleable(value):
+    try:
+        pickle.dumps(value)
+    except Exception:
+        return False
+    return True
+
+
+def _export_object(obj):
+    data = {}
+    for key, value in obj.__dict__.items():
+        if key == "lock" or not _pickleable(value):
+            continue
+        data[key] = value
+    return data
+
+
+_REPLACE_FIELDS = {"analyses", "graph", "requirements", "duplicate_groups"}
+_APPEND_FIELDS = {"commands", "denied", "approvals", "ignored_overrides", "limitations"}
+
+
+def _skip_cell(value):
+    if any(cls.__name__ == "TestCase" for cls in type(value).__mro__):
+        return True
+    return type(value).__name__ in {"module", "function", "method", "RLock", "Lock", "Event"}
+
+
+def _export_closures(fn):
+    closure = getattr(fn, "__closure__", None) or ()
+    exported = []
+    for cell in closure:
+        try:
+            current = cell.cell_contents
+        except ValueError:
+            exported.append(("skip", None))
+            continue
+        if isinstance(current, dict):
+            copied = {key: value for key, value in current.items() if _pickleable(value)}
+            exported.append(("dict", copied))
+        elif hasattr(current, "__dict__") and not _skip_cell(current):
+            exported.append(("object", _export_object(current)))
+        else:
+            exported.append(("skip", None))
+    return exported
+
+
+def _merge_object(current, exported):
+    for key, value in exported.items():
+        if key == "lock":
+            continue
+        existing = getattr(current, key, None)
+        if key in _REPLACE_FIELDS or existing is None:
+            setattr(current, key, value)
+        elif key in _APPEND_FIELDS and isinstance(existing, list) and isinstance(value, list):
+            _extend_unique(existing, value)
+        elif isinstance(existing, list) and isinstance(value, list):
+            _extend_unique(existing, value)
+        elif isinstance(existing, dict) and isinstance(value, dict):
+            existing.update(value)
+        elif hasattr(existing, "__dict__") and hasattr(value, "__dict__") and not _skip_cell(existing):
+            _merge_object(existing, _export_object(value))
+        else:
+            setattr(current, key, value)
+
+
+def _merge_closures(fn, exported):
+    closure = getattr(fn, "__closure__", None) or ()
+    for cell, item in zip(closure, exported):
+        kind, payload = item
+        try:
+            current = cell.cell_contents
+        except ValueError:
+            continue
+        if kind == "dict" and isinstance(current, dict) and isinstance(payload, dict):
+            current.clear()
+            current.update(payload)
+        elif kind == "object" and isinstance(payload, dict) and hasattr(current, "__dict__"):
+            _merge_object(current, payload)
+
+
+def _merge_evidence(evidence, exported):
+    if isinstance(evidence, dict) and isinstance(exported, dict):
+        evidence.update(exported)
+
+
+def _attempt_payload(runner, task_id, evidence):
+    try:
+        value = runner(task_id, evidence)
+        status = "ok"
+        error = None
+    except Exception as exc:  # noqa: BLE001 - classified by the parent
+        value = None
+        status = "error"
+        error = {
+            "type": exc.__class__.__name__,
+            "message": str(exc),
+            "transient": isinstance(exc, (TransientFailure, TimeoutError)),
+        }
+    evidence_copy = dict(evidence) if isinstance(evidence, dict) else None
+    return {
+        "status": status,
+        "value": value if _pickleable(value) else None,
+        "error": error,
+        "evidence": evidence_copy if evidence_copy is None or _pickleable(evidence_copy) else None,
+        "cells": _export_closures(runner),
+    }
+
+
+def _write_payload(path, payload):
+    temporary = path + ".tmp"
+    with open(temporary, "wb") as handle:
+        pickle.dump(payload, handle)
+    os.replace(temporary, path)
+
+
+def _fork_attempt(runner, task_id, evidence, result_path):
+    ready_read, ready_write = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(ready_read)
+            os.setsid()
+            signal.signal(signal.SIGALRM, signal.SIG_DFL)
+            if hasattr(signal, "setitimer"):
+                signal.setitimer(signal.ITIMER_REAL, 0)
+            os.write(ready_write, b"1")
+            os.close(ready_write)
+            _write_payload(result_path, _attempt_payload(runner, task_id, evidence))
+            os._exit(0)
+        except BaseException:
+            os._exit(1)
+    os.close(ready_write)
+    return pid, ready_read
+
+
+def _group_ready(ready_read):
+    if ready_read is None:
+        return False
+    readable, _, _ = select.select([ready_read], [], [], 0)
+    if not readable:
+        return False
+    try:
+        os.read(ready_read, 1)
+    except OSError:
+        return False
+    return True
+
+
+def _signal_pid(pid, group_ready):
+    try:
+        if group_ready:
+            os.killpg(pid, signal.SIGKILL)
+        else:
+            os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    except PermissionError:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return
+
+
+def _reap(pid, seconds=2):
+    deadline = time.monotonic() + seconds
+    while True:
+        try:
+            waited, _status = os.waitpid(pid, os.WNOHANG)
+        except ChildProcessError:
+            return True
+        if waited == pid:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.01)
+
+
+def _read_payload(path):
+    try:
+        with open(path, "rb") as handle:
+            return pickle.load(handle)
+    except (OSError, pickle.UnpicklingError, EOFError):
+        return None
+
+
+def _close_pipe(ready_read):
+    if ready_read is None:
+        return
+    try:
+        os.close(ready_read)
+    except OSError:
+        pass
+
+
+def _apply_payload(runner, evidence, payload):
+    if not payload:
+        return
+    _merge_closures(runner, payload.get("cells") or [])
+    _merge_evidence(evidence, payload.get("evidence"))
+
+
+class _Job:
+    def __init__(self, task_id, runner, evidence, key):
+        self.task_id = task_id
+        self.runner = runner
+        self.evidence = evidence
+        self.key = key
+        self.attempt = 1
+        self.records = []
+        self.next_time = 0.0
+        self.pid = None
+        self.ready_read = None
+        self.group_ready = False
+        self.result_path = None
+        self.started = None
+        self.deadline = None
+
+
+def _timeout_record(attempt, task_timeout, diagnostic, transient):
+    return {
+        "attempt": attempt,
+        "outcome": "timeout",
+        "reason": f"exceeded {task_timeout}s",
+        "transient": transient,
+        "diagnostic": diagnostic,
+    }
+
+
+def _finish_job(job, ok, error, value, cache_dir):
+    if ok:
+        _write_cache(cache_dir, job.key, {"ok": True, "value": value})
+        return {
+            "task_id": job.task_id,
+            "ok": True,
+            "cached": False,
+            "value": value,
+            "attempts": job.records,
+        }
+    return {
+        "task_id": job.task_id,
+        "ok": False,
+        "cached": False,
+        "error": error,
+        "attempts": job.records,
+    }
+
+
+def _poll_job(job, now, cancel, max_attempts, backoff):
+    """Return (finished_result_or_none, still_running)."""
+    if not job.group_ready:
+        job.group_ready = _group_ready(job.ready_read)
+    try:
+        waited, _status = os.waitpid(job.pid, os.WNOHANG)
+    except ChildProcessError:
+        waited = job.pid
+    timed_out = now >= job.deadline
+    cancelled = cancel.is_set()
+    if waited != job.pid and not timed_out and not cancelled:
+        return None, True
+    killed = False
+    if waited != job.pid:
+        _signal_pid(job.pid, job.group_ready)
+        killed = True
+        reaped = _reap(job.pid)
+    else:
+        reaped = True
+    payload = None if killed else _read_payload(job.result_path)
+    _apply_payload(job.runner, job.evidence, payload if not killed else None)
+    _close_pipe(job.ready_read)
+    if job.result_path:
+        try:
+            os.unlink(job.result_path)
+        except OSError:
+            pass
+    job.pid = None
+    if killed or payload is None:
+        transient = bool(reaped and not cancelled)
+        reason = "cancelled" if cancelled else f"exceeded {job.deadline - job.started:.3f}s"
+        diagnostic = "cancelled" if cancelled else (f"elapsed>{job.deadline - job.started:.3f}" if reaped else "attempt did not terminate")
+        if not cancelled:
+            reason = f"exceeded {job.deadline - job.started:.3f}s"
+        job.records.append(
+            {
+                "attempt": job.attempt,
+                "outcome": "timeout",
+                "reason": "cancelled" if cancelled else reason,
+                "transient": False if cancelled or not reaped else True,
+                "diagnostic": diagnostic,
+            }
+        )
+        if cancelled or not transient or job.attempt >= max_attempts:
+            error = "cancelled" if cancelled else "timeout"
+            return _finish_job(job, False, error, None, None), False
+        job.attempt += 1
+        job.next_time = time.monotonic() + (backoff * (job.attempt - 1))
+        return None, False
+    if payload.get("status") == "error":
+        error = payload.get("error") or {}
+        transient = bool(error.get("transient"))
+        job.records.append(
+            {
+                "attempt": job.attempt,
+                "outcome": "error",
+                "reason": error.get("message") or "attempt failed",
+                "transient": transient,
+                "diagnostic": error.get("type") or "Exception",
+            }
+        )
+        if not transient or job.attempt >= max_attempts:
+            return _finish_job(job, False, error.get("message") or "attempt failed", None, None), False
+        job.attempt += 1
+        job.next_time = time.monotonic() + (backoff * (job.attempt - 1))
+        return None, False
+    job.records.append(
+        {
+            "attempt": job.attempt,
+            "outcome": "success",
+            "reason": None,
+            "transient": False,
+            "diagnostic": f"elapsed={time.monotonic() - job.started:.3f}s",
+        }
+    )
+    return _finish_job(job, True, None, payload.get("value"), job.cache_dir), False
+
+
+def _start_job(job, task_timeout):
+    descriptor, path = tempfile.mkstemp(prefix="cqa-attempt-")
+    os.close(descriptor)
+    job.result_path = path
+    job.started = time.monotonic()
+    job.deadline = job.started + task_timeout
+    job.group_ready = False
+    job.pid, job.ready_read = _fork_attempt(job.runner, job.task_id, job.evidence, path)
+
+
+def _raise_in_thread(thread):
+    ident = thread.ident
+    if not ident:
+        return False
+    import ctypes
+
+    exception = ctypes.py_object(_AttemptCancelled)
+    ident_value = ctypes.c_ulong(ident)
+    count = ctypes.pythonapi.PyThreadState_SetAsyncExc(ident_value, exception)
+    if count > 1:
+        ctypes.pythonapi.PyThreadState_SetAsyncExc(ident_value, None)
+        return False
+    return count == 1
+
+
+def _run_thread_attempt(runner, task_id, evidence, task_timeout, cancel):
+    """Fallback for platforms without fork. A live thread is never overlapped by a retry."""
+    holder = {}
+
+    def invoke():
+        try:
+            if cancel.is_set():
+                raise _AttemptCancelled("cancelled")
+            holder["value"] = runner(task_id, evidence)
+        except _AttemptCancelled as exc:
+            holder["cancelled"] = exc
+        except Exception as exc:  # noqa: BLE001 - classified by the caller
+            holder["error"] = exc
+
+    worker = threading.Thread(target=invoke, daemon=False)
+    started = time.monotonic()
+    worker.start()
+    worker.join(task_timeout)
+    if worker.is_alive() or cancel.is_set():
+        cancel_requested = cancel.is_set()
+        _raise_in_thread(worker)
+        worker.join(0.2)
+        reaped = not worker.is_alive()
+        return {
+            "kind": "timeout",
+            "reaped": reaped,
+            "cancelled": cancel_requested,
+            "elapsed": time.monotonic() - started,
+        }
+    if "error" in holder:
+        exc = holder["error"]
+        return {
+            "kind": "error",
+            "type": exc.__class__.__name__,
+            "message": str(exc),
+            "transient": isinstance(exc, (TransientFailure, TimeoutError)),
+            "elapsed": time.monotonic() - started,
+        }
+    if "cancelled" in holder:
+        return {"kind": "timeout", "reaped": True, "cancelled": True, "elapsed": time.monotonic() - started}
+    return {"kind": "ok", "value": holder.get("value"), "elapsed": time.monotonic() - started}
+
+
+def _run_thread_task(task_id, runner, evidence, key, task_timeout, max_attempts, backoff, cancel, deadline, cache_dir):
+    records = []
+    for attempt in range(1, max_attempts + 1):
+        if cancel.is_set() or (deadline is not None and time.monotonic() > deadline):
+            records.append(
+                {
+                    "attempt": attempt,
+                    "outcome": "timeout",
+                    "reason": "cancelled" if cancel.is_set() else "run budget exhausted",
+                    "transient": False,
+                    "diagnostic": "cancelled before start",
+                }
+            )
+            error = "cancelled" if cancel.is_set() else "budget exhausted"
+            return {"task_id": task_id, "ok": False, "cached": False, "error": error, "attempts": records}
+        outcome = _run_thread_attempt(runner, task_id, evidence, task_timeout, cancel)
+        if outcome["kind"] == "timeout":
+            transient = bool(outcome["reaped"] and not outcome["cancelled"])
+            records.append(_timeout_record(attempt, task_timeout, "cancelled" if outcome["cancelled"] else (f"elapsed>{task_timeout}" if transient else "attempt did not terminate"), transient))
+            if outcome["cancelled"]:
+                records[-1]["reason"] = "cancelled"
+                records[-1]["transient"] = False
+            if not transient or attempt == max_attempts:
+                return {"task_id": task_id, "ok": False, "cached": False, "error": "cancelled" if outcome["cancelled"] else "timeout", "attempts": records}
+            time.sleep(backoff * attempt)
+            continue
+        if outcome["kind"] == "error":
+            records.append(
+                {
+                    "attempt": attempt,
+                    "outcome": "error",
+                    "reason": outcome["message"],
+                    "transient": outcome["transient"],
+                    "diagnostic": outcome["type"],
+                }
+            )
+            if not outcome["transient"] or attempt == max_attempts:
+                return {"task_id": task_id, "ok": False, "cached": False, "error": outcome["message"], "attempts": records}
+            time.sleep(backoff * attempt)
+            continue
+        records.append(
+            {
+                "attempt": attempt,
+                "outcome": "success",
+                "reason": None,
+                "transient": False,
+                "diagnostic": f"elapsed={outcome['elapsed']:.3f}s",
+            }
+        )
+        _write_cache(cache_dir, key, {"ok": True, "value": outcome["value"]})
+        return {"task_id": task_id, "ok": True, "cached": False, "value": outcome["value"], "attempts": records}
+    return {"task_id": task_id, "ok": False, "cached": False, "error": "retries exhausted", "attempts": records}
+
+
+def _run_processes(jobs, concurrency, task_timeout, max_attempts, backoff, cancel, deadline, cache_dir, on_result):
+    results = {}
+    failed = set()
+    queue = list(jobs)
+    delayed = []
+    inflight = []
+    for job in jobs:
+        job.cache_dir = cache_dir
+
+    def store(job, result):
+        results[job.task_id] = result
+        if on_result is not None:
+            on_result(job.task_id, result)
+        if not result.get("ok"):
+            failed.add(job.task_id)
+
+    while queue or delayed or inflight:
+        now = time.monotonic()
+        if deadline is not None and now > deadline:
+            cancel.set()
+        if cancel.is_set() and not inflight:
+            for job in queue + delayed:
+                job.records.append(
+                    {
+                        "attempt": job.attempt,
+                        "outcome": "timeout",
+                        "reason": "cancelled" if cancel.is_set() and (deadline is None or now <= deadline) else "run budget exhausted",
+                        "transient": False,
+                        "diagnostic": "cancelled before start",
+                    }
+                )
+                error = "budget exhausted" if deadline is not None and now > deadline else "cancelled"
+                store(job, _finish_job(job, False, error, None, None))
+            break
+        still_delayed = []
+        for job in delayed:
+            if job.next_time <= now and not cancel.is_set():
+                queue.append(job)
+            elif cancel.is_set():
+                job.records.append(
+                    {
+                        "attempt": job.attempt,
+                        "outcome": "timeout",
+                        "reason": "cancelled",
+                        "transient": False,
+                        "diagnostic": "cancelled before start",
+                    }
+                )
+                store(job, _finish_job(job, False, "cancelled", None, None))
+            else:
+                still_delayed.append(job)
+        delayed = still_delayed
+        while queue and len(inflight) < concurrency and not cancel.is_set():
+            job = queue.pop(0)
+            _start_job(job, task_timeout)
+            inflight.append(job)
+        if not inflight:
+            if delayed:
+                time.sleep(min(0.01, max(0.0, min(job.next_time for job in delayed) - time.monotonic())))
+            continue
+        progressed = False
+        for job in list(inflight):
+            result, running = _poll_job(job, time.monotonic(), cancel, max_attempts, backoff)
+            if running:
+                continue
+            inflight.remove(job)
+            progressed = True
+            if result is None:
+                delayed.append(job)
+            else:
+                if result.get("ok"):
+                    _write_cache(cache_dir, job.key, {"ok": True, "value": result.get("value")})
+                store(job, result)
+        if not progressed:
+            time.sleep(0.01)
+    return results, failed
+
+
 def execute(selected, registry, runners, evidence, options=None):
     """Run independent tasks in parallel, reuse cached successful results, and retry transient failures.
 
-    Deterministic exceptions are not retried. Exhausted retries and timeouts are
-    terminal errors; callers must treat them as fail-closed.
+    Deterministic exceptions are not retried. Each attempt runs in a killable
+    process session on POSIX. The next attempt starts only after the previous
+    process has been reaped. Exhausted retries and timeouts are terminal errors;
+    callers must treat them as fail-closed.
     """
     options = options or {}
     nodes = dag(selected, registry)
@@ -111,197 +663,131 @@ def execute(selected, registry, runners, evidence, options=None):
     cancel = options.get("cancel_event") or threading.Event()
     results = {}
     cache_hits = []
-    lock = threading.Lock()
     on_result = options.get("on_result")
-
-    def run_one(task_id):
-        attempts = []
-        key = fingerprint(task_id)
-        cached = _read_cache(cache_dir, key)
-        if cached is not None and cached.get("ok"):
-            with lock:
-                cache_hits.append(task_id)
-            return {
-                "task_id": task_id,
-                "ok": True,
-                "cached": True,
-                "value": cached.get("value"),
-                "attempts": [{"attempt": 0, "outcome": "cache_hit", "reason": key}],
-            }
-        runner = runners.get(task_id)
-        if runner is None:
-            attempts.append(
-                {
-                    "attempt": 1,
-                    "outcome": "error",
-                    "reason": f"no runner for {task_id}",
-                    "transient": False,
-                    "diagnostic": "missing runner",
-                }
-            )
-            return {"task_id": task_id, "ok": False, "cached": False, "error": "missing runner", "attempts": attempts}
-        for attempt in range(1, max_attempts + 1):
-            if cancel.is_set() and attempt == 1 and deadline is not None and time.monotonic() > deadline:
-                attempts.append(
-                    {
-                        "attempt": attempt,
-                        "outcome": "timeout",
-                        "reason": "run budget exhausted",
-                        "transient": True,
-                        "diagnostic": "cancelled before start",
-                    }
-                )
-                return {"task_id": task_id, "ok": False, "cached": False, "error": "budget exhausted", "attempts": attempts}
-            started = time.monotonic()
-            holder = {}
-
-            def invoke(holder=holder, runner=runner, task_id=task_id):
-                try:
-                    holder["value"] = runner(task_id, evidence)
-                except Exception as exc:  # noqa: BLE001 - classified below
-                    holder["error"] = exc
-
-            worker = threading.Thread(target=invoke, daemon=True)
-            worker.start()
-            worker.join(task_timeout)
-            if worker.is_alive():
-                cancel.set()
-                attempts.append(
-                    {
-                        "attempt": attempt,
-                        "outcome": "timeout",
-                        "reason": f"exceeded {task_timeout}s",
-                        "transient": True,
-                        "diagnostic": f"elapsed>{task_timeout}",
-                    }
-                )
-                if attempt == max_attempts:
-                    return {"task_id": task_id, "ok": False, "cached": False, "error": "timeout", "attempts": attempts}
-                time.sleep(backoff * attempt)
-                continue
-            if "error" in holder:
-                exc = holder["error"]
-                transient = isinstance(exc, (TransientFailure, TimeoutError))
-                attempts.append(
-                    {
-                        "attempt": attempt,
-                        "outcome": "error",
-                        "reason": str(exc),
-                        "transient": transient,
-                        "diagnostic": exc.__class__.__name__,
-                    }
-                )
-                if not transient or attempt == max_attempts:
-                    return {"task_id": task_id, "ok": False, "cached": False, "error": str(exc), "attempts": attempts}
-                time.sleep(backoff * attempt)
-                continue
-            attempts.append(
-                {
-                    "attempt": attempt,
-                    "outcome": "success",
-                    "reason": None,
-                    "transient": False,
-                    "diagnostic": f"elapsed={time.monotonic() - started:.3f}s",
-                }
-            )
-            payload = {"ok": True, "value": holder.get("value")}
-            _write_cache(cache_dir, key, payload)
-            return {"task_id": task_id, "ok": True, "cached": False, "value": holder.get("value"), "attempts": attempts}
-        return {"task_id": task_id, "ok": False, "cached": False, "error": "retries exhausted", "attempts": attempts}
-
     failed = set()
+    isolate = _isolated_processes()
+
+    def remember(task_id, result):
+        results[task_id] = result
+        if on_result is not None:
+            on_result(task_id, result)
+        if not result.get("ok"):
+            failed.add(task_id)
+
     for layer in layers:
-        runnable = []
+        jobs = []
         for task_id in layer:
             deps = nodes[task_id].get("depends_on") or []
             blocked = [dep for dep in deps if dep in failed or not results.get(dep, {}).get("ok", False)]
             if blocked:
                 failed.add(task_id)
-                results[task_id] = {
-                    "task_id": task_id,
-                    "ok": False,
-                    "cached": False,
-                    "error": "dependency failed",
-                    "attempts": [
-                        {
-                            "attempt": 1,
-                            "outcome": "skipped",
-                            "reason": "dependency failed: " + ", ".join(blocked),
-                            "transient": False,
-                            "diagnostic": "fail-closed",
-                        }
-                    ],
-                }
-            elif deadline is not None and time.monotonic() > deadline:
-                cancel.set()
-                failed.add(task_id)
-                results[task_id] = {
-                    "task_id": task_id,
-                    "ok": False,
-                    "cached": False,
-                    "error": "budget exhausted",
-                    "attempts": [
-                        {
-                            "attempt": 1,
-                            "outcome": "timeout",
-                            "reason": "run budget exhausted",
-                            "transient": True,
-                            "diagnostic": "fail-closed",
-                        }
-                    ],
-                }
-            else:
-                runnable.append(task_id)
-        if not runnable:
-            continue
-        with ThreadPoolExecutor(max_workers=min(concurrency, len(runnable))) as pool:
-            futures = {pool.submit(run_one, task_id): task_id for task_id in runnable}
-            done, pending = wait(futures)
-            for future in pending:
-                cancel.set()
-                task_id = futures[future]
-                failed.add(task_id)
-                results[task_id] = {
-                    "task_id": task_id,
-                    "ok": False,
-                    "cached": False,
-                    "error": "timeout",
-                    "attempts": [
-                        {
-                            "attempt": 1,
-                            "outcome": "timeout",
-                            "reason": "layer wait expired",
-                            "transient": True,
-                            "diagnostic": "fail-closed",
-                        }
-                    ],
-                }
-            for future in done:
-                task_id = futures[future]
-                try:
-                    result = future.result()
-                except Exception as exc:  # noqa: BLE001
-                    result = {
+                remember(
+                    task_id,
+                    {
                         "task_id": task_id,
                         "ok": False,
                         "cached": False,
-                        "error": str(exc),
+                        "error": "dependency failed",
+                        "attempts": [
+                            {
+                                "attempt": 1,
+                                "outcome": "skipped",
+                                "reason": "dependency failed: " + ", ".join(blocked),
+                                "transient": False,
+                                "diagnostic": "fail-closed",
+                            }
+                        ],
+                    },
+                )
+                continue
+            if deadline is not None and time.monotonic() > deadline:
+                cancel.set()
+                failed.add(task_id)
+                remember(
+                    task_id,
+                    {
+                        "task_id": task_id,
+                        "ok": False,
+                        "cached": False,
+                        "error": "budget exhausted",
+                        "attempts": [
+                            {
+                                "attempt": 1,
+                                "outcome": "timeout",
+                                "reason": "run budget exhausted",
+                                "transient": True,
+                                "diagnostic": "fail-closed",
+                            }
+                        ],
+                    },
+                )
+                continue
+            if cancel.is_set():
+                failed.add(task_id)
+                remember(
+                    task_id,
+                    {
+                        "task_id": task_id,
+                        "ok": False,
+                        "cached": False,
+                        "error": "cancelled",
+                        "attempts": [
+                            {
+                                "attempt": 1,
+                                "outcome": "timeout",
+                                "reason": "cancelled before start",
+                                "transient": False,
+                                "diagnostic": "cancelled before start",
+                            }
+                        ],
+                    },
+                )
+                continue
+            key = fingerprint(task_id)
+            cached = _read_cache(cache_dir, key)
+            if cached is not None and cached.get("ok"):
+                cache_hits.append(task_id)
+                remember(
+                    task_id,
+                    {
+                        "task_id": task_id,
+                        "ok": True,
+                        "cached": True,
+                        "value": cached.get("value"),
+                        "attempts": [{"attempt": 0, "outcome": "cache_hit", "reason": key}],
+                    },
+                )
+                continue
+            runner = runners.get(task_id)
+            if runner is None:
+                remember(
+                    task_id,
+                    {
+                        "task_id": task_id,
+                        "ok": False,
+                        "cached": False,
+                        "error": "missing runner",
                         "attempts": [
                             {
                                 "attempt": 1,
                                 "outcome": "error",
-                                "reason": str(exc),
+                                "reason": f"no runner for {task_id}",
                                 "transient": False,
-                                "diagnostic": exc.__class__.__name__,
+                                "diagnostic": "missing runner",
                             }
                         ],
-                    }
-                with lock:
-                    results[task_id] = result
-                if on_result is not None:
-                    on_result(task_id, result)
-                if not result.get("ok"):
-                    failed.add(task_id)
+                    },
+                )
+                continue
+            if not isolate:
+                result = _run_thread_task(task_id, runner, evidence, key, task_timeout, max_attempts, backoff, cancel, deadline, cache_dir)
+                remember(task_id, result)
+                continue
+            jobs.append(_Job(task_id, runner, evidence, key))
+        if jobs:
+            layer_results, layer_failed = _run_processes(jobs, concurrency, task_timeout, max_attempts, backoff, cancel, deadline, cache_dir, on_result)
+            results.update(layer_results)
+            failed.update(layer_failed)
     ordered = [results[task_id] for task_id in nodes if task_id in results]
     return {
         "ok": not failed and all(item.get("ok") for item in ordered),
