@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from cqa import ENGINE_VERSION
@@ -78,10 +80,122 @@ def runtime_probe(which=None):
     return {"available": True, "path": path, "approval_required": False}
 
 
-def probe_sandbox():
+_DROPPED_ENV = {
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "PYTHONSTARTUP",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "BASH_ENV",
+    "ENV",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+}
+_NEVER_PASS = {"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PYTHONSTARTUP", "NODE_OPTIONS", "BASH_ENV", "ENV"}
+_KEEP_ENV = ("PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "COMSPEC", "USER", "LOGNAME")
+_SECRET_DIRS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".config/gh")
+
+
+def _quote_sb(path):
+    return str(path).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _sanitize_env(explicit=None):
+    """Drop inherited loader and startup hooks. Explicit PYTHONPATH from the auditor is kept."""
+    env = {key: os.environ[key] for key in _KEEP_ENV if key in os.environ and key not in _DROPPED_ENV}
+    for key, value in (explicit or {}).items():
+        if key in _NEVER_PASS or value is None:
+            continue
+        env[key] = value
+    return env
+
+
+def _validate_custom(raw, cwd=None):
+    if raw != raw.strip() or any(character.isspace() for character in raw):
+        raise PermissionError("custom sandbox command must be one absolute executable path")
+    path = Path(raw)
+    if not path.is_absolute() or not path.is_file():
+        raise PermissionError("custom sandbox command must be one absolute executable path")
+    resolved = path.resolve()
+    if cwd is not None:
+        root = Path(cwd).resolve()
+        if resolved == root or root in resolved.parents:
+            raise PermissionError("custom sandbox command is inside the audited repository")
+    return resolved
+
+
+def _inside(root, path):
+    root = Path(root).resolve()
+    path = Path(path).resolve()
+    return path == root or root in path.parents
+
+
+def _resolve_executable(command):
+    candidate = Path(command)
+    if candidate.is_file():
+        return candidate.resolve()
+    found = shutil.which(command)
+    if not found:
+        raise PermissionError(f"executable was not found: {command}")
+    return Path(found).resolve()
+
+
+def _run_process(command, cwd, env, timeout):
+    """Run a command in its own session and kill the whole group on timeout."""
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1)
+        raise exc
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def _custom_contains(wrapper):
+    """A wrapper is containment only if a benign command works and an outside write does not."""
+    true_run = _run_process([str(wrapper), "/usr/bin/true"], None, _sanitize_env(), 10)
+    if true_run.returncode != 0:
+        return False
+    probe_dir = Path(tempfile.mkdtemp(prefix="cqa-sandbox-probe-"))
+    probe_file = probe_dir / "outside-write"
+    try:
+        write_run = _run_process([str(wrapper), "/usr/bin/touch", str(probe_file)], None, _sanitize_env(), 10)
+        created = probe_file.exists()
+    finally:
+        shutil.rmtree(probe_dir, ignore_errors=True)
+    return write_run.returncode != 0 and not created
+
+
+def probe_sandbox(cwd=None):
     custom = os.environ.get("CQA_SANDBOX_CMD")
     if custom:
-        return True, "custom containment command"
+        try:
+            path = _validate_custom(custom, cwd)
+        except PermissionError as exc:
+            return False, str(exc)
+        if not _custom_contains(path):
+            return False, "custom containment command does not isolate writes"
+        return True, str(path)
     sandbox = shutil.which("sandbox-exec")
     if not sandbox:
         return False, "no containment command is available"
@@ -97,13 +211,23 @@ def probe_sandbox():
     return True, sandbox
 
 
-def _profile(read_paths, write_path):
-    """Containment that can start CPython: read and execute are allowed, network and repository writes are not.
+def _profile(read_paths, write_path, allow_temp_writes=False):
+    """Containment for CPython and host analyzers.
 
-    read_paths is retained so callers can see which roots were considered. Writes are limited to write_path.
+    Reads of the system and the repository are allowed so interpreters and SDKs can start.
+    Home credential directories are denied after that allow, which is the rule that wins.
+    Writes stay limited to the approved output directory, plus the system temp directory
+    for host analyzers that need scratch space.
     """
     del read_paths
-    write = f'(allow file-write* (subpath "{write_path}"))' if write_path else ""
+    home = Path.home()
+    secret_denies = "\n".join(
+        f'(deny file-read* (subpath "{_quote_sb(home / name)}"))' for name in _SECRET_DIRS
+    )
+    write = f'(allow file-write* (subpath "{_quote_sb(write_path)}"))' if write_path else ""
+    if allow_temp_writes:
+        temp = _quote_sb(Path(tempfile.gettempdir()).resolve())
+        write = f'{write}\n(allow file-write* (subpath "{temp}"))'
     return f"""(version 1)
 (deny default)
 (deny network*)
@@ -118,7 +242,24 @@ def _profile(read_paths, write_path):
 (allow ipc-posix*)
 (allow system-socket)
 {write}
+{secret_denies}
 """
+
+
+def _contained_command(command, cwd, write_path):
+    command = list(command)
+    executable = Path(command[0])
+    if executable.is_file():
+        command[0] = str(executable.resolve())
+    custom = os.environ.get("CQA_SANDBOX_CMD")
+    if custom:
+        return [str(Path(custom).resolve()), *command]
+    read_paths = [str(Path(cwd).resolve())]
+    if Path(command[0]).is_file():
+        read_paths.append(str(Path(command[0]).resolve().parent.parent))
+    resolved_write = str(Path(write_path).resolve()) if write_path else None
+    profile = _profile(read_paths, resolved_write)
+    return ["sandbox-exec", "-p", profile, "--", *command]
 
 
 def run_contained(command, cwd, log, timeout=30, write_path=None, env=None):
@@ -129,28 +270,15 @@ def run_contained(command, cwd, log, timeout=30, write_path=None, env=None):
     if not log.sandbox_confirmed:
         log.deny("sandbox-confirmation", "sandbox confirmation was not given")
         raise PermissionError("sandbox confirmation was not given")
-    ok, detail = probe_sandbox()
+    ok, detail = probe_sandbox(cwd)
     if not ok:
         log.deny("containment", detail)
         raise PermissionError(detail)
-    custom = os.environ.get("CQA_SANDBOX_CMD")
-    command = list(command)
-    executable = Path(command[0])
-    if executable.is_file():
-        command[0] = str(executable.resolve())
-    if custom:
-        wrapped = custom.split() + command
-    else:
-        read_paths = [str(Path(cwd).resolve()), str(Path(command[0]).resolve().parent.parent)]
-        resolved_write = str(Path(write_path).resolve()) if write_path else None
-        profile = _profile(read_paths, resolved_write)
-        wrapped = ["sandbox-exec", "-p", profile, "--", *command]
+    wrapped = _contained_command(command, cwd, write_path)
     log.record(wrapped, "started")
-    run_env = os.environ.copy()
-    if env:
-        run_env.update(env)
+    run_env = _sanitize_env(env)
     try:
-        completed = subprocess.run(wrapped, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False, env=run_env)
+        completed = _run_process(wrapped, cwd, run_env, timeout)
     except subprocess.TimeoutExpired as exc:
         log.record(wrapped, "timeout", str(exc))
         raise
@@ -165,9 +293,31 @@ def run_tool(command, cwd, log, timeout=60):
     if not log.allow_tools:
         log.deny("external-tool", "tool execution was not approved")
         raise PermissionError("tool execution was not approved")
-    log.record(command, "started")
-    completed = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False)
-    log.record(command, f"exit {completed.returncode}")
+    try:
+        executable = _resolve_executable(command[0])
+    except PermissionError as exc:
+        log.deny("external-tool", str(exc))
+        raise
+    if _inside(cwd, executable):
+        log.deny("external-tool", "repository-controlled executable was not run")
+        raise PermissionError("repository-controlled executable was not run")
+    command = [str(executable), *list(command)[1:]]
+    custom = os.environ.get("CQA_SANDBOX_CMD")
+    ok, detail = probe_sandbox(cwd)
+    if custom and not ok:
+        log.deny("containment", detail)
+        raise PermissionError(detail)
+    if custom:
+        wrapped = [str(Path(custom).resolve()), *command]
+    elif ok:
+        read_paths = [str(Path(cwd).resolve()), str(executable.parent.parent)]
+        wrapped = ["sandbox-exec", "-p", _profile(read_paths, None, allow_temp_writes=True), "--", *command]
+    else:
+        log.record(command, "unsandboxed", detail)
+        wrapped = command
+    log.record(wrapped, "started")
+    completed = _run_process(wrapped, cwd, _sanitize_env(), timeout)
+    log.record(wrapped, f"exit {completed.returncode}")
     return completed
 
 
