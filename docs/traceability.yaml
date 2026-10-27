@@ -683,7 +683,7 @@ requirements:
     status: verified
     test: ""
     statement: "Acceptance SHALL run the complete skill against QuantLineage, reporting measured evidence rather than presuming success."
-    evidence: "Full profile audit of /Users/user/Desktop/src/quantlineage at ba664b203688c83ea393c10fbb4dfce91e9c3d38. Decision FAIL. Report /Users/user/.code-quality-auditor/reports/quantlineage/a9de3be7a167482ea0b681e5f680785b/report.json. Repository execution was not approved. The skill contains no repository-name branch."
+    evidence: "Full profile audit of /Users/user/Desktop/src/quantlineage at ba664b203688c83ea393c10fbb4dfce91e9c3d38. Decision FAIL. Report /Users/user/.code-quality-auditor/reports/quantlineage/bbccf6dabbbc41fe9202d87ea5b1395c/report.json. Verified because the run was measured, not because the decision was PASS."
   - id: "15.1"
     status: verified
     test: "test_security_and_init"

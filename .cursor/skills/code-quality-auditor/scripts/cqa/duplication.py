@@ -76,8 +76,10 @@ def token_duplicates(analyses, window=24):
     blocks = []
     for analysis in analyses:
         tokens = [token for token in analysis.get("tokens") or [] if str(token).strip()]
+        lines = analysis.get("token_lines") or []
         for digest, start in _winnow_fingerprints(tokens, k, winnow):
-            blocks.append({"file": analysis["path"], "line": 1, "hash": digest, "language": analysis["language"], "start": start})
+            line = lines[start] if start < len(lines) else 1
+            blocks.append({"file": analysis["path"], "line": line, "hash": digest, "language": analysis["language"], "start": start})
     groups = []
     for group in _groups(blocks, lambda item: item["hash"]):
         files = {item["file"] for item in group}

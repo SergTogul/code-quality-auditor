@@ -8,7 +8,7 @@ Catalog: `.cursor/skills/code-quality-auditor/config/metrics.yaml` (112 metrics)
 
 Command: `.venv/bin/python -m unittest discover -s tests -v`
 
-Result: 68 tests, OK (58 acceptance, 10 engine).
+Result: 74 tests, OK (64 acceptance, 10 engine).
 
 A requirement is `verified` when a passing acceptance test names that ID and asserts the behavior. Requirement 14.10 is the external acceptance run recorded below. Engine tests additionally lock the public API used by those acceptance tests.
 
@@ -20,11 +20,11 @@ A requirement is `verified` when a passing acceptance test names that ID and ass
 
 ## Acceptance run (14.10)
 
-Command: `.venv/bin/python .cursor/skills/code-quality-auditor/scripts/auditor.py audit --repo /Users/user/Desktop/src/quantlineage --profile full --allow-tools`
+Command: `.venv/bin/python .cursor/skills/code-quality-auditor/scripts/auditor.py audit --repo /Users/user/Desktop/src/quantlineage --profile full --allow-tools --allow-repo-execution --sandbox-confirmed --history "$HOME/.code-quality-auditor/history/quantlineage.csv"`
 
 Repository: `https://github.com/SergTogul/quantlineage`, revision `ba664b203688c83ea393c10fbb4dfce91e9c3d38` (206 commits). The skill scripts do not mention this repository.
 
-Decision: **FAIL**. Rationale: a blocking metric breached its red line. Repository execution was not approved, so tests, coverage, and mutation were not run.
+Decision: **FAIL**. Rationale: a blocking metric breached its red line. Repository execution was approved and the sandbox started. The checkout pytest ran under `sandbox-exec` and exited 1. Containment did not fail, and the audit was not rerun outside the sandbox.
 
 | Result | Count |
 | --- | ---: |
@@ -35,13 +35,13 @@ Decision: **FAIL**. Rationale: a blocking metric breached its red line. Reposito
 | UNAVAILABLE | 4 |
 | INCONCLUSIVE | 4 |
 | Confirmed violations | 4325 |
-| Unresolved candidates | 1838 |
+| Unresolved candidates | 1821 |
 
-Blocking failures: TEST-001 (33), TEST-011 (84.3), SEC-007 (2), REQ-004 (85), DUP-001 (876), DUP-002 (3061), DUP-003 (237), REL-001 (2), QUANT-003 (17), QUANT-004 (12), QUANT-005 (3). TEST-011 is the percentage of test functions with an assertion. REL-004 passes. JavaScript regular expressions and JSX closing tags are not counted as syntax errors.
+Blocking failures: TEST-001 (33), TEST-011 (84.3), SEC-007 (2), REQ-004 (85), DUP-001 (876), DUP-002 (3061), DUP-003 (237), REL-001 (2), QUANT-003 (17), QUANT-004 (12), QUANT-005 (3). TEST-011 is the percentage of test functions with an assertion. REL-004 passes.
 
-Unavailable because execution or a local database was not approved: TEST-002, TEST-004, SEC-002, MAINT-007. TEST-003 is not applicable because no branch-coverage tool is installed.
+Unavailable: TEST-002 (line coverage was not reported because non-Python tests have no installed coverage tool), TEST-004 (mutmut or Stryker is not installed; a homemade mutation score was not substituted), SEC-002 (no approved local advisory database or dependency-audit tool result is available), MAINT-007 (no local freshness snapshot; versions were not looked up on the network). TEST-003 is not applicable because no branch-coverage tool is installed.
 
-Reports: `/Users/user/.code-quality-auditor/reports/quantlineage/a9de3be7a167482ea0b681e5f680785b/` (`report.json`, `report.md`, `report.html`). History: `~/.code-quality-auditor/history/quantlineage.csv`.
+Reports: `/Users/user/.code-quality-auditor/reports/quantlineage/bbccf6dabbbc41fe9202d87ea5b1395c/` (`report.json`, `report.md`, `report.html`). History: `/Users/user/.code-quality-auditor/history/quantlineage.csv`.
 
 ## What the suite covers
 

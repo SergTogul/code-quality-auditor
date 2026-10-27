@@ -302,14 +302,19 @@ def _python(path, text):
     try:
         tokens = tokenize.tokenize(BytesIO(text.encode("utf-8")).readline)
         names = []
+        lines = []
         for token in tokens:
             if token.type == tokenize.NAME:
                 names.append(token.string)
+                lines.append(token.start[0])
             elif token.type == tokenize.NUMBER:
                 names.append(token.string)
+                lines.append(token.start[0])
             elif token.type == tokenize.OP:
                 names.append(token.string)
+                lines.append(token.start[0])
         analysis["tokens"] = names
+        analysis["token_lines"] = lines
     except tokenize.TokenError as exc:
         analysis["syntax_errors"].append({"line": 1, "message": str(exc)})
 
@@ -894,7 +899,7 @@ def _script_symbol(path, item):
     }
 
 
-def _apply_script_metrics(analysis, tokens):
+def _apply_script_metrics(analysis, tokens, header=False):
     functions = [symbol for symbol in analysis["symbols"] if symbol["kind"] == "function"]
     used = set()
     for item in _iter_script_functions(tokens):
@@ -905,6 +910,7 @@ def _apply_script_metrics(analysis, tokens):
                 break
         if symbol is None:
             symbol = _script_symbol(analysis["path"], item)
+            symbol["exported"] = header
             analysis["symbols"].append(symbol)
             functions.append(symbol)
             if item["name"] == "main" or item["name"].startswith("test"):
@@ -1214,7 +1220,9 @@ def _script_like(path, text, language):
     analysis["text_hash"] = hashlib.sha256(text.encode("utf-8")).hexdigest()
     tokens, error, comments = _scan_tokens(text)
     analysis["comments"] = comments
-    analysis["tokens"] = [token[1] for token in tokens if token[0] in {"id", "num", "op", "sym"}]
+    chosen = [token for token in tokens if token[0] in {"id", "num", "op", "sym"}]
+    analysis["tokens"] = [token[1] for token in chosen]
+    analysis["token_lines"] = [token[2] for token in chosen]
     analysis["handlers"].extend(_empty_catches(tokens))
     analysis["imports"].extend(_script_imports(tokens))
     analysis["dead_branches"].extend(_constant_branches(tokens))
@@ -1238,6 +1246,8 @@ def _script_like(path, text, language):
         analysis["dynamic"].append({"line": 1, "kind": "preprocessor", "detail": "#if"})
     ids = [(token[1], token[2]) for token in tokens if token[0] == "id"]
     exported = set()
+    header = language == "cpp" and Path(path).suffix in {".h", ".hpp", ".hh", ".hxx"}
+    export_keywords = {"function", "class", "default", "const", "let", "var", "async"}
     i = 0
     while i < len(ids):
         name, line = ids[i]
@@ -1256,7 +1266,7 @@ def _script_like(path, text, language):
                     "complexity": 1,
                     "cognitive": 1,
                     "nesting": 0,
-                    "exported": nxt in exported or name == "function",
+                    "exported": header,
                     "decorators": [],
                     "doc": False,
                     "refs": [],
@@ -1269,15 +1279,20 @@ def _script_like(path, text, language):
                 analysis["entries"].append({"symbol": nxt, "kind": "convention", "reason": nxt, "line": line})
                 analysis["entry_module"] = True
         if name == "export":
-            exported.add(nxt)
-            analysis["entries"].append({"symbol": nxt, "kind": "export", "reason": "export", "line": line})
+            cursor = i + 1
+            while cursor < len(ids) and ids[cursor][0] in export_keywords:
+                cursor += 1
+            declared = ids[cursor][0] if cursor < len(ids) else ""
+            if declared:
+                exported.add(declared)
+            analysis["entries"].append({"symbol": declared or nxt, "kind": "export", "reason": "export", "line": line})
             analysis["entry_module"] = True
         if name in {"eval", "Function"}:
             analysis["dynamic"].append({"line": line, "kind": "eval", "detail": name})
         if name in {"require", "import"} and nxt == "":
             analysis["dynamic"].append({"line": line, "kind": "dynamic_import", "detail": name})
         i += 1
-    _apply_script_metrics(analysis, tokens)
+    _apply_script_metrics(analysis, tokens, header=header)
     defined = {symbol["name"] for symbol in analysis["symbols"]}
     for name, line in ids:
         if name in defined:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import importlib.util
 import io
+import os
 import re
 import shutil
 import subprocess
@@ -2063,8 +2064,192 @@ def _coverage_measurements(line, branch):
     return {"TEST-002": line, "TEST-003": branch}
 
 
+_PYTEST_IMPORT = re.compile(r"(?m)^\s*(?:import pytest\b|from pytest\b)")
+
+
+def _uses_pytest(ctx, tests):
+    root = Path(ctx.root)
+    for directory, _dirs, files in os.walk(root):
+        if any(part in {".git", ".venv", "venv", "node_modules", "__pycache__"} for part in Path(directory).parts):
+            continue
+        if "conftest.py" in files or "pytest.ini" in files:
+            return True
+    for test in tests:
+        if test["path"].endswith(".py") and _PYTEST_IMPORT.search(_text(ctx, root / test["path"])):
+            return True
+    return False
+
+
+def _pytest_cwd(ctx, tests):
+    root = Path(ctx.root).resolve()
+    markers = {"pyproject.toml", "pytest.ini", "setup.cfg", "setup.py", "requirements.txt", "conftest.py"}
+    candidates = []
+    for test in tests:
+        if not test["path"].endswith(".py"):
+            continue
+        directory = (root / test["path"]).parent
+        while True:
+            if any((directory / name).is_file() for name in markers):
+                candidates.append(directory)
+                break
+            if directory == root or directory.parent == directory:
+                break
+            directory = directory.parent
+    if not candidates:
+        return root
+    return max(candidates, key=lambda path: len(path.parts))
+
+
+def _pytest_executable(cwd):
+    for base in (cwd, cwd.parent):
+        for name in (".venv", "venv"):
+            candidate = base / name / "bin" / "pytest"
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return candidate.resolve()
+    system = shutil.which("pytest")
+    return Path(system).resolve() if system else None
+
+
+def _parse_pytest_failures(text):
+    found = []
+    for match in re.finditer(r"FAILED\s+(\S+\.py)::((?:[\w.]+::)*)(test_\w+)", text):
+        found.append(f"{match.group(1)}:{match.group(3)}")
+    return found
+
+
+_UNITTEST_OUTCOME = re.compile(r"(?:FAIL|ERROR): (\w+) \(([\w.]+)\)")
+
+
+def _unittest_rel(qual, root, start_rel):
+    module = qual.rsplit(".", 2)[0] if qual.count(".") >= 2 else qual.rsplit(".", 1)[0]
+    rel = Path(module.replace(".", "/") + ".py")
+    if start_rel not in {"", "."}:
+        rel = Path(start_rel) / rel
+    return rel if (root / rel).is_file() else None
+
+
+def _parse_unittest_failures(text, root, start_rel):
+    """Map ``FAIL: test_add (test_add.AddTests.test_add)`` onto ``tests/test_add.py:test_add``.
+
+    ``start_rel`` is the discover start directory relative to the repository, such as ``tests`` or ``.``.
+    """
+    found = []
+    for match in _UNITTEST_OUTCOME.finditer(text):
+        rel = _unittest_rel(match.group(2), root, start_rel)
+        if rel is not None:
+            found.append(f"{rel.as_posix()}:{match.group(1)}")
+    return found
+
+
+def _unittest_has_unmapped_outcome(text, root, start_rel):
+    """True when an ``ERROR:`` or ``FAIL:`` line does not name a file in the repository."""
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith(("ERROR:", "FAIL:")):
+            continue
+        match = _UNITTEST_OUTCOME.search(stripped)
+        if match is None or _unittest_rel(match.group(2), root, start_rel) is None:
+            return True
+    return False
+
+
+def project_test_result(ctx):
+    cached = getattr(ctx, "project_tests", None)
+    if cached is not None or getattr(ctx, "_project_tests_ready", False):
+        return cached
+    ctx._project_tests_ready = True
+    ctx.project_tests = None
+    analyses = ensure_analyses(ctx)
+    tests = [analysis for analysis in analyses if _is_test_path(analysis["path"]) and analysis["path"].endswith(".py")]
+    if not tests or not ctx.log.allow_repo_execution or not ctx.log.sandbox_confirmed:
+        return None
+    work = Path(tempfile.mkdtemp(prefix="cqa-runner-")).resolve()
+    try:
+        if _uses_pytest(ctx, tests):
+            cwd = _pytest_cwd(ctx, tests)
+            executable = _pytest_executable(cwd)
+            if executable is None:
+                return None
+            command = [
+                str(executable),
+                "-q",
+                "--tb=no",
+                "-p",
+                "no:cacheprovider",
+                "--override-ini",
+                f"cache_dir={work}",
+            ]
+            runner = "pytest"
+        else:
+            root = Path(ctx.root).resolve()
+            starts = sorted({Path(test["path"]).parent.as_posix() for test in tests})
+            failures = []
+            returncode = 0
+            for start in starts:
+                start_dir = root if start == "." else root / start
+                command = [sys.executable, "-m", "unittest", "discover", "-s", str(start_dir), "-t", str(start_dir), "-v"]
+                env = {"PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": str(root)}
+                try:
+                    completed = run_contained(command, root, ctx.log, timeout=180, write_path=work, env=env)
+                except (PermissionError, subprocess.TimeoutExpired):
+                    return None
+                text = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+                parsed = _parse_unittest_failures(text, root, start)
+                if _unittest_has_unmapped_outcome(text, root, start) or (completed.returncode != 0 and not parsed):
+                    ctx.project_tests = None
+                    ctx._project_tests_ready = True
+                    return None
+                returncode = completed.returncode or returncode
+                failures.extend(parsed)
+            ctx.project_tests = {"runner": "unittest", "cwd": root, "failures": failures, "returncode": returncode}
+            return ctx.project_tests
+        env = {"PYTHONDONTWRITEBYTECODE": "1"}
+        previous = os.environ.get("PYTHONPATH", "")
+        env["PYTHONPATH"] = str(cwd) if not previous else str(cwd) + os.pathsep + previous
+        try:
+            completed = run_contained(command, cwd, ctx.log, timeout=180, write_path=work, env=env)
+        except (PermissionError, subprocess.TimeoutExpired):
+            return None
+        text = f"{completed.stdout or ''}\n{completed.stderr or ''}"
+        failures = _parse_pytest_failures(text)
+        if re.search(r"(?m)^ERROR ", text) or (completed.returncode != 0 and not failures):
+            ctx.project_tests = None
+            ctx._project_tests_ready = True
+            return None
+        root = Path(ctx.root).resolve()
+        failures = [
+            f"{(cwd / item.split(':', 1)[0]).resolve().relative_to(root).as_posix()}:{item.split(':', 1)[1]}"
+            for item in failures
+        ]
+        ctx.project_tests = {"runner": runner, "cwd": cwd, "failures": failures, "returncode": completed.returncode}
+        return ctx.project_tests
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def _line_coverage_unavailable(reason, branch_tool):
+    if branch_tool:
+        branch = _measure(None, True, status="UNAVAILABLE", reason=f"{branch_tool} is installed; branch coverage is not estimated from line coverage and was not parsed from a branch report")
+    else:
+        branch = _measure(None, False, reason="no branch-capable coverage tool is installed")
+    line = _measure(None, True, status="UNAVAILABLE", reason=reason)
+    return _result([], _coverage_measurements(line, branch))
+
+
+def _pytest_line_reason(ctx, tests, result):
+    coverage_installed = bool(shutil.which("coverage") or importlib.util.find_spec("coverage"))
+    if result is not None and result.get("runner") == "pytest":
+        if coverage_installed:
+            return "coverage.py is installed; its report was not parsed and line coverage was not estimated"
+        return "pytest ran; coverage.py is not installed and line coverage was not estimated"
+    if _pytest_executable(_pytest_cwd(ctx, tests)) is None:
+        return "pytest is the repository runner and it is not installed; coverage was not estimated"
+    return "pytest did not finish; coverage.py was not run and line coverage was not estimated"
+
+
 def run_coverage(ctx):
     analyses = ensure_analyses(ctx)
+    result = project_test_result(ctx)
     tests = [analysis for analysis in analyses if _is_test_path(analysis["path"])]
     if not tests:
         return _result([], _coverage_measurements(_measure(None, False, reason="no tests to cover"), _measure(None, False, reason="no tests to cover")))
@@ -2091,6 +2276,8 @@ def run_coverage(ctx):
             _measure(None, True, status="UNAVAILABLE", reason="line coverage was not reported because non-Python tests have no installed coverage tool"),
             _measure(None, bool(branch_tool), status="UNAVAILABLE" if branch_tool else None, reason="" if not branch_tool else "branch coverage was not run"),
         ))
+    if (result is not None and result.get("runner") == "pytest") or (result is None and _uses_pytest(ctx, python_tests)):
+        return _line_coverage_unavailable(_pytest_line_reason(ctx, python_tests, result), branch_tool)
     value, evidence, error = _trace_line_coverage(ctx)
     if value is None:
         line = _measure(None, True, status="UNAVAILABLE", reason=error or "stdlib trace produced no production coverage")
@@ -2105,94 +2292,48 @@ def run_coverage(ctx):
 
 def _trace_line_coverage(ctx):
     cover = Path(tempfile.mkdtemp(prefix="cqa-cover-")).resolve()
-    driver = cover / "cqa_trace_driver.py"
-    driver.write_text(
-        "import importlib.util, os, sys, unittest\n"
-        "from pathlib import Path\n"
-        "root = Path(os.environ['CQA_REPO'])\n"
-        "sys.path.insert(0, str(root))\n"
-        "loader = unittest.TestLoader()\n"
-        "suite = unittest.TestSuite()\n"
-        "skip = {'.git', '.venv', 'node_modules', '__pycache__'}\n"
-        "for path in sorted(root.rglob('*.py')):\n"
-        "    if any(part in skip for part in path.parts):\n"
-        "        continue\n"
-        "    rel = path.relative_to(root).as_posix()\n"
-        "    if not (path.name.startswith('test_') or path.name.endswith('_test.py') or rel.startswith('tests/')):\n"
-        "        continue\n"
-        "    spec = importlib.util.spec_from_file_location('cqa_loaded_' + path.stem, path)\n"
-        "    module = importlib.util.module_from_spec(spec)\n"
-        "    sys.modules[spec.name] = module\n"
-        "    spec.loader.exec_module(module)\n"
-        "    suite.addTests(loader.loadTestsFromModule(module))\n"
-        "result = unittest.TextTestRunner(verbosity=0).run(suite)\n"
-        "(Path(os.environ['CQA_COVER']) / 'tests_run.txt').write_text(str(result.testsRun), encoding='utf-8')\n",
-        encoding="utf-8",
-    )
-    command = [
-        sys.executable,
-        "-m",
-        "trace",
-        "--count",
-        "--missing",
-        "--coverdir",
-        str(cover),
-        "--ignore-module",
-        "unittest",
-        "--ignore-dir",
-        sys.prefix,
-        str(driver),
-    ]
+    root = Path(ctx.root).resolve()
     try:
-        completed = run_contained(
-            command,
-            ctx.root,
-            ctx.log,
-            timeout=60,
-            write_path=cover,
-            env={"PYTHONDONTWRITEBYTECODE": "1", "CQA_REPO": str(ctx.root), "CQA_COVER": str(cover)},
-        )
-    except PermissionError as exc:
-        return None, [], str(exc)
-    ran = 0
-    marker = cover / "tests_run.txt"
-    if marker.is_file():
-        try:
-            ran = int(marker.read_text(encoding="utf-8").strip() or "0")
-        except ValueError:
-            ran = 0
-    if ran == 0:
-        detail = (completed.stderr or completed.stdout or "").strip()
-        reason = "stdlib trace executed no unittest cases"
-        if shutil.which("pytest") is None:
-            reason += "; pytest is not installed and coverage was not estimated"
-        if detail:
-            reason = f"{reason}: {detail.splitlines()[-1][:240]}"
-        return None, [], reason
-    production = {}
-    for analysis in ctx.analyses or []:
-        if analysis["path"].endswith(".py") and not _is_test_path(analysis["path"]):
-            source = _text(ctx, ctx.root / analysis["path"])
-            production[analysis["path"]] = "\n".join(line.expandtabs(8).rstrip() for line in source.splitlines())
-    hits = missing = 0
-    evidence = []
-    for cover_file in cover.glob("*.cover"):
-        if cover_file.name.startswith("cqa_trace_driver") or cover_file.name.startswith("cqa_loaded_"):
-            continue
-        body = cover_file.read_text(encoding="utf-8", errors="replace")
-        reconstructed = _reconstruct_cover(body)
-        if reconstructed not in production.values():
-            continue
-        file_hits, file_missing = _count_cover(body)
-        if file_hits + file_missing == 0:
-            continue
-        hits += file_hits
-        missing += file_missing
-        evidence.append(cover_file.name)
-    if hits + missing == 0:
-        detail = (completed.stderr or completed.stdout or "trace produced no production coverage").strip()
-        return None, [], detail.splitlines()[-1][:240]
-    return round(100.0 * hits / (hits + missing), 1), evidence, ""
+        analyses = ctx.analyses or []
+        tests = [analysis for analysis in analyses if _is_test_path(analysis["path"]) and analysis["path"].endswith(".py")]
+        starts = sorted({Path(test["path"]).parent.as_posix() for test in tests}) or ["."]
+        env = {"PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": str(root)}
+        for start in starts:
+            start_dir = str(root if start == "." else (root / start).resolve())
+            # trace's -m is --missing, so --module is what actually runs unittest.
+            command = [
+                sys.executable, "-m", "trace", "--count", "--missing",
+                "--coverdir", str(cover), "--ignore-module", "unittest",
+                "--ignore-dir", sys.prefix, "--module", "unittest", "discover",
+                "-s", start_dir, "-t", start_dir, "-q",
+            ]
+            try:
+                run_contained(command, root, ctx.log, timeout=180, write_path=cover, env=env)
+            except PermissionError as exc:
+                return None, [], str(exc)
+        production = {}
+        for analysis in analyses:
+            if analysis["path"].endswith(".py") and not _is_test_path(analysis["path"]):
+                source = _text(ctx, ctx.root / analysis["path"])
+                production[analysis["path"]] = "\n".join(line.expandtabs(8).rstrip() for line in source.splitlines())
+        hits = missing = 0
+        evidence = []
+        for cover_file in cover.glob("*.cover"):
+            body = cover_file.read_text(encoding="utf-8", errors="replace")
+            reconstructed = _reconstruct_cover(body)
+            if reconstructed not in production.values():
+                continue
+            file_hits, file_missing = _count_cover(body)
+            if file_hits + file_missing == 0:
+                continue
+            hits += file_hits
+            missing += file_missing
+            evidence.append(cover_file.name)
+        if hits + missing == 0:
+            return None, [], "unittest discover produced no production coverage"
+        return round(100.0 * hits / (hits + missing), 1), evidence, ""
+    finally:
+        shutil.rmtree(cover, ignore_errors=True)
 
 
 def _reconstruct_cover(text):
@@ -2455,67 +2596,17 @@ def _method_cites_requirement(text, method, known):
 
 
 def _authorized_acceptance_failures(ctx, specs):
-    """Run Python unittest modules in the approved sandbox and return failing acceptance tests."""
     known = {item["id"] for item in specs}
-    work = Path(tempfile.mkdtemp(prefix="cqa-accept-")).resolve()
-    driver = work / "cqa_accept_driver.py"
-    driver.write_text(
-        "import importlib.util, os, sys, unittest\n"
-        "from pathlib import Path\n"
-        "root = Path(os.environ['CQA_REPO'])\n"
-        "out = Path(os.environ['CQA_ACCEPT'])\n"
-        "sys.path.insert(0, str(root))\n"
-        "loader = unittest.TestLoader()\n"
-        "suite = unittest.TestSuite()\n"
-        "skip = {'.git', '.venv', 'node_modules', '__pycache__'}\n"
-        "for path in sorted(root.rglob('*.py')):\n"
-        "    if any(part in skip for part in path.parts):\n"
-        "        continue\n"
-        "    rel = path.relative_to(root).as_posix()\n"
-        "    if not (path.name.startswith('test_') or path.name.endswith('_test.py') or rel.startswith('tests/')):\n"
-        "        continue\n"
-        "    spec = importlib.util.spec_from_file_location('cqa_loaded_' + path.stem, path)\n"
-        "    module = importlib.util.module_from_spec(spec)\n"
-        "    module.CQA_PATH = rel\n"
-        "    sys.modules[spec.name] = module\n"
-        "    spec.loader.exec_module(module)\n"
-        "    suite.addTests(loader.loadTestsFromModule(module))\n"
-        "result = unittest.TextTestRunner(verbosity=0).run(suite)\n"
-        "lines = []\n"
-        "for case, _tb in list(result.failures) + list(result.errors):\n"
-        "    module = sys.modules.get(case.__class__.__module__)\n"
-        "    rel = getattr(module, 'CQA_PATH', '')\n"
-        "    lines.append(rel + '::' + case._testMethodName)\n"
-        "(out / 'failures.txt').write_text('\\n'.join(lines), encoding='utf-8')\n"
-        "(out / 'done.txt').write_text('ok', encoding='utf-8')\n",
-        encoding="utf-8",
-    )
-    try:
-        try:
-            run_contained(
-                [sys.executable, str(driver)],
-                ctx.root,
-                ctx.log,
-                timeout=60,
-                write_path=work,
-                env={"PYTHONDONTWRITEBYTECODE": "1", "CQA_REPO": str(Path(ctx.root).resolve()), "CQA_ACCEPT": str(work)},
-            )
-        except (PermissionError, subprocess.TimeoutExpired):
-            return None
-        if not (work / "done.txt").is_file():
-            return None
-        failures = []
-        report = work / "failures.txt"
-        for line in report.read_text(encoding="utf-8").splitlines() if report.is_file() else []:
-            if "::" not in line:
-                continue
-            rel, method = line.split("::", 1)
-            text = _text(ctx, Path(ctx.root) / rel)
-            if _method_cites_requirement(text, method, known):
-                failures.append(f"{rel}:{method}")
-        return failures
-    finally:
-        shutil.rmtree(work, ignore_errors=True)
+    result = project_test_result(ctx)
+    if result is None:
+        return None
+    failures = []
+    for item in result["failures"]:
+        rel, method = item.split(":", 1)
+        text = _text(ctx, Path(ctx.root) / rel)
+        if _method_cites_requirement(text, method, known):
+            failures.append(f"{rel}:{method}")
+    return failures
 
 
 def run_requirements(ctx):

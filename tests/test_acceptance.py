@@ -44,7 +44,7 @@ def _write(path, text):
 
 class AcceptanceTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="cqa-test-", dir=ROOT))
+        self.tmp = Path(tempfile.mkdtemp(prefix="cqa-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
 
     def repo(self, name="repo"):
@@ -1369,6 +1369,26 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(metrics["DUP-002"]["status"], "FAIL")
         self.assertEqual(metrics["DUP-001"]["measured_value"], 0)
 
+    def test_token_duplicate_uses_the_source_line(self):
+        """Requirements: 6.9, 11.3."""
+        repo = self.repo("clone-lines")
+        _write(repo / "quality-auditor.yaml", """
+        version: 1
+        default_profile: clones
+        profiles:
+          clones:
+            include: [duplication]
+        """)
+        body = "\n\nfunction copy(alpha, beta, gamma, delta, epsilon, zeta, eta, theta, iota, kappa) { return alpha+beta+gamma+delta+epsilon+zeta+eta+theta+iota+kappa; }\n"
+        # _write lstrips the body, which would put the clone on line 1.
+        (repo / "left.js").write_text(body, encoding="utf-8")
+        (repo / "right.js").write_text(body, encoding="utf-8")
+        report = self.audit(repo, profile="clones")
+        findings = [item for item in report["findings"] if "DUP-002" in item["metric_ids"]]
+        self.assertTrue(findings)
+        self.assertTrue(any(item["line"] == 3 for item in findings))
+        self.assertFalse(any(item["line"] == 1 for item in findings))
+
     def test_script_functions_share_structure_hashes(self):
         """Requirements: 6.9, 8.1."""
         repo = self.repo("shapes")
@@ -1429,6 +1449,39 @@ class AcceptanceTests(unittest.TestCase):
         metrics = {item["metric_id"]: item for item in report["metrics"]}
         self.assertEqual(metrics["CC-011"]["measured_value"], 2)
         self.assertEqual(set(metrics["CC-011"]["evidence_refs"]), {"app.py:4:40", "app.js:2:40"})
+
+    def test_unexported_script_function_can_be_dead(self):
+        """Requirements: 6.4, 6.5, 6.8."""
+        repo = self.repo("exports")
+        _write(repo / "quality-auditor.yaml", """
+        version: 1
+        default_profile: dead
+        profiles:
+          dead:
+            include: [dead_code]
+        """)
+        _write(repo / "main.js", """
+        import { used } from "./util.js";
+        function main() { return used(); }
+        """)
+        _write(repo / "util.js", """
+        export function used() { return 1; }
+        function spare() { return 2; }
+        """)
+        _write(repo / "main.cpp", """
+        #include "util.h"
+        int main() { return used(); }
+        """)
+        _write(repo / "util.h", """
+        int used() { return 1; }
+        int spare() { return 2; }
+        """)
+        report = self.audit(repo, profile="dead")
+        metrics = {item["metric_id"]: item for item in report["metrics"]}
+        confirmed = [item for item in report["findings"] if "GRAPH-001" in item["metric_ids"] and item["confidence"] == "confirmed"]
+        self.assertTrue(any(item["file"] == "util.js" and item["line"] == 2 for item in confirmed))
+        self.assertFalse(any(item["file"] == "util.h" for item in confirmed))
+        self.assertGreaterEqual(metrics["GRAPH-001"]["measured_value"], 1)
 
     def test_unimported_modules_are_dead_when_an_entry_exists(self):
         """Requirements: 6.4, 8.1."""
@@ -1784,6 +1837,170 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(metrics["REQ-008"]["status"], "FAIL")
         self.assertIn("tests/test_add.py:test_add", metrics["REQ-008"]["evidence_refs"])
         self.assertNotIn("tests/test_add.py:test_other", metrics["REQ-008"]["evidence_refs"])
+
+    def test_pytest_project_uses_its_runner(self):
+        """Requirements: 4.4, 7.6, 8.3."""
+        repo = self.repo("pyrunner")
+        _write(repo / "quality-auditor.yaml", """
+        version: 1
+        default_profile: accept
+        profiles:
+          accept:
+            include: [requirements_trace, coverage]
+        """)
+        _write(repo / "docs" / "requirements.md", """
+        # REQ-100 Adder
+        The adder works.
+        Acceptance: test_add returns 2.
+        """)
+        _write(repo / "app.py", """
+        def add(left, right):
+            return left + right
+        """)
+        _write(repo / "tests" / "test_add.py", """
+        import pytest
+
+        def test_add():
+            \"\"\"REQ-100\"\"\"
+            assert 1 + 1 == 3
+        """)
+        runner = repo / ".venv" / "bin" / "pytest"
+        runner.parent.mkdir(parents=True)
+        runner.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' 'FAILED tests/test_add.py::test_add - AssertionError'\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        runner.chmod(0o755)
+        report = self.audit(repo, profile="accept", allow_repo_execution=True, sandbox_confirmed=True)
+        commands = [" ".join(item["command"]) for item in report["execution"]["commands"]]
+        blob = "\n".join(commands)
+        self.assertIn(".venv/bin/pytest", blob)
+        self.assertNotIn("cqa_accept_driver", blob)
+        self.assertNotIn("cqa_trace_driver", blob)
+        metrics = {item["metric_id"]: item for item in report["metrics"]}
+        self.assertIn("tests/test_add.py:test_add", metrics["REQ-008"]["evidence_refs"])
+        self.assertEqual(metrics["TEST-002"]["status"], "UNAVAILABLE")
+        self.assertIn("coverage.py", metrics["TEST-002"]["reason"])
+
+    def test_pytest_collection_error_stays_unavailable(self):
+        """Requirements: 4.4, 7.6, 8.3."""
+        repo = self.repo("pycollect")
+        _write(repo / "quality-auditor.yaml", """
+        version: 1
+        default_profile: accept
+        profiles:
+          accept:
+            include: [requirements_trace, coverage]
+        """)
+        _write(repo / "docs" / "requirements.md", """
+        # REQ-100 Adder
+        The adder works.
+        Acceptance: test_add returns 2.
+        """)
+        _write(repo / "app.py", """
+        def add(left, right):
+            return left + right
+        """)
+        _write(repo / "tests" / "test_add.py", """
+        import pytest
+
+        def test_add():
+            \"\"\"REQ-100\"\"\"
+            assert 1 + 1 == 3
+        """)
+        runner = repo / ".venv" / "bin" / "pytest"
+        runner.parent.mkdir(parents=True)
+        runner.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' 'ERROR collecting tests'\n"
+            "exit 2\n",
+            encoding="utf-8",
+        )
+        runner.chmod(0o755)
+        report = self.audit(repo, profile="accept", allow_repo_execution=True, sandbox_confirmed=True)
+        commands = [" ".join(item["command"]) for item in report["execution"]["commands"]]
+        blob = "\n".join(commands)
+        self.assertIn(".venv/bin/pytest", blob)
+        self.assertNotIn("cqa_accept_driver", blob)
+        metrics = {item["metric_id"]: item for item in report["metrics"]}
+        self.assertEqual(metrics["REQ-008"]["status"], "UNAVAILABLE")
+
+    def test_pytest_failure_with_error_line_stays_unavailable(self):
+        """Requirements: 4.4, 7.6, 8.3."""
+        repo = self.repo("pyerror")
+        _write(repo / "quality-auditor.yaml", """
+        version: 1
+        default_profile: accept
+        profiles:
+          accept:
+            include: [requirements_trace, coverage]
+        """)
+        _write(repo / "docs" / "requirements.md", """
+        # REQ-100 Adder
+        The adder works.
+        Acceptance: test_add returns 2.
+        """)
+        _write(repo / "app.py", """
+        def add(left, right):
+            return left + right
+        """)
+        _write(repo / "tests" / "test_add.py", """
+        import pytest
+
+        def test_add():
+            \"\"\"REQ-100\"\"\"
+            assert 1 + 1 == 3
+        """)
+        runner = repo / ".venv" / "bin" / "pytest"
+        runner.parent.mkdir(parents=True)
+        runner.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' 'FAILED tests/test_add.py::test_add - AssertionError'\n"
+            "printf '%s\\n' 'ERROR tests/test_missing.py'\n"
+            "exit 1\n",
+            encoding="utf-8",
+        )
+        runner.chmod(0o755)
+        report = self.audit(repo, profile="accept", allow_repo_execution=True, sandbox_confirmed=True)
+        metrics = {item["metric_id"]: item for item in report["metrics"]}
+        self.assertEqual(metrics["REQ-008"]["status"], "UNAVAILABLE")
+
+    def test_unittest_import_error_stays_unavailable(self):
+        """Requirements: 7.8, 8.8."""
+        repo = self.repo("accept-broken")
+        _write(repo / "quality-auditor.yaml", """
+        version: 1
+        default_profile: accept
+        profiles:
+          accept:
+            include: [requirements_trace]
+        """)
+        _write(repo / "docs" / "requirements.md", """
+        # REQ-100 Adder
+        The adder works.
+        Acceptance: test_add returns 2.
+
+        # REQ-200 Missing
+        The widget is covered.
+        Acceptance: a test cites this requirement.
+        """)
+        _write(repo / "tests" / "test_add.py", """
+        import unittest
+
+        class AddTests(unittest.TestCase):
+            def test_add(self):
+                \"\"\"REQ-100\"\"\"
+                self.assertEqual(1 + 1, 3)
+
+            def test_other(self):
+                self.assertEqual(1, 0)
+        """)
+        _write(repo / "tests" / "test_broken.py", "import does_not_exist\n")
+        report = self.audit(repo, profile="accept", allow_repo_execution=True, sandbox_confirmed=True)
+        metrics = {item["metric_id"]: item for item in report["metrics"]}
+        self.assertEqual(metrics["REQ-008"]["status"], "UNAVAILABLE")
 
     def test_script_loop_nesting_ignores_conditionals(self):
         """Requirements: 6.1, 8.8."""
