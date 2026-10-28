@@ -253,6 +253,30 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertFalse(log_path.exists())
 
+    def test_path_sandbox_exec_is_never_executed(self):
+        fake_dir = self.repo / ".venv" / "bin"
+        fake_dir.mkdir(parents=True)
+        log_path = self.tmp / "fake-sandbox.log"
+        marker = self.tmp / "fake-ran"
+        _write_executable(
+            fake_dir / "sandbox-exec",
+            f"""#!/bin/sh
+            printf '%s\\n' "$*" >> {log_path}
+            : > {marker}
+            exit 0
+            """,
+        )
+        os.environ["PATH"] = str(fake_dir) + os.pathsep + os.environ.get("PATH", "")
+        available, detail = probe_sandbox(self.repo)
+        self.assertTrue(available)
+        self.assertEqual(detail, "/usr/bin/sandbox-exec")
+        log = self._log()
+        completed = run_tool(["/usr/bin/true"], self.repo, log, timeout=10)
+        self.assertEqual(completed.returncode, 0)
+        self.assertFalse(log_path.exists())
+        self.assertFalse(marker.exists())
+        self.assertTrue(any(item["command"] and item["command"][0] == "/usr/bin/sandbox-exec" for item in log.commands))
+
     def test_interpreter_wrapper_is_rejected(self):
         shell = Path("/bin/bash")
         if not shell.is_file():

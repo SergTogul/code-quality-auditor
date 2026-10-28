@@ -175,15 +175,29 @@ def _run_process(command, cwd, env, timeout):
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
+_PLATFORM_SANDBOX = {"darwin": "/usr/bin/sandbox-exec"}
+
+
 def _trusted_sandbox():
-    """The only containment implementation this process will execute."""
-    sandbox = shutil.which("sandbox-exec")
-    if not sandbox:
+    """The platform binary at a fixed path. PATH cannot select a different executable."""
+    candidate = _PLATFORM_SANDBOX.get(sys.platform)
+    if not candidate:
         return None
-    path = Path(sandbox).resolve()
-    if not path.is_file():
+    path = Path(candidate)
+    try:
+        info = path.stat()
+    except OSError:
         return None
-    return path
+    if not path.is_file() or info.st_uid != 0:
+        return None
+    return path.resolve()
+
+
+def _sandbox_command(profile, command):
+    trusted = _trusted_sandbox()
+    if trusted is None:
+        raise PermissionError("no containment command is available")
+    return [str(trusted), "-p", profile, "--", *command]
 
 
 def probe_sandbox(cwd=None):
@@ -299,7 +313,7 @@ def _contained_command(command, cwd, write_path):
         command[0] = str(executable.resolve())
     resolved_write = str(Path(write_path).resolve()) if write_path else None
     profile = _profile(_command_read_paths(cwd, command), resolved_write)
-    return ["sandbox-exec", "-p", profile, "--", *command]
+    return _sandbox_command(profile, command)
 
 
 def run_contained(command, cwd, log, timeout=30, write_path=None, env=None):
@@ -346,7 +360,7 @@ def run_tool(command, cwd, log, timeout=60):
     if not ok:
         log.deny("containment", detail)
         raise PermissionError(detail)
-    wrapped = ["sandbox-exec", "-p", _profile(_command_read_paths(cwd, command), None, allow_temp_writes=True), "--", *command]
+    wrapped = _sandbox_command(_profile(_command_read_paths(cwd, command), None, allow_temp_writes=True), command)
     log.record(wrapped, "started")
     completed = _run_process(wrapped, cwd, _sanitize_env(), timeout)
     log.record(wrapped, f"exit {completed.returncode}")
