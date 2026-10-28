@@ -172,12 +172,36 @@ def _same(left, right):
 
 
 def _dict_delta(before, after):
+    """Changed keys only. Nested dicts stay nested so siblings are not replaced."""
     before = before or {}
     delta = {}
     for key, value in (after or {}).items():
-        if key not in before or not _same(before.get(key), value):
+        if key not in before:
+            delta[key] = value
+            continue
+        previous = before[key]
+        if _same(previous, value):
+            continue
+        if isinstance(previous, dict) and isinstance(value, dict):
+            nested = _dict_delta(previous, value)
+            if nested:
+                delta[key] = nested
+        elif value is None:
+            continue
+        else:
             delta[key] = value
     return delta
+
+
+def _merge_dict(current, delta):
+    for key, value in delta.items():
+        existing = current.get(key)
+        if isinstance(existing, dict) and isinstance(value, dict):
+            _merge_dict(existing, value)
+        elif value is None and key in current and existing is not None:
+            continue
+        else:
+            current[key] = value
 
 
 def _element_change(before, after):
@@ -263,7 +287,7 @@ def _merge_object(current, exported):
         kind, value = change
         existing = getattr(current, key, None)
         if kind == "dict" and isinstance(existing, dict):
-            existing.update(value)
+            _merge_dict(existing, value)
         elif kind == "dict" and existing is None:
             setattr(current, key, dict(value))
         elif kind == "list" and isinstance(existing, list):
@@ -276,7 +300,7 @@ def _merge_object(current, exported):
                     continue
                 current_item = existing[index]
                 if ekind == "dict" and isinstance(current_item, dict):
-                    current_item.update(payload)
+                    _merge_dict(current_item, payload)
                 elif ekind == "value" and not (payload is None and current_item is not None):
                     existing[index] = payload
             _extend_unique(existing, value.get("extra") or [])
@@ -297,14 +321,14 @@ def _merge_closures(fn, exported):
         except ValueError:
             continue
         if kind == "dict" and isinstance(current, dict) and isinstance(payload, dict):
-            current.update(payload)
+            _merge_dict(current, payload)
         elif kind == "object" and isinstance(payload, dict) and hasattr(current, "__dict__"):
             _merge_object(current, payload)
 
 
 def _merge_evidence(evidence, exported):
     if isinstance(evidence, dict) and isinstance(exported, dict):
-        evidence.update(exported)
+        _merge_dict(evidence, exported)
 
 
 def _attempt_payload(runner, task_id, evidence):
@@ -493,7 +517,8 @@ def _poll_job(job, now, cancel, max_attempts, backoff):
         if job.group_ready:
             _signal_pid(job.pid, True)
     payload = None if killed else _read_payload(job.result_path)
-    _apply_payload(job.runner, job.evidence, payload if not killed else None)
+    if payload and payload.get("status") == "ok":
+        _apply_payload(job.runner, job.evidence, payload)
     _close_pipe(job.ready_read)
     if job.result_path:
         try:

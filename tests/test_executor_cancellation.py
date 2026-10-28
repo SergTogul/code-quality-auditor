@@ -27,7 +27,7 @@ spec = importlib.util.spec_from_file_location("auditor", SKILL / "scripts" / "au
 auditor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(auditor)
 
-from cqa.executor import _run_thread_task, execute  # noqa: E402
+from cqa.executor import TransientFailure, _run_thread_task, execute  # noqa: E402
 
 
 REGISTRY = {
@@ -198,10 +198,11 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertEqual(skipped["tasks"][0]["attempts"][0]["diagnostic"], "cancelled before start")
 
     def test_deterministic_failure_is_not_retried(self):
-        calls = {"n": 0}
+        calls = self.tmp / "deterministic-calls"
+        calls.write_text("0", encoding="utf-8")
 
         def broken(_task, _store):
-            calls["n"] += 1
+            calls.write_text(str(int(calls.read_text(encoding="utf-8")) + 1), encoding="utf-8")
             raise ValueError("deterministic")
 
         result = execute(
@@ -215,7 +216,7 @@ class ExecutorCancellationTests(unittest.TestCase):
         failed = next(task for task in result["tasks"] if task["task_id"] == "right")
         self.assertEqual(len(failed["attempts"]), 1)
         self.assertFalse(failed["attempts"][0]["transient"])
-        self.assertEqual(calls["n"], 1)
+        self.assertEqual(calls.read_text(encoding="utf-8"), "1")
         dependent = next(task for task in result["tasks"] if task["task_id"] == "left")
         self.assertTrue(dependent["ok"])
 
@@ -382,3 +383,89 @@ class ExecutorCancellationTests(unittest.TestCase):
             invocation={"budgets": {"concurrency": 2}},
         )
         self.assertGreater(report["graph_completeness"].get("indexed_files", 0), 0)
+
+    def test_failed_attempt_does_not_keep_partial_findings(self):
+        class Context:
+            def __init__(self):
+                self.analyses = []
+
+        def make_runner(counter, context):
+            def runner(_task, store):
+                count = int(counter.read_text(encoding="utf-8")) + 1
+                counter.write_text(str(count), encoding="utf-8")
+                context.analyses.append("partial")
+                store["findings"]["leaked"] = count
+                if count == 1:
+                    raise TransientFailure("temporary")
+                context.analyses[:] = ["final"]
+                store["findings"] = {"final": True}
+                return {"ok": True}
+
+            return runner
+
+        context = Context()
+        counter = self.tmp / "tries"
+        counter.write_text("0", encoding="utf-8")
+        evidence = {"findings": {}}
+        result = execute(
+            {"left"},
+            REGISTRY,
+            {"left": make_runner(counter, context)},
+            evidence,
+            {"concurrency": 1, "max_retries": 2, "retry_backoff_seconds": 0, "task_timeout_seconds": 2},
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertGreaterEqual(len(result["tasks"][0]["attempts"]), 2)
+        self.assertEqual(context.analyses, ["final"])
+        self.assertEqual(evidence["findings"], {"final": True})
+
+        terminal = Context()
+        terminal_evidence = {"findings": {}}
+
+        def broken(_task, store):
+            terminal.analyses.append("partial")
+            store["findings"]["leaked"] = True
+            raise ValueError("deterministic")
+
+        failed = execute(
+            {"left"},
+            REGISTRY,
+            {"left": broken},
+            terminal_evidence,
+            {"concurrency": 1, "max_retries": 2, "task_timeout_seconds": 2},
+        )
+        self.assertFalse(failed["ok"])
+        self.assertEqual(len(failed["tasks"][0]["attempts"]), 1)
+        self.assertEqual(terminal.analyses, [])
+        self.assertEqual(terminal_evidence["findings"], {})
+
+    def test_parallel_writers_keep_distinct_nested_evidence_keys(self):
+        registry = {
+            "left": {"id": "left", "depends_on": []},
+            "right": {"id": "right", "depends_on": []},
+        }
+
+        def make_runner(left_delay, right_delay):
+            def runner(task_id, store):
+                if task_id == "left":
+                    time.sleep(left_delay)
+                    store["findings"]["a"] = 1
+                else:
+                    time.sleep(right_delay)
+                    store["findings"]["b"] = 1
+                return {"task": task_id}
+
+            return runner
+
+        for left_delay, right_delay in ((0.0, 0.25), (0.25, 0.0)):
+            evidence = {"findings": {"a": 0, "b": 0}}
+            runner = make_runner(left_delay, right_delay)
+            result = execute(
+                {"left", "right"},
+                registry,
+                {"left": runner, "right": runner},
+                evidence,
+                {"concurrency": 2, "max_retries": 1, "task_timeout_seconds": 2},
+            )
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(evidence["findings"], {"a": 1, "b": 1})

@@ -247,11 +247,13 @@ class AcceptanceTests(unittest.TestCase):
         self.assertTrue(parallel_result["ok"])
         self.assertEqual(len(parallel_result["layers"][0]), 2)
 
-        state = {"n": 0}
+        counter = self.tmp / "flaky-count"
+        counter.write_text("0", encoding="utf-8")
 
         def flaky(_task, _store):
-            state["n"] += 1
-            if state["n"] < 2:
+            count = int(counter.read_text(encoding="utf-8")) + 1
+            counter.write_text(str(count), encoding="utf-8")
+            if count < 2:
                 raise TransientFailure("temporary")
             return {"done": True}
 
