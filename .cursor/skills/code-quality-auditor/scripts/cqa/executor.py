@@ -180,8 +180,21 @@ def _dict_delta(before, after):
     return delta
 
 
+def _element_change(before, after):
+    if isinstance(before, dict) and isinstance(after, dict):
+        nested = _dict_delta(before, after)
+        if not nested:
+            return None
+        if set(before) - set(after):
+            return ("value", after)
+        return ("dict", nested)
+    if after is None and before is not None:
+        return None
+    return ("value", after)
+
+
 def _list_change(before, after):
-    """Append only a pure tail. Mutated elements replace the list the child actually wrote."""
+    """Append a pure tail. Same-length edits merge per element so siblings do not replace the list."""
     if not isinstance(before, list) or not isinstance(after, list):
         return ("value", after)
     if len(after) >= len(before) and all(_same(before[index], after[index]) for index in range(len(before))):
@@ -189,7 +202,17 @@ def _list_change(before, after):
         if not extra:
             return None
         return ("list", extra)
-    return ("value", after)
+    if len(after) < len(before):
+        return ("value", after)
+    changes = []
+    for index, previous in enumerate(before):
+        change = _element_change(previous, after[index])
+        if change:
+            changes.append((index, change[0], change[1]))
+    extra = after[len(before):]
+    if not changes:
+        return ("list", extra) if extra else None
+    return ("elements", {"changes": changes, "extra": extra})
 
 
 def _object_delta(before, after):
@@ -247,6 +270,16 @@ def _merge_object(current, exported):
             _extend_unique(existing, value)
         elif kind == "list" and existing is None:
             setattr(current, key, list(value))
+        elif kind == "elements" and isinstance(existing, list) and isinstance(value, dict):
+            for index, ekind, payload in value.get("changes") or []:
+                if not isinstance(index, int) or index < 0 or index >= len(existing):
+                    continue
+                current_item = existing[index]
+                if ekind == "dict" and isinstance(current_item, dict):
+                    current_item.update(payload)
+                elif ekind == "value" and not (payload is None and current_item is not None):
+                    existing[index] = payload
+            _extend_unique(existing, value.get("extra") or [])
         elif kind == "object" and hasattr(existing, "__dict__"):
             _merge_object(existing, value)
         elif kind == "value":
@@ -457,6 +490,8 @@ def _poll_job(job, now, cancel, max_attempts, backoff):
         reaped = _reap(job.pid)
     else:
         reaped = True
+        if job.group_ready:
+            _signal_pid(job.pid, True)
     payload = None if killed else _read_payload(job.result_path)
     _apply_payload(job.runner, job.evidence, payload if not killed else None)
     _close_pipe(job.ready_read)

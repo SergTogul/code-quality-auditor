@@ -16,6 +16,7 @@ import textwrap
 import threading
 import time
 import unittest
+import warnings
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -255,6 +256,98 @@ class ExecutorCancellationTests(unittest.TestCase):
             self.assertTrue(result["ok"], result)
             self.assertEqual(context.graph, {"from": "writer"})
             self.assertEqual(context.analyses, ["kept"])
+
+    def test_parallel_writers_keep_distinct_list_elements(self):
+        class Context:
+            def __init__(self):
+                self.analyses = [{"a": 0}, {"b": 0}]
+
+        registry = {
+            "left": {"id": "left", "depends_on": []},
+            "right": {"id": "right", "depends_on": []},
+        }
+
+        def make_runner(left_delay, right_delay, context):
+            def runner(task_id, _store):
+                if task_id == "left":
+                    time.sleep(left_delay)
+                    context.analyses[0]["a"] = 1
+                else:
+                    time.sleep(right_delay)
+                    context.analyses[1]["b"] = 1
+                return {"task": task_id}
+
+            return runner
+
+        for left_delay, right_delay in ((0.0, 0.25), (0.25, 0.0)):
+            context = Context()
+            runner = make_runner(left_delay, right_delay, context)
+            result = execute(
+                {"left", "right"},
+                registry,
+                {"left": runner, "right": runner},
+                {},
+                {"concurrency": 2, "max_retries": 1, "task_timeout_seconds": 2},
+            )
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(context.analyses, [{"a": 1}, {"b": 1}])
+
+    def _wait_until_dead(self, pid):
+        def stop():
+            if _alive(pid):
+                os.kill(pid, signal.SIGKILL)
+
+        self.addCleanup(stop)
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and _alive(pid):
+            time.sleep(0.05)
+        self.assertFalse(_alive(pid))
+
+    def test_background_child_dies_when_the_attempt_leader_exits(self):
+        pid_file = self.tmp / "leader-child"
+
+        def runner(_task, _store):
+            process = subprocess.Popen(["sleep", "30"])
+            pid_file.write_text(str(process.pid), encoding="utf-8")
+            return {"ok": True}
+
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            result = execute(
+                {"left"},
+                REGISTRY,
+                {"left": runner},
+                {},
+                {"concurrency": 1, "max_retries": 1, "task_timeout_seconds": 2},
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertTrue(pid_file.exists())
+        self._wait_until_dead(int(pid_file.read_text(encoding="utf-8").strip()))
+
+    def test_background_child_dies_when_the_attempt_times_out(self):
+        pid_file = self.tmp / "timeout-child"
+
+        def runner(_task, _store):
+            process = subprocess.Popen(["sleep", "30"])
+            pid_file.write_text(str(process.pid), encoding="utf-8")
+            time.sleep(30)
+            return {"ok": True}
+
+        started = time.monotonic()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            result = execute(
+                {"left"},
+                REGISTRY,
+                {"left": runner},
+                {},
+                {"concurrency": 1, "max_retries": 1, "task_timeout_seconds": 0.6},
+            )
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["tasks"][0]["attempts"][0]["outcome"], "timeout")
+        self.assertTrue(pid_file.exists())
+        self._wait_until_dead(int(pid_file.read_text(encoding="utf-8").strip()))
 
     def test_blocking_io_without_fork_reports_unterminated_work(self):
         read_fd, write_fd = os.pipe()
