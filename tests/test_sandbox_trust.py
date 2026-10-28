@@ -15,6 +15,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / ".cursor" / "skills" / "code-quality-auditor"
@@ -135,7 +136,7 @@ class SandboxTrustTests(unittest.TestCase):
         )
         started = time.monotonic()
         with self.assertRaises(subprocess_timeout()):
-            run_tool([str(tool)], self.repo, self._log(), timeout=0.4)
+            run_tool([str(tool)], self.repo, self._log(), timeout=1)
         self.assertLess(time.monotonic() - started, 5)
         grandchild = int(pid_file.read_text(encoding="utf-8").strip())
         deadline = time.monotonic() + 2
@@ -198,13 +199,81 @@ class SandboxTrustTests(unittest.TestCase):
             encoding="utf-8",
         )
         sentinel.write_text("secret", encoding="utf-8")
+        private = Path.home() / "cqa-sandbox-private-note"
+        private.write_text("private", encoding="utf-8")
         self.addCleanup(lambda: sentinel.unlink(missing_ok=True))
+        self.addCleanup(lambda: private.unlink(missing_ok=True))
+        reader.write_text(
+            reader.read_text(encoding="utf-8")
+            + textwrap.dedent(
+                f"""
+                try:
+                    open({str(private)!r}, encoding="utf-8").read()
+                    print("PRIVATE_READ")
+                except OSError:
+                    print("PRIVATE_BLOCKED")
+                """
+            ),
+            encoding="utf-8",
+        )
         os.environ.pop("CQA_SANDBOX_CMD", None)
         completed = run_contained([sys.executable, str(reader)], self.repo, self._log(), timeout=20)
         output = completed.stdout
-        self.assertIn("SECRET_BLOCKED", output)
+        self.assertIn("SECRET_BLOCKED", output, f"rc={completed.returncode} stderr={completed.stderr!r} stdout={output!r}")
+        self.assertIn("PRIVATE_BLOCKED", output)
         self.assertIn("REPO visible", output)
         self.assertNotIn("SECRET_READ", output)
+        self.assertNotIn("PRIVATE_READ", output)
+
+    def test_tool_without_containment_does_not_run(self):
+        marker = self.tmp / "side-effect"
+        tool = self.tmp / "host-tool"
+        _write_executable(tool, f"#!/bin/sh\n: > {marker}\n")
+        with mock.patch("cqa.security.probe_sandbox", return_value=(False, "containment is unavailable")):
+            with self.assertRaises(PermissionError):
+                run_tool([str(tool)], self.repo, self._log())
+        self.assertFalse(marker.exists())
+
+    def test_wrapper_that_blocks_only_the_write_probe_is_rejected(self):
+        wrapper = self.tmp / "read-wrapper"
+        _write_executable(
+            wrapper,
+            """#!/bin/sh
+            if [ "$1" = /usr/bin/touch ]; then
+              exit 1
+            fi
+            exec "$@"
+            """,
+        )
+        os.environ["CQA_SANDBOX_CMD"] = str(wrapper)
+        available, detail = probe_sandbox(self.repo)
+        self.assertFalse(available)
+        self.assertIn("does not isolate", detail)
+
+    def test_wrapper_that_allows_network_is_rejected(self):
+        wrapper = self.tmp / "network-wrapper"
+        _write_executable(
+            wrapper,
+            """#!/bin/sh
+            if [ "$1" = /usr/bin/touch ] || [ "$1" = /bin/cat ]; then
+              exit 1
+            fi
+            exec "$@"
+            """,
+        )
+        os.environ["CQA_SANDBOX_CMD"] = str(wrapper)
+        available, detail = probe_sandbox(self.repo)
+        self.assertFalse(available)
+        self.assertIn("does not isolate", detail)
+
+    def test_interpreter_wrapper_is_rejected(self):
+        shell = Path("/bin/bash")
+        if not shell.is_file():
+            self.skipTest("bash is not present")
+        os.environ["CQA_SANDBOX_CMD"] = str(shell)
+        available, detail = probe_sandbox(self.repo)
+        self.assertFalse(available)
+        self.assertIn("interpreter or shell", detail)
 
 
 def subprocess_timeout():

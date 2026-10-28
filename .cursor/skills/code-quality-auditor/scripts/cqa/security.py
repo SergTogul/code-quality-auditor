@@ -4,11 +4,14 @@ from __future__ import annotations
 
 import hashlib
 import os
+import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
+import threading
 from pathlib import Path
 
 from cqa import ENGINE_VERSION
@@ -98,6 +101,7 @@ _DROPPED_ENV = {
 _NEVER_PASS = {"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PYTHONSTARTUP", "NODE_OPTIONS", "BASH_ENV", "ENV"}
 _KEEP_ENV = ("PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "COMSPEC", "USER", "LOGNAME")
 _SECRET_DIRS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".config/gh")
+_SHELLS = {"bash", "sh", "zsh", "dash", "env", "python", "python3", "perl", "ruby", "node"}
 
 
 def _quote_sb(path):
@@ -121,6 +125,9 @@ def _validate_custom(raw, cwd=None):
     if not path.is_absolute() or not path.is_file():
         raise PermissionError("custom sandbox command must be one absolute executable path")
     resolved = path.resolve()
+    name = resolved.name
+    if name in _SHELLS or name.startswith("python"):
+        raise PermissionError("custom sandbox command is an interpreter or shell")
     if cwd is not None:
         root = Path(cwd).resolve()
         if resolved == root or root in resolved.parents:
@@ -172,18 +179,58 @@ def _run_process(command, cwd, env, timeout):
 
 
 def _custom_contains(wrapper):
-    """A wrapper is containment only if a benign command works and an outside write does not."""
+    """Probe write, secret read, and network. A wrapper can still special-case these argv shapes."""
     true_run = _run_process([str(wrapper), "/usr/bin/true"], None, _sanitize_env(), 10)
     if true_run.returncode != 0:
-        return False
+        return False, "custom containment command does not isolate: benign command failed"
     probe_dir = Path(tempfile.mkdtemp(prefix="cqa-sandbox-probe-"))
     probe_file = probe_dir / "outside-write"
+    secret = probe_dir / "secret-token"
+    token = secrets.token_hex(16)
+    secret.write_text(token, encoding="utf-8")
     try:
         write_run = _run_process([str(wrapper), "/usr/bin/touch", str(probe_file)], None, _sanitize_env(), 10)
         created = probe_file.exists()
+        if write_run.returncode == 0 or created:
+            return False, "custom containment command does not isolate writes"
+        read_run = _run_process([str(wrapper), "/bin/cat", str(secret)], None, _sanitize_env(), 10)
+        if read_run.returncode == 0 or token in (read_run.stdout or ""):
+            return False, "custom containment command does not isolate reads"
+        if _network_escapes(wrapper):
+            return False, "custom containment command does not isolate network"
     finally:
         shutil.rmtree(probe_dir, ignore_errors=True)
-    return write_run.returncode != 0 and not created
+    return True, ""
+
+
+def _network_escapes(wrapper):
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server.bind(("127.0.0.1", 0))
+    server.listen(1)
+    server.settimeout(5)
+    port = server.getsockname()[1]
+    connected = {"ok": False}
+
+    def accept():
+        try:
+            connection, _addr = server.accept()
+            connection.close()
+            connected["ok"] = True
+        except OSError:
+            return
+
+    waiter = threading.Thread(target=accept, daemon=True)
+    waiter.start()
+    code = f"import socket; socket.create_connection(('127.0.0.1', {port}), 2).close()"
+    try:
+        _run_process([str(wrapper), sys.executable, "-c", code], None, _sanitize_env(), 5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    finally:
+        server.close()
+    waiter.join(1)
+    return connected["ok"]
 
 
 def probe_sandbox(cwd=None):
@@ -193,8 +240,9 @@ def probe_sandbox(cwd=None):
             path = _validate_custom(custom, cwd)
         except PermissionError as exc:
             return False, str(exc)
-        if not _custom_contains(path):
-            return False, "custom containment command does not isolate writes"
+        contained, detail = _custom_contains(path)
+        if not contained:
+            return False, detail
         return True, str(path)
     sandbox = shutil.which("sandbox-exec")
     if not sandbox:
@@ -211,16 +259,55 @@ def probe_sandbox(cwd=None):
     return True, sandbox
 
 
-def _profile(read_paths, write_path, allow_temp_writes=False):
-    """Containment for CPython and host analyzers.
+def _existing_reads(read_paths):
+    candidates = list(read_paths or [])
+    candidates.append(sys.prefix)
+    candidates.append(getattr(sys, "base_prefix", sys.prefix))
+    roots = []
+    seen = set()
+    for raw in candidates:
+        if not raw:
+            continue
+        path = Path(raw)
+        if not path.exists():
+            continue
+        resolved = str(path.resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        roots.append(resolved)
+    return roots
 
-    Reads of the system and the repository are allowed so interpreters and SDKs can start.
-    Home credential directories are denied after that allow, which is the rule that wins.
-    Writes stay limited to the approved output directory, plus the system temp directory
-    for host analyzers that need scratch space.
+
+def _command_read_paths(cwd, command):
+    paths = []
+    root = Path(cwd).resolve()
+    if root.exists():
+        paths.append(str(root))
+    for item in command:
+        candidate = Path(item)
+        if not candidate.exists():
+            continue
+        resolved = candidate.resolve()
+        paths.append(str(resolved if resolved.is_dir() else resolved.parent))
+    return paths
+
+
+def _profile(read_paths, write_path, allow_temp_writes=False):
+    """Allow system reads, then close the home directory except paths this command must read.
+
+    Filtered file-read allows are not usable on their own here: seatbelt aborts the process.
+    The home deny is applied after the blanket read, and only the command's own paths under
+    the home directory are opened again. Credential directories are denied last.
     """
-    del read_paths
-    home = Path.home()
+    home = Path.home().resolve()
+    reopen = []
+    for raw in _existing_reads(read_paths):
+        path = Path(raw).resolve()
+        if path == home or home in path.parents:
+            reopen.append(str(path))
+    home_deny = f'(deny file-read* (subpath "{_quote_sb(home)}"))'
+    reopened = "\n".join(f'(allow file-read* (subpath "{_quote_sb(path)}"))' for path in reopen)
     secret_denies = "\n".join(
         f'(deny file-read* (subpath "{_quote_sb(home / name)}"))' for name in _SECRET_DIRS
     )
@@ -241,6 +328,8 @@ def _profile(read_paths, write_path, allow_temp_writes=False):
 (allow mach-lookup)
 (allow ipc-posix*)
 (allow system-socket)
+{home_deny}
+{reopened}
 {write}
 {secret_denies}
 """
@@ -254,11 +343,8 @@ def _contained_command(command, cwd, write_path):
     custom = os.environ.get("CQA_SANDBOX_CMD")
     if custom:
         return [str(Path(custom).resolve()), *command]
-    read_paths = [str(Path(cwd).resolve())]
-    if Path(command[0]).is_file():
-        read_paths.append(str(Path(command[0]).resolve().parent.parent))
     resolved_write = str(Path(write_path).resolve()) if write_path else None
-    profile = _profile(read_paths, resolved_write)
+    profile = _profile(_command_read_paths(cwd, command), resolved_write)
     return ["sandbox-exec", "-p", profile, "--", *command]
 
 
@@ -304,17 +390,13 @@ def run_tool(command, cwd, log, timeout=60):
     command = [str(executable), *list(command)[1:]]
     custom = os.environ.get("CQA_SANDBOX_CMD")
     ok, detail = probe_sandbox(cwd)
-    if custom and not ok:
+    if not ok:
         log.deny("containment", detail)
         raise PermissionError(detail)
     if custom:
         wrapped = [str(Path(custom).resolve()), *command]
-    elif ok:
-        read_paths = [str(Path(cwd).resolve()), str(executable.parent.parent)]
-        wrapped = ["sandbox-exec", "-p", _profile(read_paths, None, allow_temp_writes=True), "--", *command]
     else:
-        log.record(command, "unsandboxed", detail)
-        wrapped = command
+        wrapped = ["sandbox-exec", "-p", _profile(_command_read_paths(cwd, command), None, allow_temp_writes=True), "--", *command]
     log.record(wrapped, "started")
     completed = _run_process(wrapped, cwd, _sanitize_env(), timeout)
     log.record(wrapped, f"exit {completed.returncode}")
