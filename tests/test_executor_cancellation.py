@@ -26,7 +26,7 @@ spec = importlib.util.spec_from_file_location("auditor", SKILL / "scripts" / "au
 auditor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(auditor)
 
-from cqa.executor import execute  # noqa: E402
+from cqa.executor import _run_thread_task, execute  # noqa: E402
 
 
 REGISTRY = {
@@ -217,3 +217,75 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertEqual(calls["n"], 1)
         dependent = next(task for task in result["tasks"] if task["task_id"] == "left")
         self.assertTrue(dependent["ok"])
+
+    def test_parallel_tasks_do_not_restore_stale_context(self):
+        class Context:
+            def __init__(self):
+                self.graph = None
+                self.analyses = None
+                self.requirements = None
+                self.duplicate_groups = None
+
+        registry = {
+            "left": {"id": "left", "depends_on": []},
+            "right": {"id": "right", "depends_on": []},
+        }
+        def make_runner(writer_delay, reader_delay, context):
+            def runner(task_id, _store):
+                if task_id == "left":
+                    time.sleep(writer_delay)
+                    context.graph = {"from": "writer"}
+                    context.analyses = ["kept"]
+                    return {"role": "writer"}
+                time.sleep(reader_delay)
+                return {"role": "reader"}
+
+            return runner
+
+        for writer_delay, reader_delay in ((0.0, 0.25), (0.25, 0.0)):
+            context = Context()
+            runner = make_runner(writer_delay, reader_delay, context)
+            result = execute(
+                {"left", "right"},
+                registry,
+                {"left": runner, "right": runner},
+                {},
+                {"concurrency": 2, "max_retries": 1, "task_timeout_seconds": 2},
+            )
+            self.assertTrue(result["ok"], result)
+            self.assertEqual(context.graph, {"from": "writer"})
+            self.assertEqual(context.analyses, ["kept"])
+
+    def test_blocking_io_without_fork_reports_unterminated_work(self):
+        read_fd, write_fd = os.pipe()
+
+        def blocked(_task, _store):
+            os.read(read_fd, 1)
+            return {"done": True}
+
+        started = time.monotonic()
+        result = _run_thread_task("left", blocked, {}, "key", 0.2, 2, 0, threading.Event(), None, None)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "termination could not be guaranteed")
+        self.assertEqual(len(result["attempts"]), 1)
+        self.assertFalse(result["attempts"][0]["transient"])
+        os.close(write_fd)
+        os.close(read_fd)
+
+    def test_audit_keeps_graph_evidence_across_parallel_checks(self):
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("def main():\n    return 1\n\nif __name__ == '__main__':\n    main()\n", encoding="utf-8")
+        (repo / "quality-auditor.yaml").write_text(
+            "version: 1\ndefault_profile: focused\nprofiles:\n  focused:\n    include: [syntax_static, symbol_index]\n",
+            encoding="utf-8",
+        )
+        report = auditor.audit(
+            repo,
+            skill_root=SKILL,
+            profile="focused",
+            output_dir=self.tmp / "out",
+            invocation={"budgets": {"concurrency": 2}},
+        )
+        self.assertGreater(report["graph_completeness"].get("indexed_files", 0), 0)

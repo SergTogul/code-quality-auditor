@@ -125,6 +125,11 @@ def _pickleable(value):
     return True
 
 
+def _snapshot(value):
+    """Copy values before an attempt so later in-place edits stay visible as deltas."""
+    return pickle.loads(pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL))
+
+
 def _export_object(obj):
     data = {}
     for key, value in obj.__dict__.items():
@@ -132,10 +137,6 @@ def _export_object(obj):
             continue
         data[key] = value
     return data
-
-
-_REPLACE_FIELDS = {"analyses", "graph", "requirements", "duplicate_groups"}
-_APPEND_FIELDS = {"commands", "denied", "approvals", "ignored_overrides", "limitations"}
 
 
 def _skip_cell(value):
@@ -163,22 +164,94 @@ def _export_closures(fn):
     return exported
 
 
-def _merge_object(current, exported):
-    for key, value in exported.items():
-        if key == "lock":
+def _same(left, right):
+    try:
+        return pickle.dumps(left, protocol=pickle.HIGHEST_PROTOCOL) == pickle.dumps(right, protocol=pickle.HIGHEST_PROTOCOL)
+    except Exception:
+        return False
+
+
+def _dict_delta(before, after):
+    before = before or {}
+    delta = {}
+    for key, value in (after or {}).items():
+        if key not in before or not _same(before.get(key), value):
+            delta[key] = value
+    return delta
+
+
+def _list_change(before, after):
+    """Append only a pure tail. Mutated elements replace the list the child actually wrote."""
+    if not isinstance(before, list) or not isinstance(after, list):
+        return ("value", after)
+    if len(after) >= len(before) and all(_same(before[index], after[index]) for index in range(len(before))):
+        extra = after[len(before):]
+        if not extra:
+            return None
+        return ("list", extra)
+    return ("value", after)
+
+
+def _object_delta(before, after):
+    """Return only fields whose value changed during this attempt."""
+    delta = {}
+    for key, value in after.items():
+        if key == "lock" or key not in before:
             continue
-        existing = getattr(current, key, None)
-        if key in _REPLACE_FIELDS or existing is None:
-            setattr(current, key, value)
-        elif key in _APPEND_FIELDS and isinstance(existing, list) and isinstance(value, list):
-            _extend_unique(existing, value)
-        elif isinstance(existing, list) and isinstance(value, list):
-            _extend_unique(existing, value)
-        elif isinstance(existing, dict) and isinstance(value, dict):
-            existing.update(value)
-        elif hasattr(existing, "__dict__") and hasattr(value, "__dict__") and not _skip_cell(existing):
-            _merge_object(existing, _export_object(value))
+        previous = before[key]
+        if _same(previous, value):
+            continue
+        if isinstance(previous, dict) and isinstance(value, dict):
+            nested = _dict_delta(previous, value)
+            if nested:
+                delta[key] = ("dict", nested)
+        elif isinstance(previous, list) and isinstance(value, list):
+            change = _list_change(previous, value)
+            if change:
+                delta[key] = change
+        elif hasattr(previous, "__dict__") and hasattr(value, "__dict__") and not _skip_cell(value):
+            nested = _object_delta(_export_object(previous), _export_object(value))
+            if nested:
+                delta[key] = ("object", nested)
+        elif value is None:
+            continue
         else:
+            delta[key] = ("value", value)
+    return delta
+
+
+def _closure_delta(before, after):
+    deltas = []
+    for previous, current in zip(before, after):
+        kind = current[0]
+        if kind == "dict":
+            deltas.append(("dict", _dict_delta(previous[1], current[1])))
+        elif kind == "object":
+            deltas.append(("object", _object_delta(previous[1] or {}, current[1] or {})))
+        else:
+            deltas.append(("skip", None))
+    return deltas
+
+
+def _merge_object(current, exported):
+    for key, change in exported.items():
+        if key == "lock" or not isinstance(change, tuple) or len(change) != 2:
+            continue
+        kind, value = change
+        existing = getattr(current, key, None)
+        if kind == "dict" and isinstance(existing, dict):
+            existing.update(value)
+        elif kind == "dict" and existing is None:
+            setattr(current, key, dict(value))
+        elif kind == "list" and isinstance(existing, list):
+            _extend_unique(existing, value)
+        elif kind == "list" and existing is None:
+            setattr(current, key, list(value))
+        elif kind == "object" and hasattr(existing, "__dict__"):
+            _merge_object(existing, value)
+        elif kind == "value":
+            if value is None and existing is not None:
+                continue
             setattr(current, key, value)
 
 
@@ -191,7 +264,6 @@ def _merge_closures(fn, exported):
         except ValueError:
             continue
         if kind == "dict" and isinstance(current, dict) and isinstance(payload, dict):
-            current.clear()
             current.update(payload)
         elif kind == "object" and isinstance(payload, dict) and hasattr(current, "__dict__"):
             _merge_object(current, payload)
@@ -203,6 +275,8 @@ def _merge_evidence(evidence, exported):
 
 
 def _attempt_payload(runner, task_id, evidence):
+    before_cells = _snapshot(_export_closures(runner))
+    before_evidence = _snapshot(dict(evidence)) if isinstance(evidence, dict) else None
     try:
         value = runner(task_id, evidence)
         status = "ok"
@@ -215,13 +289,13 @@ def _attempt_payload(runner, task_id, evidence):
             "message": str(exc),
             "transient": isinstance(exc, (TransientFailure, TimeoutError)),
         }
-    evidence_copy = dict(evidence) if isinstance(evidence, dict) else None
+    evidence_delta = _dict_delta(before_evidence, dict(evidence)) if isinstance(evidence, dict) else None
     return {
         "status": status,
         "value": value if _pickleable(value) else None,
         "error": error,
-        "evidence": evidence_copy if evidence_copy is None or _pickleable(evidence_copy) else None,
-        "cells": _export_closures(runner),
+        "evidence": evidence_delta,
+        "cells": _closure_delta(before_cells, _export_closures(runner)),
     }
 
 
@@ -481,7 +555,7 @@ def _run_thread_attempt(runner, task_id, evidence, task_timeout, cancel):
         except Exception as exc:  # noqa: BLE001 - classified by the caller
             holder["error"] = exc
 
-    worker = threading.Thread(target=invoke, daemon=False)
+    worker = threading.Thread(target=invoke, daemon=True)
     started = time.monotonic()
     worker.start()
     worker.join(task_timeout)
@@ -494,6 +568,7 @@ def _run_thread_attempt(runner, task_id, evidence, task_timeout, cancel):
             "kind": "timeout",
             "reaped": reaped,
             "cancelled": cancel_requested,
+            "unterminated": not reaped,
             "elapsed": time.monotonic() - started,
         }
     if "error" in holder:
@@ -527,6 +602,17 @@ def _run_thread_task(task_id, runner, evidence, key, task_timeout, max_attempts,
             return {"task_id": task_id, "ok": False, "cached": False, "error": error, "attempts": records}
         outcome = _run_thread_attempt(runner, task_id, evidence, task_timeout, cancel)
         if outcome["kind"] == "timeout":
+            if outcome.get("unterminated"):
+                records.append(
+                    {
+                        "attempt": attempt,
+                        "outcome": "timeout",
+                        "reason": "termination could not be guaranteed",
+                        "transient": False,
+                        "diagnostic": "termination could not be guaranteed",
+                    }
+                )
+                return {"task_id": task_id, "ok": False, "cached": False, "error": "termination could not be guaranteed", "attempts": records}
             transient = bool(outcome["reaped"] and not outcome["cancelled"])
             records.append(_timeout_record(attempt, task_timeout, "cancelled" if outcome["cancelled"] else (f"elapsed>{task_timeout}" if transient else "attempt did not terminate"), transient))
             if outcome["cancelled"]:
