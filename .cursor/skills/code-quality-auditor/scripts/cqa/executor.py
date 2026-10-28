@@ -171,11 +171,65 @@ def _same(left, right):
         return False
 
 
+class Tombstone:
+    """Successful explicit null or key removal, compared against the value at fork time."""
+
+    def __init__(self, kind, previous):
+        self.kind = kind
+        self.previous = previous
+
+    def __repr__(self):
+        return f"Tombstone({self.kind!r})"
+
+
+class _Missing:
+    pass
+
+
+_MISSING = _Missing()
+# Parent-only. A deleted dict can be restored if a sibling patches it later, so
+# completion order does not drop the sibling's keys. Process-local; merges run
+# on the parent thread.
+_deleted_bases = {}
+
+
+def _deleted_base(current, key):
+    return _deleted_bases.get(id(current), {}).get(key, _MISSING)
+
+
+def _take_deleted_base(current, key):
+    bucket = _deleted_bases.get(id(current))
+    if not bucket or key not in bucket:
+        return None
+    previous = bucket.pop(key)
+    if not bucket:
+        _deleted_bases.pop(id(current), None)
+    return previous
+
+
+def _clear_deleted_base(current, key):
+    bucket = _deleted_bases.get(id(current))
+    if not bucket or key not in bucket:
+        return
+    bucket.pop(key, None)
+    if not bucket:
+        _deleted_bases.pop(id(current), None)
+
+
+def _remember_deleted_base(current, key, previous):
+    if isinstance(previous, dict):
+        _deleted_bases.setdefault(id(current), {})[key] = previous
+
+
 def _dict_delta(before, after):
-    """Changed keys only. Nested dicts stay nested so siblings are not replaced."""
-    before = before or {}
+    """Changed keys, explicit nulls, and deletions. Nested dicts stay nested."""
+    before = {} if before is None else before
+    after = {} if after is None else after
     delta = {}
-    for key, value in (after or {}).items():
+    for key, previous in before.items():
+        if key not in after:
+            delta[key] = Tombstone("delete", previous)
+    for key, value in after.items():
         if key not in before:
             delta[key] = value
             continue
@@ -186,22 +240,44 @@ def _dict_delta(before, after):
             nested = _dict_delta(previous, value)
             if nested:
                 delta[key] = nested
-        elif value is None:
             continue
-        else:
-            delta[key] = value
+        if value is None:
+            delta[key] = Tombstone("null", previous)
+            continue
+        delta[key] = value
     return delta
+
+
+def _apply_tombstone(current, key, tombstone):
+    if tombstone.kind == "delete":
+        if key not in current or not _same(current[key], tombstone.previous):
+            return
+        _remember_deleted_base(current, key, tombstone.previous)
+        del current[key]
+        return
+    if key in current and current[key] is not None and not _same(current[key], tombstone.previous):
+        return
+    _remember_deleted_base(current, key, tombstone.previous)
+    current[key] = None
 
 
 def _merge_dict(current, delta):
     for key, value in delta.items():
-        existing = current.get(key)
-        if isinstance(existing, dict) and isinstance(value, dict):
-            _merge_dict(existing, value)
-        elif value is None and key in current and existing is not None:
+        if isinstance(value, Tombstone):
+            _apply_tombstone(current, key, value)
             continue
-        else:
-            current[key] = value
+        if isinstance(value, dict):
+            existing = current.get(key, _MISSING)
+            if isinstance(existing, dict):
+                _merge_dict(existing, value)
+                continue
+            base = _deleted_base(current, key)
+            if isinstance(base, dict) and (existing is _MISSING or existing is None):
+                current[key] = _snapshot(_take_deleted_base(current, key))
+                _merge_dict(current[key], value)
+                continue
+        _clear_deleted_base(current, key)
+        current[key] = value
 
 
 def _element_change(before, after):
@@ -209,34 +285,31 @@ def _element_change(before, after):
         nested = _dict_delta(before, after)
         if not nested:
             return None
-        if set(before) - set(after):
-            return ("value", after)
-        return ("dict", nested)
-    if after is None and before is not None:
+        return ("dict", {"delta": nested, "previous": before})
+    if _same(before, after):
         return None
+    if after is None:
+        return ("null", before)
     return ("value", after)
 
 
 def _list_change(before, after):
-    """Append a pure tail. Same-length edits merge per element so siblings do not replace the list."""
+    """Per-index edits and tail deletions. A shorter list does not replace the parent list."""
     if not isinstance(before, list) or not isinstance(after, list):
         return ("value", after)
-    if len(after) >= len(before) and all(_same(before[index], after[index]) for index in range(len(before))):
-        extra = after[len(before):]
+    changes = []
+    shared = min(len(before), len(after))
+    for index in range(shared):
+        change = _element_change(before[index], after[index])
+        if change:
+            changes.append((index, change[0], change[1]))
+    deleted = [(index, before[index]) for index in range(len(after), len(before))]
+    extra = after[len(before):]
+    if not changes and not deleted:
         if not extra:
             return None
         return ("list", extra)
-    if len(after) < len(before):
-        return ("value", after)
-    changes = []
-    for index, previous in enumerate(before):
-        change = _element_change(previous, after[index])
-        if change:
-            changes.append((index, change[0], change[1]))
-    extra = after[len(before):]
-    if not changes:
-        return ("list", extra) if extra else None
-    return ("elements", {"changes": changes, "extra": extra})
+    return ("elements", {"changes": changes, "deleted": deleted, "extra": extra})
 
 
 def _object_delta(before, after):
@@ -261,7 +334,7 @@ def _object_delta(before, after):
             if nested:
                 delta[key] = ("object", nested)
         elif value is None:
-            continue
+            delta[key] = ("null", previous)
         else:
             delta[key] = ("value", value)
     return delta
@@ -295,21 +368,57 @@ def _merge_object(current, exported):
         elif kind == "list" and existing is None:
             setattr(current, key, list(value))
         elif kind == "elements" and isinstance(existing, list) and isinstance(value, dict):
-            for index, ekind, payload in value.get("changes") or []:
-                if not isinstance(index, int) or index < 0 or index >= len(existing):
-                    continue
-                current_item = existing[index]
-                if ekind == "dict" and isinstance(current_item, dict):
-                    _merge_dict(current_item, payload)
-                elif ekind == "value" and not (payload is None and current_item is not None):
-                    existing[index] = payload
-            _extend_unique(existing, value.get("extra") or [])
+            _merge_list_elements(existing, value)
         elif kind == "object" and hasattr(existing, "__dict__"):
             _merge_object(existing, value)
+        elif kind == "null":
+            if existing is None or _same(existing, value):
+                setattr(current, key, None)
         elif kind == "value":
             if value is None and existing is not None:
                 continue
             setattr(current, key, value)
+
+
+def _merge_list_item(existing, index, ekind, payload):
+    if not isinstance(index, int) or index < 0 or index > len(existing):
+        return
+    if index == len(existing):
+        if ekind == "dict" and isinstance(payload, dict) and isinstance(payload.get("previous"), dict):
+            existing.append(_snapshot(payload["previous"]))
+            _merge_dict(existing[index], payload.get("delta") or {})
+        elif ekind == "value":
+            existing.append(payload)
+        elif ekind == "null":
+            existing.append(None)
+        return
+    current_item = existing[index]
+    if ekind == "dict" and isinstance(payload, dict):
+        delta = payload.get("delta") or {}
+        if isinstance(current_item, dict):
+            _merge_dict(current_item, delta)
+        elif current_item is None and isinstance(payload.get("previous"), dict):
+            existing[index] = _snapshot(payload["previous"])
+            _merge_dict(existing[index], delta)
+        return
+    if ekind == "null":
+        if current_item is None or _same(current_item, payload):
+            existing[index] = None
+        return
+    if ekind == "value":
+        existing[index] = payload
+
+
+def _merge_list_elements(existing, value):
+    changes = sorted(value.get("changes") or [], key=lambda item: item[0])
+    for index, ekind, payload in changes:
+        _merge_list_item(existing, index, ekind, payload)
+    for index, previous in sorted(value.get("deleted") or [], key=lambda item: item[0], reverse=True):
+        if not isinstance(index, int) or index < 0 or index >= len(existing):
+            continue
+        if _same(existing[index], previous):
+            del existing[index]
+    _extend_unique(existing, value.get("extra") or [])
 
 
 def _merge_closures(fn, exported):

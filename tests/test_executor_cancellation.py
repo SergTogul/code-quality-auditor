@@ -27,7 +27,15 @@ spec = importlib.util.spec_from_file_location("auditor", SKILL / "scripts" / "au
 auditor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(auditor)
 
-from cqa.executor import TransientFailure, _run_thread_task, execute  # noqa: E402
+from cqa.executor import (  # noqa: E402
+    Tombstone,
+    TransientFailure,
+    _dict_delta,
+    _list_change,
+    _merge_dict,
+    _run_thread_task,
+    execute,
+)
 
 
 REGISTRY = {
@@ -469,3 +477,199 @@ class ExecutorCancellationTests(unittest.TestCase):
             )
             self.assertTrue(result["ok"], result)
             self.assertEqual(evidence["findings"], {"a": 1, "b": 1})
+
+    def test_successful_task_removes_and_clears_nested_findings(self):
+        removed = {"findings": {"stale": {"status": "failed"}, "valid": 1}}
+
+        def drop(_task, store):
+            del store["findings"]["stale"]
+            return {"ok": True}
+
+        result = execute(
+            {"left"},
+            REGISTRY,
+            {"left": drop},
+            removed,
+            {"concurrency": 1, "max_retries": 1, "task_timeout_seconds": 2},
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(removed["findings"], {"valid": 1})
+
+        cleared = {"findings": {"stale": {"status": "failed"}, "valid": 1}}
+
+        def clear(_task, store):
+            store["findings"]["stale"] = None
+            return {"ok": True}
+
+        result = execute(
+            {"left"},
+            REGISTRY,
+            {"left": clear},
+            cleared,
+            {"concurrency": 1, "max_retries": 1, "task_timeout_seconds": 2},
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(cleared["findings"], {"stale": None, "valid": 1})
+
+        closed = {"stale": {"status": "failed"}, "valid": 1}
+
+        def drop_closed(_task, _store):
+            del closed["stale"]
+            return {"ok": True}
+
+        result = execute(
+            {"left"},
+            REGISTRY,
+            {"left": drop_closed},
+            {},
+            {"concurrency": 1, "max_retries": 1, "task_timeout_seconds": 2},
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(closed, {"valid": 1})
+
+    def test_failed_attempt_does_not_publish_a_deletion(self):
+        evidence = {"findings": {"stale": 1}}
+
+        def broken(_task, store):
+            del store["findings"]["stale"]
+            raise ValueError("deterministic")
+
+        failed = execute(
+            {"left"},
+            REGISTRY,
+            {"left": broken},
+            evidence,
+            {"concurrency": 1, "max_retries": 1, "task_timeout_seconds": 2},
+        )
+        self.assertFalse(failed["ok"])
+        self.assertEqual(evidence["findings"], {"stale": 1})
+
+    def _run_both_orders(self, evidence_factory, left, right):
+        registry = {
+            "left": {"id": "left", "depends_on": []},
+            "right": {"id": "right", "depends_on": []},
+        }
+        outcomes = []
+        for left_delay, right_delay in ((0.0, 0.3), (0.3, 0.0)):
+            held = evidence_factory()
+            delays = {"left": left_delay, "right": right_delay}
+            if isinstance(held, dict):
+                def runner(task_id, store):
+                    time.sleep(delays[task_id])
+                    (left if task_id == "left" else right)(store)
+                    return {"task": task_id}
+
+                evidence = held
+            else:
+                def runner(task_id, _store):
+                    time.sleep(delays[task_id])
+                    (left if task_id == "left" else right)(held)
+                    return {"task": task_id}
+
+                evidence = {}
+            result = execute(
+                {"left", "right"},
+                registry,
+                {"left": runner, "right": runner},
+                evidence,
+                {"concurrency": 2, "max_retries": 1, "task_timeout_seconds": 2},
+            )
+            self.assertTrue(result["ok"], result)
+            outcomes.append(held)
+        return outcomes
+
+    def test_parallel_delete_and_update_keep_both_changes(self):
+        def left(store):
+            del store["findings"]["stale"]
+
+        def right(store):
+            store["findings"]["fresh"] = 1
+
+        outcomes = self._run_both_orders(lambda: {"findings": {"stale": 1}}, left, right)
+        for evidence in outcomes:
+            self.assertEqual(evidence["findings"], {"fresh": 1})
+
+    def test_parallel_delete_and_update_of_same_key_keeps_the_update(self):
+        def left(store):
+            del store["findings"]["stale"]
+
+        def right(store):
+            store["findings"]["stale"] = 9
+
+        outcomes = self._run_both_orders(lambda: {"findings": {"stale": 1, "kept": 2}}, left, right)
+        for evidence in outcomes:
+            self.assertEqual(evidence["findings"], {"stale": 9, "kept": 2})
+
+    def test_parallel_nested_delete_and_patch_keeps_the_patch(self):
+        def left(store):
+            del store["findings"]["stale"]
+
+        def right(store):
+            store["findings"]["stale"]["x"] = 3
+
+        outcomes = self._run_both_orders(
+            lambda: {"findings": {"stale": {"x": 1, "y": 2}}},
+            left,
+            right,
+        )
+        for evidence in outcomes:
+            self.assertEqual(evidence["findings"], {"stale": {"x": 3, "y": 2}})
+
+    def test_parallel_null_and_update_of_same_key_keeps_the_update(self):
+        def left(store):
+            store["findings"]["stale"] = None
+
+        def right(store):
+            store["findings"]["stale"] = 9
+
+        outcomes = self._run_both_orders(lambda: {"findings": {"stale": 1}}, left, right)
+        for evidence in outcomes:
+            self.assertEqual(evidence["findings"], {"stale": 9})
+
+    def test_explicit_null_stays_distinct_from_deletion(self):
+        before = {"stale": 1, "kept": 2}
+        self.assertIsInstance(_dict_delta(before, {"stale": None, "kept": 2})["stale"], Tombstone)
+        self.assertEqual(_dict_delta(before, {"stale": None, "kept": 2})["stale"].kind, "null")
+        self.assertEqual(_dict_delta(before, {"kept": 2})["stale"].kind, "delete")
+        present = {"stale": 1, "kept": 2}
+        _merge_dict(present, _dict_delta(before, {"stale": None, "kept": 2}))
+        self.assertEqual(present, {"stale": None, "kept": 2})
+        absent = {"stale": 1, "kept": 2}
+        _merge_dict(absent, _dict_delta(before, {"kept": 2}))
+        self.assertEqual(absent, {"kept": 2})
+
+    def test_list_truncation_keeps_sibling_element_edit(self):
+        class Context:
+            def __init__(self):
+                self.analyses = [{"a": 0}, {"b": 0}]
+
+        def left(evidence):
+            evidence.analyses.pop()
+
+        def right(evidence):
+            evidence.analyses[0]["a"] = 1
+
+        outcomes = self._run_both_orders(Context, left, right)
+        for evidence in outcomes:
+            self.assertEqual(evidence.analyses, [{"a": 1}])
+
+    def test_list_truncation_does_not_replace_a_sibling_edit_of_the_removed_element(self):
+        class Context:
+            def __init__(self):
+                self.analyses = [{"a": 0}, {"b": 0}]
+
+        def left(evidence):
+            evidence.analyses.pop()
+
+        def right(evidence):
+            evidence.analyses[1]["b"] = 1
+
+        outcomes = self._run_both_orders(Context, left, right)
+        for evidence in outcomes:
+            self.assertEqual(evidence.analyses, [{"a": 0}, {"b": 1}])
+
+    def test_shorter_list_delta_is_index_deletion_not_replacement(self):
+        change = _list_change([{"a": 0}, {"b": 0}], [{"a": 1}])
+        self.assertEqual(change[0], "elements")
+        self.assertEqual(change[1]["deleted"][0][0], 1)
+        self.assertNotEqual(change[0], "value")
