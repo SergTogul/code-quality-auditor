@@ -4,14 +4,11 @@ from __future__ import annotations
 
 import hashlib
 import os
-import secrets
 import shutil
 import signal
-import socket
 import subprocess
 import sys
 import tempfile
-import threading
 from pathlib import Path
 
 from cqa import ENGINE_VERSION
@@ -178,77 +175,32 @@ def _run_process(command, cwd, env, timeout):
     return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
-def _custom_contains(wrapper):
-    """Probe write, secret read, and network. A wrapper can still special-case these argv shapes."""
-    true_run = _run_process([str(wrapper), "/usr/bin/true"], None, _sanitize_env(), 10)
-    if true_run.returncode != 0:
-        return False, "custom containment command does not isolate: benign command failed"
-    probe_dir = Path(tempfile.mkdtemp(prefix="cqa-sandbox-probe-"))
-    probe_file = probe_dir / "outside-write"
-    secret = probe_dir / "secret-token"
-    token = secrets.token_hex(16)
-    secret.write_text(token, encoding="utf-8")
-    try:
-        write_run = _run_process([str(wrapper), "/usr/bin/touch", str(probe_file)], None, _sanitize_env(), 10)
-        created = probe_file.exists()
-        if write_run.returncode == 0 or created:
-            return False, "custom containment command does not isolate writes"
-        read_run = _run_process([str(wrapper), "/bin/cat", str(secret)], None, _sanitize_env(), 10)
-        if read_run.returncode == 0 or token in (read_run.stdout or ""):
-            return False, "custom containment command does not isolate reads"
-        if _network_escapes(wrapper):
-            return False, "custom containment command does not isolate network"
-    finally:
-        shutil.rmtree(probe_dir, ignore_errors=True)
-    return True, ""
-
-
-def _network_escapes(wrapper):
-    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    server.bind(("127.0.0.1", 0))
-    server.listen(1)
-    server.settimeout(5)
-    port = server.getsockname()[1]
-    connected = {"ok": False}
-
-    def accept():
-        try:
-            connection, _addr = server.accept()
-            connection.close()
-            connected["ok"] = True
-        except OSError:
-            return
-
-    waiter = threading.Thread(target=accept, daemon=True)
-    waiter.start()
-    code = f"import socket; socket.create_connection(('127.0.0.1', {port}), 2).close()"
-    try:
-        _run_process([str(wrapper), sys.executable, "-c", code], None, _sanitize_env(), 5)
-    except (OSError, subprocess.TimeoutExpired):
-        pass
-    finally:
-        server.close()
-    waiter.join(1)
-    return connected["ok"]
+def _trusted_sandbox():
+    """The only containment implementation this process will execute."""
+    sandbox = shutil.which("sandbox-exec")
+    if not sandbox:
+        return None
+    path = Path(sandbox).resolve()
+    if not path.is_file():
+        return None
+    return path
 
 
 def probe_sandbox(cwd=None):
+    """Trust only the platform sandbox-exec binary. Probes cannot authorize another executable."""
+    trusted = _trusted_sandbox()
     custom = os.environ.get("CQA_SANDBOX_CMD")
     if custom:
         try:
             path = _validate_custom(custom, cwd)
         except PermissionError as exc:
             return False, str(exc)
-        contained, detail = _custom_contains(path)
-        if not contained:
-            return False, detail
-        return True, str(path)
-    sandbox = shutil.which("sandbox-exec")
-    if not sandbox:
+        if trusted is None or path != trusted:
+            return False, "custom containment command is not an allowlisted implementation"
+    if trusted is None:
         return False, "no containment command is available"
     probe = subprocess.run(
-        [sandbox, "-p", "(version 1)(allow default)", "/usr/bin/true"],
+        [str(trusted), "-p", "(version 1)(allow default)", "/usr/bin/true"],
         capture_output=True,
         text=True,
         check=False,
@@ -256,7 +208,7 @@ def probe_sandbox(cwd=None):
     if probe.returncode != 0:
         detail = (probe.stderr or probe.stdout or "sandbox-exec failed").strip()
         return False, f"containment is unavailable: {detail}"
-    return True, sandbox
+    return True, str(trusted)
 
 
 def _existing_reads(read_paths):
@@ -294,20 +246,25 @@ def _command_read_paths(cwd, command):
 
 
 def _profile(read_paths, write_path, allow_temp_writes=False):
-    """Allow system reads, then close the home directory except paths this command must read.
+    """Close user trees, then re-open only the paths this command must read.
 
-    Filtered file-read allows are not usable on their own here: seatbelt aborts the process.
-    The home deny is applied after the blanket read, and only the command's own paths under
-    the home directory are opened again. Credential directories are denied last.
+    A profile whose file reads are only subpath allows makes seatbelt abort the process,
+    so system locations outside /Users and /home stay on the blanket read. Those system
+    paths are the residual exposure. Credential directories are denied last.
     """
-    home = Path.home().resolve()
+    denied_roots = []
+    for raw in ("/Users", "/home"):
+        path = Path(raw)
+        if path.is_dir():
+            denied_roots.append(path.resolve())
     reopen = []
     for raw in _existing_reads(read_paths):
         path = Path(raw).resolve()
-        if path == home or home in path.parents:
+        if any(path == root or root in path.parents for root in denied_roots):
             reopen.append(str(path))
-    home_deny = f'(deny file-read* (subpath "{_quote_sb(home)}"))'
+    user_denies = "\n".join(f'(deny file-read* (subpath "{_quote_sb(root)}"))' for root in denied_roots)
     reopened = "\n".join(f'(allow file-read* (subpath "{_quote_sb(path)}"))' for path in reopen)
+    home = Path.home().resolve()
     secret_denies = "\n".join(
         f'(deny file-read* (subpath "{_quote_sb(home / name)}"))' for name in _SECRET_DIRS
     )
@@ -328,7 +285,7 @@ def _profile(read_paths, write_path, allow_temp_writes=False):
 (allow mach-lookup)
 (allow ipc-posix*)
 (allow system-socket)
-{home_deny}
+{user_denies}
 {reopened}
 {write}
 {secret_denies}
@@ -340,9 +297,6 @@ def _contained_command(command, cwd, write_path):
     executable = Path(command[0])
     if executable.is_file():
         command[0] = str(executable.resolve())
-    custom = os.environ.get("CQA_SANDBOX_CMD")
-    if custom:
-        return [str(Path(custom).resolve()), *command]
     resolved_write = str(Path(write_path).resolve()) if write_path else None
     profile = _profile(_command_read_paths(cwd, command), resolved_write)
     return ["sandbox-exec", "-p", profile, "--", *command]
@@ -388,15 +342,11 @@ def run_tool(command, cwd, log, timeout=60):
         log.deny("external-tool", "repository-controlled executable was not run")
         raise PermissionError("repository-controlled executable was not run")
     command = [str(executable), *list(command)[1:]]
-    custom = os.environ.get("CQA_SANDBOX_CMD")
     ok, detail = probe_sandbox(cwd)
     if not ok:
         log.deny("containment", detail)
         raise PermissionError(detail)
-    if custom:
-        wrapped = [str(Path(custom).resolve()), *command]
-    else:
-        wrapped = ["sandbox-exec", "-p", _profile(_command_read_paths(cwd, command), None, allow_temp_writes=True), "--", *command]
+    wrapped = ["sandbox-exec", "-p", _profile(_command_read_paths(cwd, command), None, allow_temp_writes=True), "--", *command]
     log.record(wrapped, "started")
     completed = _run_process(wrapped, cwd, _sanitize_env(), timeout)
     log.record(wrapped, f"exit {completed.returncode}")

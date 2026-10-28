@@ -60,7 +60,7 @@ class SandboxTrustTests(unittest.TestCase):
         os.environ["CQA_SANDBOX_CMD"] = str(wrapper)
         available, detail = probe_sandbox(self.repo)
         self.assertFalse(available)
-        self.assertIn("does not isolate", detail)
+        self.assertIn("allowlisted", detail)
         with self.assertRaises(PermissionError):
             run_contained([str(payload)], self.repo, self._log())
         self.assertFalse(marker.exists())
@@ -83,37 +83,30 @@ class SandboxTrustTests(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 run_contained(["/usr/bin/true"], self.repo, self._log())
 
-    def test_sandbox_failure_is_not_retried_outside_the_wrapper(self):
-        log_path = self.tmp / "wrapper.log"
-        wrapper = self.tmp / "wrapper"
-        _write_executable(
-            wrapper,
-            f"""
-            #!/usr/bin/env python3
-            import pathlib
-            import sys
-            log = pathlib.Path({str(log_path)!r})
-            args = sys.argv[1:]
-            with log.open("a", encoding="utf-8") as handle:
-                handle.write("wrapped " + " ".join(args) + "\\n")
-            if args == ["/usr/bin/true"]:
-                sys.exit(0)
-            if args and args[0] == "/usr/bin/touch":
-                sys.exit(1)
-            sys.exit(71)
-            """,
-        )
+    def test_sandbox_apply_failure_is_not_rerun(self):
+        import subprocess
+
+        from cqa import security
+
         marker = self.tmp / "payload-ran"
         payload = self.tmp / "payload"
         _write_executable(payload, f"#!/bin/sh\n: > {marker}\n")
-        os.environ["CQA_SANDBOX_CMD"] = str(wrapper)
-        with self.assertRaises(PermissionError):
-            run_contained([str(payload)], self.repo, self._log())
+        calls = []
+        real = security._run_process
+
+        def wrapped(command, cwd, env, timeout):
+            calls.append(list(command))
+            if command and Path(command[0]).name == "sandbox-exec":
+                return subprocess.CompletedProcess(command, 71, "", "sandbox_apply failed")
+            return real(command, cwd, env, timeout)
+
+        with mock.patch("cqa.security._run_process", side_effect=wrapped):
+            with self.assertRaises(PermissionError) as caught:
+                run_contained([str(payload)], self.repo, self._log())
+        self.assertIn("not rerun", str(caught.exception))
         self.assertFalse(marker.exists())
-        recorded = log_path.read_text(encoding="utf-8")
-        self.assertEqual(recorded.count(str(payload)), 1)
-        self.assertNotIn("unwrapped", recorded)
-        self.assertTrue(all(line.startswith("wrapped ") for line in recorded.splitlines()))
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(Path(calls[0][0]).name, "sandbox-exec")
 
     def test_repository_executable_is_not_a_trusted_analyzer(self):
         marker = self.repo / "pwned"
@@ -234,37 +227,31 @@ class SandboxTrustTests(unittest.TestCase):
                 run_tool([str(tool)], self.repo, self._log())
         self.assertFalse(marker.exists())
 
-    def test_wrapper_that_blocks_only_the_write_probe_is_rejected(self):
-        wrapper = self.tmp / "read-wrapper"
+    def test_wrapper_that_blocks_the_probe_but_allows_other_commands_is_not_trusted(self):
+        log_path = self.tmp / "wrapper.log"
+        marker = self.tmp / "network-payload"
+        wrapper = self.tmp / "selective-wrapper"
+        python = sys.executable
         _write_executable(
             wrapper,
-            """#!/bin/sh
-            if [ "$1" = /usr/bin/touch ]; then
+            f"""#!/bin/sh
+            printf '%s\\n' "$*" >> {log_path}
+            if [ "$1" = {python} ] || [ "$1" = /usr/bin/touch ] || [ "$1" = /bin/cat ]; then
               exit 1
             fi
             exec "$@"
             """,
         )
+        payload = self.tmp / "payload"
+        _write_executable(payload, f"#!/bin/sh\n: > {marker}\n")
         os.environ["CQA_SANDBOX_CMD"] = str(wrapper)
         available, detail = probe_sandbox(self.repo)
         self.assertFalse(available)
-        self.assertIn("does not isolate", detail)
-
-    def test_wrapper_that_allows_network_is_rejected(self):
-        wrapper = self.tmp / "network-wrapper"
-        _write_executable(
-            wrapper,
-            """#!/bin/sh
-            if [ "$1" = /usr/bin/touch ] || [ "$1" = /bin/cat ]; then
-              exit 1
-            fi
-            exec "$@"
-            """,
-        )
-        os.environ["CQA_SANDBOX_CMD"] = str(wrapper)
-        available, detail = probe_sandbox(self.repo)
-        self.assertFalse(available)
-        self.assertIn("does not isolate", detail)
+        self.assertIn("allowlisted", detail)
+        with self.assertRaises(PermissionError):
+            run_contained([str(payload)], self.repo, self._log())
+        self.assertFalse(marker.exists())
+        self.assertFalse(log_path.exists())
 
     def test_interpreter_wrapper_is_rejected(self):
         shell = Path("/bin/bash")
