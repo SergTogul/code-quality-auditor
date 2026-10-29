@@ -10,6 +10,7 @@ import signal
 import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 
@@ -187,38 +188,59 @@ class _Missing:
 
 
 _MISSING = _Missing()
-# Parent-only. A deleted dict can be restored if a sibling patches it later, so
-# completion order does not drop the sibling's keys. Process-local; merges run
-# on the parent thread.
-_deleted_bases = {}
+# One batch per DAG layer. A sibling patch can restore a dict deleted earlier
+# in that layer. The map is discarded when the layer ends, so a later insert
+# cannot resurrect it and a recycled object id cannot see another audit's delete.
+_batch_stack = []
+
+
+class _MergeBatch:
+    def __init__(self):
+        self.deleted = {}
+
+
+@contextmanager
+def _merge_batch():
+    _batch_stack.append(_MergeBatch())
+    try:
+        yield
+    finally:
+        _batch_stack.pop()
 
 
 def _deleted_base(current, key):
-    return _deleted_bases.get(id(current), {}).get(key, _MISSING)
+    if not _batch_stack:
+        return _MISSING
+    return _batch_stack[-1].deleted.get(id(current), {}).get(key, _MISSING)
 
 
 def _take_deleted_base(current, key):
-    bucket = _deleted_bases.get(id(current))
+    if not _batch_stack:
+        return None
+    bucket = _batch_stack[-1].deleted.get(id(current))
     if not bucket or key not in bucket:
         return None
     previous = bucket.pop(key)
     if not bucket:
-        _deleted_bases.pop(id(current), None)
+        _batch_stack[-1].deleted.pop(id(current), None)
     return previous
 
 
 def _clear_deleted_base(current, key):
-    bucket = _deleted_bases.get(id(current))
+    if not _batch_stack:
+        return
+    bucket = _batch_stack[-1].deleted.get(id(current))
     if not bucket or key not in bucket:
         return
     bucket.pop(key, None)
     if not bucket:
-        _deleted_bases.pop(id(current), None)
+        _batch_stack[-1].deleted.pop(id(current), None)
 
 
 def _remember_deleted_base(current, key, previous):
-    if isinstance(previous, dict):
-        _deleted_bases.setdefault(id(current), {})[key] = previous
+    if not _batch_stack or not isinstance(previous, dict):
+        return
+    _batch_stack[-1].deleted.setdefault(id(current), {})[key] = previous
 
 
 def _dict_delta(before, after):
@@ -262,6 +284,15 @@ def _apply_tombstone(current, key, tombstone):
 
 
 def _merge_dict(current, delta):
+    """Merge one delta. A call outside a layer batch cannot see an earlier delete."""
+    if not _batch_stack:
+        with _merge_batch():
+            _merge_dict_keys(current, delta)
+        return
+    _merge_dict_keys(current, delta)
+
+
+def _merge_dict_keys(current, delta):
     for key, value in delta.items():
         if isinstance(value, Tombstone):
             _apply_tombstone(current, key, value)
@@ -930,119 +961,120 @@ def execute(selected, registry, runners, evidence, options=None):
             failed.add(task_id)
 
     for layer in layers:
-        jobs = []
-        for task_id in layer:
-            deps = nodes[task_id].get("depends_on") or []
-            blocked = [dep for dep in deps if dep in failed or not results.get(dep, {}).get("ok", False)]
-            if blocked:
-                failed.add(task_id)
-                remember(
-                    task_id,
-                    {
-                        "task_id": task_id,
-                        "ok": False,
-                        "cached": False,
-                        "error": "dependency failed",
-                        "attempts": [
-                            {
-                                "attempt": 1,
-                                "outcome": "skipped",
-                                "reason": "dependency failed: " + ", ".join(blocked),
-                                "transient": False,
-                                "diagnostic": "fail-closed",
-                            }
-                        ],
-                    },
-                )
-                continue
-            if deadline is not None and time.monotonic() > deadline:
-                cancel.set()
-                failed.add(task_id)
-                remember(
-                    task_id,
-                    {
-                        "task_id": task_id,
-                        "ok": False,
-                        "cached": False,
-                        "error": "budget exhausted",
-                        "attempts": [
-                            {
-                                "attempt": 1,
-                                "outcome": "timeout",
-                                "reason": "run budget exhausted",
-                                "transient": True,
-                                "diagnostic": "fail-closed",
-                            }
-                        ],
-                    },
-                )
-                continue
-            if cancel.is_set():
-                failed.add(task_id)
-                remember(
-                    task_id,
-                    {
-                        "task_id": task_id,
-                        "ok": False,
-                        "cached": False,
-                        "error": "cancelled",
-                        "attempts": [
-                            {
-                                "attempt": 1,
-                                "outcome": "timeout",
-                                "reason": "cancelled before start",
-                                "transient": False,
-                                "diagnostic": "cancelled before start",
-                            }
-                        ],
-                    },
-                )
-                continue
-            key = fingerprint(task_id)
-            cached = _read_cache(cache_dir, key)
-            if cached is not None and cached.get("ok"):
-                cache_hits.append(task_id)
-                remember(
-                    task_id,
-                    {
-                        "task_id": task_id,
-                        "ok": True,
-                        "cached": True,
-                        "value": cached.get("value"),
-                        "attempts": [{"attempt": 0, "outcome": "cache_hit", "reason": key}],
-                    },
-                )
-                continue
-            runner = runners.get(task_id)
-            if runner is None:
-                remember(
-                    task_id,
-                    {
-                        "task_id": task_id,
-                        "ok": False,
-                        "cached": False,
-                        "error": "missing runner",
-                        "attempts": [
-                            {
-                                "attempt": 1,
-                                "outcome": "error",
-                                "reason": f"no runner for {task_id}",
-                                "transient": False,
-                                "diagnostic": "missing runner",
-                            }
-                        ],
-                    },
-                )
-                continue
-            if not isolate:
-                result = _run_thread_task(task_id, runner, evidence, key, task_timeout, max_attempts, backoff, cancel, deadline, cache_dir)
-                remember(task_id, result)
-                continue
-            jobs.append(_Job(task_id, runner, evidence, key))
-        if jobs:
-            layer_results, layer_failed = _run_processes(jobs, concurrency, task_timeout, max_attempts, backoff, cancel, deadline, cache_dir, on_result)
-            results.update(layer_results)
-            failed.update(layer_failed)
+        with _merge_batch():
+            jobs = []
+            for task_id in layer:
+                deps = nodes[task_id].get("depends_on") or []
+                blocked = [dep for dep in deps if dep in failed or not results.get(dep, {}).get("ok", False)]
+                if blocked:
+                    failed.add(task_id)
+                    remember(
+                        task_id,
+                        {
+                            "task_id": task_id,
+                            "ok": False,
+                            "cached": False,
+                            "error": "dependency failed",
+                            "attempts": [
+                                {
+                                    "attempt": 1,
+                                    "outcome": "skipped",
+                                    "reason": "dependency failed: " + ", ".join(blocked),
+                                    "transient": False,
+                                    "diagnostic": "fail-closed",
+                                }
+                            ],
+                        },
+                    )
+                    continue
+                if deadline is not None and time.monotonic() > deadline:
+                    cancel.set()
+                    failed.add(task_id)
+                    remember(
+                        task_id,
+                        {
+                            "task_id": task_id,
+                            "ok": False,
+                            "cached": False,
+                            "error": "budget exhausted",
+                            "attempts": [
+                                {
+                                    "attempt": 1,
+                                    "outcome": "timeout",
+                                    "reason": "run budget exhausted",
+                                    "transient": True,
+                                    "diagnostic": "fail-closed",
+                                }
+                            ],
+                        },
+                    )
+                    continue
+                if cancel.is_set():
+                    failed.add(task_id)
+                    remember(
+                        task_id,
+                        {
+                            "task_id": task_id,
+                            "ok": False,
+                            "cached": False,
+                            "error": "cancelled",
+                            "attempts": [
+                                {
+                                    "attempt": 1,
+                                    "outcome": "timeout",
+                                    "reason": "cancelled before start",
+                                    "transient": False,
+                                    "diagnostic": "cancelled before start",
+                                }
+                            ],
+                        },
+                    )
+                    continue
+                key = fingerprint(task_id)
+                cached = _read_cache(cache_dir, key)
+                if cached is not None and cached.get("ok"):
+                    cache_hits.append(task_id)
+                    remember(
+                        task_id,
+                        {
+                            "task_id": task_id,
+                            "ok": True,
+                            "cached": True,
+                            "value": cached.get("value"),
+                            "attempts": [{"attempt": 0, "outcome": "cache_hit", "reason": key}],
+                        },
+                    )
+                    continue
+                runner = runners.get(task_id)
+                if runner is None:
+                    remember(
+                        task_id,
+                        {
+                            "task_id": task_id,
+                            "ok": False,
+                            "cached": False,
+                            "error": "missing runner",
+                            "attempts": [
+                                {
+                                    "attempt": 1,
+                                    "outcome": "error",
+                                    "reason": f"no runner for {task_id}",
+                                    "transient": False,
+                                    "diagnostic": "missing runner",
+                                }
+                            ],
+                        },
+                    )
+                    continue
+                if not isolate:
+                    result = _run_thread_task(task_id, runner, evidence, key, task_timeout, max_attempts, backoff, cancel, deadline, cache_dir)
+                    remember(task_id, result)
+                    continue
+                jobs.append(_Job(task_id, runner, evidence, key))
+            if jobs:
+                layer_results, layer_failed = _run_processes(jobs, concurrency, task_timeout, max_attempts, backoff, cancel, deadline, cache_dir, on_result)
+                results.update(layer_results)
+                failed.update(layer_failed)
     ordered = [results[task_id] for task_id in nodes if task_id in results]
     return {
         "ok": not failed and all(item.get("ok") for item in ordered),

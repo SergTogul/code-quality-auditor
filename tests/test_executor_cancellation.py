@@ -673,3 +673,35 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertEqual(change[0], "elements")
         self.assertEqual(change[1]["deleted"][0][0], 1)
         self.assertNotEqual(change[0], "value")
+
+    def test_later_insert_does_not_resurrect_a_deleted_dict(self):
+        evidence = {"a": {"old": 1}}
+        _merge_dict(evidence, {"a": Tombstone("delete", {"old": 1})})
+        _merge_dict(evidence, {"a": {"new": 2}})
+        self.assertEqual(evidence, {"a": {"new": 2}})
+
+    def test_later_task_replaces_a_deleted_dict_without_resurrecting_it(self):
+        registry = {
+            "drop": {"id": "drop", "depends_on": []},
+            "insert": {"id": "insert", "depends_on": ["drop"]},
+        }
+        evidence = {"findings": {"stale": {"old": 1}, "other": 1}}
+
+        def drop(_task, store):
+            del store["findings"]["stale"]
+            return {"ok": True}
+
+        def insert(_task, store):
+            self.assertNotIn("stale", store["findings"])
+            store["findings"]["stale"] = {"new": 2}
+            return {"ok": True}
+
+        result = execute(
+            {"drop", "insert"},
+            registry,
+            {"drop": drop, "insert": insert},
+            evidence,
+            {"concurrency": 2, "max_retries": 1, "task_timeout_seconds": 2},
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(evidence["findings"], {"stale": {"new": 2}, "other": 1})
