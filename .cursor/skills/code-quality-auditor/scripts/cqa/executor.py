@@ -188,10 +188,11 @@ class _Missing:
 
 
 _MISSING = _Missing()
-# One batch per DAG layer. A sibling patch can restore a dict deleted earlier
-# in that layer. The map is discarded when the layer ends, so a later insert
-# cannot resurrect it and a recycled object id cannot see another audit's delete.
-_batch_stack = []
+# One batch per DAG layer, stored on the thread that called execute().
+# A sibling patch can restore a dict deleted earlier in that layer. The map is
+# discarded when the layer ends. Another thread's execute() has its own stack,
+# so the two audits cannot pop or read each other's batches.
+_batch_local = threading.local()
 
 
 class _MergeBatch:
@@ -199,48 +200,61 @@ class _MergeBatch:
         self.deleted = {}
 
 
+def _batch_stack():
+    stack = getattr(_batch_local, "stack", None)
+    if stack is None:
+        stack = []
+        _batch_local.stack = stack
+    return stack
+
+
 @contextmanager
 def _merge_batch():
-    _batch_stack.append(_MergeBatch())
+    stack = _batch_stack()
+    stack.append(_MergeBatch())
     try:
         yield
     finally:
-        _batch_stack.pop()
+        stack.pop()
 
 
 def _deleted_base(current, key):
-    if not _batch_stack:
+    stack = _batch_stack()
+    if not stack:
         return _MISSING
-    return _batch_stack[-1].deleted.get(id(current), {}).get(key, _MISSING)
+    return stack[-1].deleted.get(id(current), {}).get(key, _MISSING)
 
 
 def _take_deleted_base(current, key):
-    if not _batch_stack:
+    stack = _batch_stack()
+    if not stack:
         return None
-    bucket = _batch_stack[-1].deleted.get(id(current))
+    bucket = stack[-1].deleted.get(id(current))
     if not bucket or key not in bucket:
         return None
     previous = bucket.pop(key)
     if not bucket:
-        _batch_stack[-1].deleted.pop(id(current), None)
+        stack[-1].deleted.pop(id(current), None)
     return previous
 
 
 def _clear_deleted_base(current, key):
-    if not _batch_stack:
+    stack = _batch_stack()
+    if not stack:
         return
-    bucket = _batch_stack[-1].deleted.get(id(current))
+    bucket = stack[-1].deleted.get(id(current))
     if not bucket or key not in bucket:
         return
     bucket.pop(key, None)
     if not bucket:
-        _batch_stack[-1].deleted.pop(id(current), None)
+        stack[-1].deleted.pop(id(current), None)
 
 
 def _remember_deleted_base(current, key, previous):
-    if not _batch_stack or not isinstance(previous, dict):
+    stack = _batch_stack()
+    if not stack or not isinstance(previous, dict):
         return
-    _batch_stack[-1].deleted.setdefault(id(current), {})[key] = previous
+    stack[-1].deleted.setdefault(id(current), {})[key] = previous
 
 
 def _dict_delta(before, after):
@@ -285,7 +299,7 @@ def _apply_tombstone(current, key, tombstone):
 
 def _merge_dict(current, delta):
     """Merge one delta. A call outside a layer batch cannot see an earlier delete."""
-    if not _batch_stack:
+    if not _batch_stack():
         with _merge_batch():
             _merge_dict_keys(current, delta)
         return

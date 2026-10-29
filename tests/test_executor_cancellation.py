@@ -674,6 +674,86 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertEqual(change[1]["deleted"][0][0], 1)
         self.assertNotEqual(change[0], "value")
 
+    def test_overlapping_audits_keep_separate_deletion_batches(self):
+        for first_to_finish in ("left", "right"):
+            with self.subTest(first_to_finish=first_to_finish):
+                self._overlapping_audits(first_to_finish)
+
+    def _overlapping_audits(self, first_to_finish):
+        directory = Path(tempfile.mkdtemp(prefix="cqa-overlap-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, ignore_errors=True))
+
+        def flag(name):
+            return directory / name
+
+        def signal(name):
+            flag(name).write_text("1", encoding="utf-8")
+
+        def wait_for(name, timeout=4):
+            deadline = time.monotonic() + timeout
+            while not flag(name).exists():
+                if time.monotonic() > deadline:
+                    return False
+                time.sleep(0.01)
+            return True
+
+        registry = {
+            "drop": {"id": "drop", "depends_on": []},
+            "patch": {"id": "patch", "depends_on": []},
+        }
+        errors = []
+
+        def run(name):
+            evidence = {"findings": {"stale": {"old": 1}}}
+
+            def drop(_task, store):
+                signal(f"{name}-entered")
+                del store["findings"]["stale"]
+                return {"ok": True}
+
+            def patch(_task, store):
+                other = "right" if name == "left" else "left"
+                wait_for(f"{name}-dropped")
+                wait_for(f"{other}-entered")
+                if first_to_finish == other:
+                    wait_for(f"{other}-finished")
+                store["findings"]["stale"]["mark"] = name
+                return {"ok": True}
+
+            def on_result(task_id, _result):
+                if task_id == "drop":
+                    signal(f"{name}-dropped")
+
+            try:
+                result = execute(
+                    {"drop", "patch"},
+                    registry,
+                    {"drop": drop, "patch": patch},
+                    evidence,
+                    {
+                        "concurrency": 2,
+                        "max_retries": 1,
+                        "task_timeout_seconds": 6,
+                        "on_result": on_result,
+                    },
+                )
+                if not result["ok"] or evidence["findings"].get("stale") != {"old": 1, "mark": name}:
+                    errors.append((name, result, dict(evidence)))
+            except Exception as exc:  # noqa: BLE001 - reported by the assertion below
+                errors.append((name, exc))
+            finally:
+                signal(f"{name}-finished")
+                signal(f"{name}-entered")
+                signal(f"{name}-dropped")
+
+        threads = [threading.Thread(target=run, args=(name,)) for name in ("left", "right")]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(8)
+            self.assertFalse(thread.is_alive())
+        self.assertEqual(errors, [])
+
     def test_later_insert_does_not_resurrect_a_deleted_dict(self):
         evidence = {"a": {"old": 1}}
         _merge_dict(evidence, {"a": Tombstone("delete", {"old": 1})})
