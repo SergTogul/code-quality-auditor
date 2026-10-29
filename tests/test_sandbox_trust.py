@@ -26,7 +26,7 @@ auditor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(auditor)
 
 from cqa.project import discover_repository, init_repository  # noqa: E402
-from cqa.security import ExecutionLog, probe_sandbox, run_contained, run_tool  # noqa: E402
+from cqa.security import ExecutionLog, _profile, probe_sandbox, run_contained, run_tool  # noqa: E402
 
 
 def _write_executable(path, text):
@@ -168,6 +168,31 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertNotIn("LD_PRELOAD", output)
         self.assertNotIn("NODE_OPTIONS", output)
 
+    def test_profile_closes_reads_outside_the_command_allowlist(self):
+        repo = Path.home() / "cqa-allowlist-repo"
+        repo.mkdir(exist_ok=True)
+        self.addCleanup(lambda: __import__("shutil").rmtree(repo, ignore_errors=True))
+        repo_file = repo / "visible.txt"
+        repo_file.write_text("visible", encoding="utf-8")
+        sibling = Path.home() / "cqa-allowlist-sibling.txt"
+        sibling.write_text("outside", encoding="utf-8")
+        self.addCleanup(lambda: sibling.unlink(missing_ok=True))
+        profile = _profile([str(repo)], str(repo))
+        blanket = profile.index("(allow file-read*)")
+        closure = profile.index('(deny file-read* (subpath "/"))')
+        self.assertLess(blanket, closure)
+        self.assertFalse(_read_allowed(profile, "/etc/passwd"))
+        self.assertFalse(_read_allowed(profile, "/var/lib/cqa-not-allowed"))
+        self.assertFalse(_read_allowed(profile, "/opt/cqa-not-allowed"))
+        self.assertFalse(_read_allowed(profile, sibling))
+        self.assertTrue(_read_allowed(profile, repo_file))
+        self.assertTrue(_read_allowed(profile, Path("/usr/bin/true")))
+        secret = Path.home() / ".ssh" / "id_ed25519"
+        self.assertFalse(_read_allowed(profile, secret))
+        self.assertNotIn('(allow file-read* (subpath "/"))', profile)
+        self.assertNotIn('(allow file-read* (subpath "/etc"))', profile)
+        self.assertNotIn('(allow file-read* (subpath "/opt"))', profile)
+
     def test_contained_command_cannot_read_home_secrets(self):
         secret_dir = Path.home() / ".ssh"
         secret_dir.mkdir(exist_ok=True)
@@ -285,6 +310,28 @@ class SandboxTrustTests(unittest.TestCase):
         available, detail = probe_sandbox(self.repo)
         self.assertFalse(available)
         self.assertIn("interpreter or shell", detail)
+
+
+def _read_allowed(profile, path):
+    """Last matching file-read* rule wins, which is how seatbelt evaluates a profile."""
+    decision = False
+    target = Path(path)
+    for raw in profile.splitlines():
+        line = raw.strip()
+        if line == "(allow file-read*)":
+            decision = True
+            continue
+        if line == "(deny file-read*)":
+            decision = False
+            continue
+        for verb, allowed in (("allow", True), ("deny", False)):
+            prefix = f'({verb} file-read* (subpath "'
+            if not line.startswith(prefix) or not line.endswith('"))'):
+                continue
+            root = Path(line[len(prefix):-3])
+            if target == root or root in target.parents:
+                decision = allowed
+    return decision
 
 
 def subprocess_timeout():

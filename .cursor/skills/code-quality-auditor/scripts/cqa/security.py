@@ -259,29 +259,85 @@ def _command_read_paths(cwd, command):
     return paths
 
 
-def _profile(read_paths, write_path, allow_temp_writes=False):
-    """Close user trees, then re-open only the paths this command must read.
+# Roots a macOS process needs after the startup allow is closed. /etc, /var, /opt,
+# /Users, and /home are intentionally absent.
+_SYSTEM_READ_ROOTS = (
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/System",
+    "/Library",
+    "/dev",
+    "/opt/homebrew",
+    "/private/tmp",
+    "/private/var/folders",
+    "/tmp",
+    "/var/tmp",
+)
 
-    A profile whose file reads are only subpath allows makes seatbelt abort the process,
-    so system locations outside /Users and /home stay on the blanket read. Those system
-    paths are the residual exposure. Credential directories are denied last.
-    """
-    denied_roots = []
+
+def _read_rule(verb, path):
+    quoted = _quote_sb(path)
+    return (
+        f'({verb} file-read* (subpath "{quoted}"))\n'
+        f'({verb} file-read-metadata (subpath "{quoted}"))'
+    )
+
+
+def _allows_read(path):
+    quoted = _quote_sb(path)
+    return (
+        f'(allow file-read* (subpath "{quoted}"))\n'
+        f'(allow file-read-metadata (subpath "{quoted}"))\n'
+        f'(allow file-map-executable (subpath "{quoted}"))'
+    )
+
+
+def _user_roots():
+    roots = []
     for raw in ("/Users", "/home"):
         path = Path(raw)
         if path.is_dir():
-            denied_roots.append(path.resolve())
-    reopen = []
+            roots.append(path.resolve())
+    return roots
+
+
+def _too_broad(path, user_roots):
+    """An allow of `/`, `/home`, or `/Users` would undo the read closure."""
+    if path == Path("/"):
+        return True
+    return any(path == root or path in root.parents for root in user_roots)
+
+
+def _profile(read_paths, write_path, allow_temp_writes=False):
+    """Start with a blanket read so seatbelt can launch, then close it.
+
+    A profile made only of subpath allows aborts sandbox-exec. The blanket
+    `(allow file-read*)` stays first. The next rule denies `/`, and later rules
+    re-open system roots plus the command's own inputs. Credential directories
+    are denied last.
+    """
+    user_roots = _user_roots()
+    required = []
     for raw in _existing_reads(read_paths):
         path = Path(raw).resolve()
-        if any(path == root or root in path.parents for root in denied_roots):
-            reopen.append(str(path))
-    user_denies = "\n".join(f'(deny file-read* (subpath "{_quote_sb(root)}"))' for root in denied_roots)
-    reopened = "\n".join(f'(allow file-read* (subpath "{_quote_sb(path)}"))' for path in reopen)
+        if _too_broad(path, user_roots):
+            continue
+        required.append(path)
+    system = []
+    for raw in _SYSTEM_READ_ROOTS:
+        path = Path(raw)
+        if not path.exists():
+            continue
+        resolved = path.resolve()
+        if _too_broad(resolved, user_roots):
+            continue
+        system.append(resolved)
+    system_allows = "\n".join(_allows_read(path) for path in system)
+    required_allows = "\n".join(_allows_read(path) for path in required)
+    user_denies = "\n".join(_read_rule("deny", root) for root in user_roots)
     home = Path.home().resolve()
-    secret_denies = "\n".join(
-        f'(deny file-read* (subpath "{_quote_sb(home / name)}"))' for name in _SECRET_DIRS
-    )
+    secret_denies = "\n".join(_read_rule("deny", home / name) for name in _SECRET_DIRS)
     write = f'(allow file-write* (subpath "{_quote_sb(write_path)}"))' if write_path else ""
     if allow_temp_writes:
         temp = _quote_sb(Path(tempfile.gettempdir()).resolve())
@@ -296,11 +352,14 @@ def _profile(read_paths, write_path, allow_temp_writes=False):
 (allow file-read*)
 (allow file-read-metadata)
 (allow file-map-executable)
+(deny file-read* (subpath "/"))
+(deny file-read-metadata (subpath "/"))
 (allow mach-lookup)
 (allow ipc-posix*)
 (allow system-socket)
+{system_allows}
 {user_denies}
-{reopened}
+{required_allows}
 {write}
 {secret_denies}
 """
