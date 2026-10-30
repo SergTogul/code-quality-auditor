@@ -205,7 +205,7 @@ class AcceptanceTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             auditor.dag({"dead_code"}, {"dead_code": {"id": "dead_code", "depends_on": ["dead_code"]}})
         evidence = {"builds": 0}
-        barrier = threading.Barrier(2)
+        arrived = self.tmp / "parallel-arrived"
 
         def symbol(_task, store):
             store["builds"] += 1
@@ -217,8 +217,15 @@ class AcceptanceTests(unittest.TestCase):
             return {"used": True}
 
         def parallel(task, _store):
-            barrier.wait(timeout=2)
-            return {"task": task}
+            with arrived.open("a", encoding="utf-8") as handle:
+                handle.write(task + "\n")
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline:
+                text = arrived.read_text(encoding="utf-8") if arrived.exists() else ""
+                if "left" in text and "right" in text:
+                    return {"task": task}
+                time.sleep(0.01)
+            raise TimeoutError("peer did not start")
 
         plan = execute(
             {"dead_code"},
@@ -240,11 +247,13 @@ class AcceptanceTests(unittest.TestCase):
         self.assertTrue(parallel_result["ok"])
         self.assertEqual(len(parallel_result["layers"][0]), 2)
 
-        state = {"n": 0}
+        counter = self.tmp / "flaky-count"
+        counter.write_text("0", encoding="utf-8")
 
         def flaky(_task, _store):
-            state["n"] += 1
-            if state["n"] < 2:
+            count = int(counter.read_text(encoding="utf-8")) + 1
+            counter.write_text(str(count), encoding="utf-8")
+            if count < 2:
                 raise TransientFailure("temporary")
             return {"done": True}
 
