@@ -5,8 +5,10 @@ from __future__ import annotations
 import hashlib
 import os
 import shutil
+import signal
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 from cqa import ENGINE_VERSION
@@ -78,15 +80,141 @@ def runtime_probe(which=None):
     return {"available": True, "path": path, "approval_required": False}
 
 
-def probe_sandbox():
+_DROPPED_ENV = {
+    "LD_PRELOAD",
+    "LD_LIBRARY_PATH",
+    "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH",
+    "PYTHONSTARTUP",
+    "PYTHONPATH",
+    "PYTHONHOME",
+    "NODE_OPTIONS",
+    "NODE_PATH",
+    "BASH_ENV",
+    "ENV",
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+}
+_NEVER_PASS = {"LD_PRELOAD", "DYLD_INSERT_LIBRARIES", "PYTHONSTARTUP", "NODE_OPTIONS", "BASH_ENV", "ENV"}
+_KEEP_ENV = ("PATH", "HOME", "TMPDIR", "TEMP", "TMP", "LANG", "LC_ALL", "LC_CTYPE", "SYSTEMROOT", "COMSPEC", "USER", "LOGNAME")
+_SECRET_DIRS = (".ssh", ".aws", ".gnupg", ".kube", ".docker", ".config/gh")
+_SHELLS = {"bash", "sh", "zsh", "dash", "env", "python", "python3", "perl", "ruby", "node"}
+
+
+def _quote_sb(path):
+    return str(path).replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _sanitize_env(explicit=None):
+    """Drop inherited loader and startup hooks. Explicit PYTHONPATH from the auditor is kept."""
+    env = {key: os.environ[key] for key in _KEEP_ENV if key in os.environ and key not in _DROPPED_ENV}
+    for key, value in (explicit or {}).items():
+        if key in _NEVER_PASS or value is None:
+            continue
+        env[key] = value
+    return env
+
+
+def _validate_custom(raw, cwd=None):
+    if raw != raw.strip() or any(character.isspace() for character in raw):
+        raise PermissionError("custom sandbox command must be one absolute executable path")
+    path = Path(raw)
+    if not path.is_absolute() or not path.is_file():
+        raise PermissionError("custom sandbox command must be one absolute executable path")
+    resolved = path.resolve()
+    name = resolved.name
+    if name in _SHELLS or name.startswith("python"):
+        raise PermissionError("custom sandbox command is an interpreter or shell")
+    if cwd is not None:
+        root = Path(cwd).resolve()
+        if resolved == root or root in resolved.parents:
+            raise PermissionError("custom sandbox command is inside the audited repository")
+    return resolved
+
+
+def _inside(root, path):
+    root = Path(root).resolve()
+    path = Path(path).resolve()
+    return path == root or root in path.parents
+
+
+def _resolve_executable(command):
+    candidate = Path(command)
+    if candidate.is_file():
+        return candidate.resolve()
+    found = shutil.which(command)
+    if not found:
+        raise PermissionError(f"executable was not found: {command}")
+    return Path(found).resolve()
+
+
+def _run_process(command, cwd, env, timeout):
+    """Run a command in its own session and kill the whole group on timeout."""
+    process = subprocess.Popen(
+        command,
+        cwd=cwd,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=1)
+        raise exc
+    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+_PLATFORM_SANDBOX = {"darwin": "/usr/bin/sandbox-exec"}
+
+
+def _trusted_sandbox():
+    """The platform binary at a fixed path. PATH cannot select a different executable."""
+    candidate = _PLATFORM_SANDBOX.get(sys.platform)
+    if not candidate:
+        return None
+    path = Path(candidate)
+    try:
+        info = path.stat()
+    except OSError:
+        return None
+    if not path.is_file() or info.st_uid != 0:
+        return None
+    return path.resolve()
+
+
+def _sandbox_command(profile, command):
+    trusted = _trusted_sandbox()
+    if trusted is None:
+        raise PermissionError("no containment command is available")
+    return [str(trusted), "-p", profile, "--", *command]
+
+
+def probe_sandbox(cwd=None):
+    """Trust only the platform sandbox-exec binary. Probes cannot authorize another executable."""
+    trusted = _trusted_sandbox()
     custom = os.environ.get("CQA_SANDBOX_CMD")
     if custom:
-        return True, "custom containment command"
-    sandbox = shutil.which("sandbox-exec")
-    if not sandbox:
+        try:
+            path = _validate_custom(custom, cwd)
+        except PermissionError as exc:
+            return False, str(exc)
+        if trusted is None or path != trusted:
+            return False, "custom containment command is not an allowlisted implementation"
+    if trusted is None:
         return False, "no containment command is available"
     probe = subprocess.run(
-        [sandbox, "-p", "(version 1)(allow default)", "/usr/bin/true"],
+        [str(trusted), "-p", "(version 1)(allow default)", "/usr/bin/true"],
         capture_output=True,
         text=True,
         check=False,
@@ -94,16 +222,126 @@ def probe_sandbox():
     if probe.returncode != 0:
         detail = (probe.stderr or probe.stdout or "sandbox-exec failed").strip()
         return False, f"containment is unavailable: {detail}"
-    return True, sandbox
+    return True, str(trusted)
 
 
-def _profile(read_paths, write_path):
-    """Containment that can start CPython: read and execute are allowed, network and repository writes are not.
+def _existing_reads(read_paths):
+    candidates = list(read_paths or [])
+    candidates.append(sys.prefix)
+    candidates.append(getattr(sys, "base_prefix", sys.prefix))
+    roots = []
+    seen = set()
+    for raw in candidates:
+        if not raw:
+            continue
+        path = Path(raw)
+        if not path.exists():
+            continue
+        resolved = str(path.resolve())
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        roots.append(resolved)
+    return roots
 
-    read_paths is retained so callers can see which roots were considered. Writes are limited to write_path.
+
+def _command_read_paths(cwd, command):
+    paths = []
+    root = Path(cwd).resolve()
+    if root.exists():
+        paths.append(str(root))
+    for item in command:
+        candidate = Path(item)
+        if not candidate.exists():
+            continue
+        resolved = candidate.resolve()
+        paths.append(str(resolved if resolved.is_dir() else resolved.parent))
+    return paths
+
+
+# Roots a macOS process needs after the startup allow is closed. /etc, /var, /opt,
+# /Users, and /home are intentionally absent.
+_SYSTEM_READ_ROOTS = (
+    "/usr",
+    "/bin",
+    "/sbin",
+    "/System",
+    "/Library",
+    "/dev",
+    "/opt/homebrew",
+    "/private/tmp",
+    "/private/var/folders",
+    "/tmp",
+    "/var/tmp",
+)
+
+
+def _read_rule(verb, path):
+    quoted = _quote_sb(path)
+    return (
+        f'({verb} file-read* (subpath "{quoted}"))\n'
+        f'({verb} file-read-metadata (subpath "{quoted}"))'
+    )
+
+
+def _allows_read(path):
+    quoted = _quote_sb(path)
+    return (
+        f'(allow file-read* (subpath "{quoted}"))\n'
+        f'(allow file-read-metadata (subpath "{quoted}"))\n'
+        f'(allow file-map-executable (subpath "{quoted}"))'
+    )
+
+
+def _user_roots():
+    roots = []
+    for raw in ("/Users", "/home"):
+        path = Path(raw)
+        if path.is_dir():
+            roots.append(path.resolve())
+    return roots
+
+
+def _too_broad(path, user_roots):
+    """An allow of `/`, `/home`, or `/Users` would undo the read closure."""
+    if path == Path("/"):
+        return True
+    return any(path == root or path in root.parents for root in user_roots)
+
+
+def _profile(read_paths, write_path, allow_temp_writes=False):
+    """Start with a blanket read so seatbelt can launch, then close it.
+
+    A profile made only of subpath allows aborts sandbox-exec. The blanket
+    `(allow file-read*)` stays first. The next rule denies `/`, and later rules
+    re-open system roots plus the command's own inputs. Credential directories
+    are denied last.
     """
-    del read_paths
-    write = f'(allow file-write* (subpath "{write_path}"))' if write_path else ""
+    user_roots = _user_roots()
+    required = []
+    for raw in _existing_reads(read_paths):
+        path = Path(raw).resolve()
+        if _too_broad(path, user_roots):
+            continue
+        required.append(path)
+    system = []
+    for raw in _SYSTEM_READ_ROOTS:
+        path = Path(raw)
+        if not path.exists():
+            continue
+        resolved = path.resolve()
+        if _too_broad(resolved, user_roots):
+            continue
+        system.append(resolved)
+    system_allows = "\n".join(_allows_read(path) for path in system)
+    required_allows = "\n".join(_allows_read(path) for path in required)
+    user_denies = "\n".join(_read_rule("deny", root) for root in user_roots)
+    home = Path.home().resolve()
+    secret_denies = "\n".join(_read_rule("deny", home / name) for name in _SECRET_DIRS)
+    write = f'(allow file-write* (subpath "{_quote_sb(write_path)}"))' if write_path else ""
+    if allow_temp_writes:
+        temp = _quote_sb(Path(tempfile.gettempdir()).resolve())
+        write = f'{write}\n(allow file-write* (subpath "{temp}"))'
     return f"""(version 1)
 (deny default)
 (deny network*)
@@ -114,11 +352,27 @@ def _profile(read_paths, write_path):
 (allow file-read*)
 (allow file-read-metadata)
 (allow file-map-executable)
+(deny file-read* (subpath "/"))
+(deny file-read-metadata (subpath "/"))
 (allow mach-lookup)
 (allow ipc-posix*)
 (allow system-socket)
+{system_allows}
+{user_denies}
+{required_allows}
 {write}
+{secret_denies}
 """
+
+
+def _contained_command(command, cwd, write_path):
+    command = list(command)
+    executable = Path(command[0])
+    if executable.is_file():
+        command[0] = str(executable.resolve())
+    resolved_write = str(Path(write_path).resolve()) if write_path else None
+    profile = _profile(_command_read_paths(cwd, command), resolved_write)
+    return _sandbox_command(profile, command)
 
 
 def run_contained(command, cwd, log, timeout=30, write_path=None, env=None):
@@ -129,28 +383,15 @@ def run_contained(command, cwd, log, timeout=30, write_path=None, env=None):
     if not log.sandbox_confirmed:
         log.deny("sandbox-confirmation", "sandbox confirmation was not given")
         raise PermissionError("sandbox confirmation was not given")
-    ok, detail = probe_sandbox()
+    ok, detail = probe_sandbox(cwd)
     if not ok:
         log.deny("containment", detail)
         raise PermissionError(detail)
-    custom = os.environ.get("CQA_SANDBOX_CMD")
-    command = list(command)
-    executable = Path(command[0])
-    if executable.is_file():
-        command[0] = str(executable.resolve())
-    if custom:
-        wrapped = custom.split() + command
-    else:
-        read_paths = [str(Path(cwd).resolve()), str(Path(command[0]).resolve().parent.parent)]
-        resolved_write = str(Path(write_path).resolve()) if write_path else None
-        profile = _profile(read_paths, resolved_write)
-        wrapped = ["sandbox-exec", "-p", profile, "--", *command]
+    wrapped = _contained_command(command, cwd, write_path)
     log.record(wrapped, "started")
-    run_env = os.environ.copy()
-    if env:
-        run_env.update(env)
+    run_env = _sanitize_env(env)
     try:
-        completed = subprocess.run(wrapped, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False, env=run_env)
+        completed = _run_process(wrapped, cwd, run_env, timeout)
     except subprocess.TimeoutExpired as exc:
         log.record(wrapped, "timeout", str(exc))
         raise
@@ -165,9 +406,23 @@ def run_tool(command, cwd, log, timeout=60):
     if not log.allow_tools:
         log.deny("external-tool", "tool execution was not approved")
         raise PermissionError("tool execution was not approved")
-    log.record(command, "started")
-    completed = subprocess.run(command, cwd=cwd, capture_output=True, text=True, timeout=timeout, check=False)
-    log.record(command, f"exit {completed.returncode}")
+    try:
+        executable = _resolve_executable(command[0])
+    except PermissionError as exc:
+        log.deny("external-tool", str(exc))
+        raise
+    if _inside(cwd, executable):
+        log.deny("external-tool", "repository-controlled executable was not run")
+        raise PermissionError("repository-controlled executable was not run")
+    command = [str(executable), *list(command)[1:]]
+    ok, detail = probe_sandbox(cwd)
+    if not ok:
+        log.deny("containment", detail)
+        raise PermissionError(detail)
+    wrapped = _sandbox_command(_profile(_command_read_paths(cwd, command), None, allow_temp_writes=True), command)
+    log.record(wrapped, "started")
+    completed = _run_process(wrapped, cwd, _sanitize_env(), timeout)
+    log.record(wrapped, f"exit {completed.returncode}")
     return completed
 
 
