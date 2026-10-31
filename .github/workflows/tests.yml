@@ -10,7 +10,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
@@ -109,6 +109,31 @@ jobs:
       - name: Run test suite
         run: python scripts/ci/run_unittest.py --start-directory tests --result-json "$RESULTS_DIR/unittest.json" --verbosity 2
 
+      - name: Require native sandbox tests to run on macOS
+        if: runner.os == 'macOS'
+        run: |
+          python - <<'EOF'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          results = Path(os.environ["RESULTS_DIR"])
+          platform_info = json.loads((results / "platform.json").read_text(encoding="utf-8"))
+          data = json.loads((results / "unittest.json").read_text(encoding="utf-8"))
+          problems = []
+          if platform_info.get("sandbox_exec_is_file") is not True:
+              problems.append("/usr/bin/sandbox-exec is not a file on this macOS runner")
+          skipped = [item["id"] for item in data["skipped_details"] if item["reason"] == "requires macOS /usr/bin/sandbox-exec"]
+          for test_id in skipped:
+              problems.append(f"native sandbox test was skipped: {test_id}")
+          for problem in problems:
+              print(f"::error::{problem}")
+          if problems:
+              sys.exit(1)
+          print("native sandbox-exec is present and no native sandbox test was skipped")
+          EOF
+
       - name: Summarize test results
         if: always()
         run: |
@@ -121,7 +146,7 @@ jobs:
           print(f"### unittest ({os.environ['RUNNER_OS']}, Python {os.environ['PYTHON_LABEL']})")
           if not path.is_file():
               print("No result file was written.")
-              raise SystemExit
+              raise SystemExit(1)
           data = json.loads(path.read_text(encoding="utf-8"))
           print(
               f"success={data['success']} run={data['tests_run']} failures={data['failures']} "
@@ -142,7 +167,7 @@ jobs:
         with:
           name: test-results-${{ matrix.os }}-py${{ matrix.python-version }}
           path: ${{ env.RESULTS_DIR }}/
-          if-no-files-found: warn
+          if-no-files-found: error
           retention-days: 14
 
   required:

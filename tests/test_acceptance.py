@@ -36,10 +36,14 @@ from cqa.project import init_repository, manage_profile  # noqa: E402
 from cqa.reporting import compare_history, render_html, trends  # noqa: E402
 from cqa import checks as check_module  # noqa: E402
 
-requires_macos_sandbox = unittest.skipUnless(
-    sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").is_file(),
-    "requires macOS /usr/bin/sandbox-exec",
-)
+NATIVE_SANDBOX_REASON = "requires macOS /usr/bin/sandbox-exec"
+
+
+def _native_sandbox_available():
+    return sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").is_file()
+
+
+requires_macos_sandbox = unittest.skipUnless(_native_sandbox_available(), NATIVE_SANDBOX_REASON)
 
 
 def _write(path, text):
@@ -51,6 +55,11 @@ class AcceptanceTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="cqa-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def require_native_sandbox(self):
+        """Call after the platform-independent assertions so they still run everywhere."""
+        if not _native_sandbox_available():
+            self.skipTest(NATIVE_SANDBOX_REASON)
 
     def repo(self, name="repo"):
         path = self.tmp / name
@@ -515,7 +524,6 @@ class AcceptanceTests(unittest.TestCase):
         plain_report = self.audit(plain, profile="full")
         self.assertEqual({item["metric_id"]: item["status"] for item in plain_report["metrics"]}["QUANT-003"], "NOT_APPLICABLE")
 
-    @requires_macos_sandbox
     def test_authorized_line_coverage(self):
         """Requirements: 8.3."""
         repo = self.repo("covered")
@@ -545,6 +553,7 @@ class AcceptanceTests(unittest.TestCase):
         denied_line = {item["metric_id"]: item for item in denied["metrics"]}["TEST-002"]
         self.assertEqual(denied_line["status"], "UNAVAILABLE")
         self.assertIn("not approved", denied_line["reason"])
+        self.require_native_sandbox()
         before = (repo / "app.py").read_text(encoding="utf-8")
         approved = self.audit(repo, profile="lines", allow_repo_execution=True, sandbox_confirmed=True)
         metrics = {item["metric_id"]: item for item in approved["metrics"]}
@@ -899,10 +908,8 @@ class AcceptanceTests(unittest.TestCase):
         files = {item["file"] for item in report["findings"] if "REL-001" in item["metric_ids"]}
         self.assertEqual(files, {"app.py", "app.js", "app.cpp"})
 
-    @requires_macos_sandbox
     def test_clang_syntax_requires_tool_approval(self):
         """Requirements: 4.4, 8.7."""
-        self.assertIsNotNone(shutil.which("clang"))
         repo = self.repo("clang-syntax")
         _write(repo / "quality-auditor.yaml", """
         version: 1
@@ -920,6 +927,8 @@ class AcceptanceTests(unittest.TestCase):
         denied_metrics = {item["metric_id"]: item for item in denied["metrics"]}
         self.assertEqual(denied_metrics["REL-004"]["measured_value"], 0)
         self.assertEqual(denied["decision"], "PASS")
+        self.require_native_sandbox()
+        self.assertIsNotNone(shutil.which("clang"))
         approved = self.audit(repo, profile="syntax", allow_tools=True)
         approved_metrics = {item["metric_id"]: item for item in approved["metrics"]}
         self.assertEqual(approved_metrics["REL-004"]["measured_value"], 1)
@@ -1813,7 +1822,6 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(metrics["REQ-004"]["measured_value"], 1)
         self.assertEqual(metrics["REQ-004"]["status"], "FAIL")
 
-    @requires_macos_sandbox
     def test_authorized_acceptance_failures_count(self):
         """Requirements: 7.8, 8.8."""
         repo = self.repo("accept")
@@ -1848,6 +1856,7 @@ class AcceptanceTests(unittest.TestCase):
         denied_metrics = {item["metric_id"]: item for item in denied["metrics"]}
         self.assertEqual(denied_metrics["REQ-008"]["measured_value"], 1)
         self.assertEqual(denied_metrics["REQ-008"]["status"], "FAIL")
+        self.require_native_sandbox()
         approved = self.audit(repo, profile="accept", allow_repo_execution=True, sandbox_confirmed=True)
         metrics = {item["metric_id"]: item for item in approved["metrics"]}
         self.assertEqual(metrics["REQ-008"]["measured_value"], 2)
@@ -1946,6 +1955,7 @@ class AcceptanceTests(unittest.TestCase):
         metrics = {item["metric_id"]: item for item in report["metrics"]}
         self.assertEqual(metrics["REQ-008"]["status"], "UNAVAILABLE")
 
+    @requires_macos_sandbox
     def test_pytest_failure_with_error_line_stays_unavailable(self):
         """Requirements: 4.4, 7.6, 8.3."""
         repo = self.repo("pyerror")
@@ -1983,9 +1993,14 @@ class AcceptanceTests(unittest.TestCase):
         )
         runner.chmod(0o755)
         report = self.audit(repo, profile="accept", allow_repo_execution=True, sandbox_confirmed=True)
+        commands = [" ".join(item["command"]) for item in report["execution"]["commands"]]
+        blob = "\n".join(commands)
+        self.assertEqual(report["execution"]["denied"], [])
+        self.assertIn(".venv/bin/pytest", blob)
         metrics = {item["metric_id"]: item for item in report["metrics"]}
         self.assertEqual(metrics["REQ-008"]["status"], "UNAVAILABLE")
 
+    @requires_macos_sandbox
     def test_unittest_import_error_stays_unavailable(self):
         """Requirements: 7.8, 8.8."""
         repo = self.repo("accept-broken")
@@ -2018,6 +2033,10 @@ class AcceptanceTests(unittest.TestCase):
         """)
         _write(repo / "tests" / "test_broken.py", "import does_not_exist\n")
         report = self.audit(repo, profile="accept", allow_repo_execution=True, sandbox_confirmed=True)
+        commands = [" ".join(item["command"]) for item in report["execution"]["commands"]]
+        blob = "\n".join(commands)
+        self.assertEqual(report["execution"]["denied"], [])
+        self.assertIn("-m unittest discover", blob)
         metrics = {item["metric_id"]: item for item in report["metrics"]}
         self.assertEqual(metrics["REQ-008"]["status"], "UNAVAILABLE")
 
