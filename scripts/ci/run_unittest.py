@@ -76,7 +76,9 @@ def main(argv=None):
     loader = unittest.TestLoader()
     try:
         suite = loader.discover(args.start_directory, pattern=args.pattern)
-    except Exception:  # discovery raises for a missing or unimportable start directory
+    # Discovery raises for a missing or unimportable start directory, and a
+    # load_tests() hook can raise SystemExit; neither may end the run silently.
+    except (Exception, SystemExit):
         message = traceback.format_exc()
         sys.stdout.write(message)
         payload = _payload(args, None, time.perf_counter() - started, [message])
@@ -88,9 +90,9 @@ def main(argv=None):
     result = runner.run(suite)
     elapsed = time.perf_counter() - started
     payload = _payload(args, result, elapsed, list(loader.errors))
-    # Mirrors `python -m unittest`, which exits 5 when nothing ran, so an empty
-    # selection is never reported as a passing check.
-    no_tests = result.testsRun == 0 and not result.skipped
+    # testsRun includes skipped tests and wasSuccessful() is true when every
+    # test was skipped, so an empty or entirely skipped selection is not a pass.
+    no_tests = result.testsRun - len(result.skipped) <= 0
     success = result.wasSuccessful() and not loader.errors and not no_tests
     payload["success"] = success
     _write(args.result_json, payload)
@@ -98,7 +100,7 @@ def main(argv=None):
     if success:
         return 0
     if no_tests:
-        sys.stdout.write("no tests were run\n")
+        sys.stdout.write("no non-skipped tests were run\n")
         return EXIT_NO_TESTS
     return EXIT_FAILED
 

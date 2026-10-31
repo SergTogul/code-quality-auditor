@@ -76,13 +76,30 @@ class CiRunnerTests(unittest.TestCase):
 
     def test_skipped_test_records_its_reason(self):
         completed, data = self._run("""
+        def test_ok(self):
+            self.assertTrue(True)
+
         @unittest.skip("platform facility is absent")
         def test_platform(self):
             raise AssertionError("must not run")
         """)
         self.assertEqual(completed.returncode, 0, completed.stdout)
         self.assertTrue(data["success"])
+        self.assertEqual(data["tests_run"], 2)
         self.assertEqual(data["skipped"], 1)
+        self.assertEqual(
+            data["skipped_details"],
+            [{"id": f"{MODULE}.Fixture.test_platform", "reason": "platform facility is absent"}],
+        )
+
+    def test_entirely_skipped_suite_exits_nonzero(self):
+        completed, data = self._run("""
+        @unittest.skip("platform facility is absent")
+        def test_platform(self):
+            raise AssertionError("must not run")
+        """)
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(data["success"])
         self.assertEqual(
             data["skipped_details"],
             [{"id": f"{MODULE}.Fixture.test_platform", "reason": "platform facility is absent"}],
@@ -106,6 +123,17 @@ class CiRunnerTests(unittest.TestCase):
         self.assertFalse(data["success"])
         self.assertEqual(data["tests_run"], 0)
         self.assertTrue(data["discovery_errors"])
+
+    def test_load_tests_exit_is_a_discovery_error(self):
+        (self.suite / f"{MODULE}.py").write_text(
+            "import sys\n\n\ndef load_tests(loader, tests, pattern):\n    sys.exit(0)\n",
+            encoding="utf-8",
+        )
+        completed, data = self._run()
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertFalse(data["success"])
+        self.assertTrue(data["discovery_errors"])
+        self.assertIn("SystemExit", completed.stdout)
 
     def test_empty_selection_exits_nonzero(self):
         completed, data = self._run()
