@@ -649,8 +649,39 @@ def _finish_job(job, ok, error, value, cache_dir):
     }
 
 
-def _poll_job(job, now, cancel, max_attempts, backoff):
-    """Return (finished_result_or_none, still_running)."""
+def _stopped_record(job, cancelled, budget_spent, reaped):
+    if budget_spent:
+        return {
+            "attempt": job.attempt,
+            "outcome": "timeout",
+            "reason": "run budget exhausted",
+            "transient": False,
+            "diagnostic": "run deadline reached" if reaped else "attempt did not terminate",
+        }
+    if cancelled:
+        return {
+            "attempt": job.attempt,
+            "outcome": "timeout",
+            "reason": "cancelled",
+            "transient": False,
+            "diagnostic": "cancelled",
+        }
+    limit = f"{job.deadline - job.started:.3f}"
+    return {
+        "attempt": job.attempt,
+        "outcome": "timeout",
+        "reason": f"exceeded {limit}s",
+        "transient": reaped,
+        "diagnostic": f"elapsed>{limit}" if reaped else "attempt did not terminate",
+    }
+
+
+def _poll_job(job, now, cancel, max_attempts, backoff, budget_spent=False):
+    """Return (finished_result_or_none, still_running).
+
+    budget_spent means the run deadline set the cancel event, so the stop is
+    reported as an exhausted budget rather than a user cancellation.
+    """
     if not job.group_ready:
         job.group_ready = _group_ready(job.ready_read)
     try:
@@ -681,22 +712,11 @@ def _poll_job(job, now, cancel, max_attempts, backoff):
             pass
     job.pid = None
     if killed or payload is None:
-        transient = bool(reaped and not cancelled)
-        reason = "cancelled" if cancelled else f"exceeded {job.deadline - job.started:.3f}s"
-        diagnostic = "cancelled" if cancelled else (f"elapsed>{job.deadline - job.started:.3f}" if reaped else "attempt did not terminate")
-        if not cancelled:
-            reason = f"exceeded {job.deadline - job.started:.3f}s"
-        job.records.append(
-            {
-                "attempt": job.attempt,
-                "outcome": "timeout",
-                "reason": "cancelled" if cancelled else reason,
-                "transient": False if cancelled or not reaped else True,
-                "diagnostic": diagnostic,
-            }
-        )
-        if cancelled or not transient or job.attempt >= max_attempts:
-            error = "cancelled" if cancelled else "timeout"
+        budget_spent = bool(cancelled and budget_spent)
+        record = _stopped_record(job, cancelled, budget_spent, reaped)
+        job.records.append(record)
+        if cancelled or not record["transient"] or job.attempt >= max_attempts:
+            error = "budget exhausted" if budget_spent else ("cancelled" if cancelled else "timeout")
             return _finish_job(job, False, error, None, None), False
         job.attempt += 1
         job.next_time = time.monotonic() + (backoff * (job.attempt - 1))
@@ -741,22 +761,45 @@ def _start_job(job, task_timeout):
 
 
 def _raise_in_thread(thread):
+    """Return True only when CPython accepted an asynchronous exception for this thread."""
     ident = thread.ident
     if not ident:
         return False
-    import ctypes
+    try:
+        import ctypes
 
-    exception = ctypes.py_object(_AttemptCancelled)
-    ident_value = ctypes.c_ulong(ident)
-    count = ctypes.pythonapi.PyThreadState_SetAsyncExc(ident_value, exception)
-    if count > 1:
-        ctypes.pythonapi.PyThreadState_SetAsyncExc(ident_value, None)
+        set_async_exc = ctypes.pythonapi.PyThreadState_SetAsyncExc
+        exception = ctypes.py_object(_AttemptCancelled)
+        ident_value = ctypes.c_ulong(ident)
+        count = set_async_exc(ident_value, exception)
+        if count > 1:
+            set_async_exc(ident_value, None)
+            return False
+    except Exception:  # noqa: BLE001 - no CPython API means no termination guarantee
         return False
     return count == 1
 
 
-def _run_thread_attempt(runner, task_id, evidence, task_timeout, cancel):
-    """Fallback for platforms without fork. A live thread is never overlapped by a retry."""
+_THREAD_POLL_SECONDS = 0.01
+_THREAD_QUIESCENCE_SECONDS = 0.2
+
+
+def _thread_stop_trigger(cancel, now, timeout_at, deadline):
+    if cancel.is_set():
+        return "cancelled"
+    if deadline is not None and now >= deadline:
+        return "budget"
+    if now >= timeout_at:
+        return "timeout"
+    return None
+
+
+def _run_thread_attempt(runner, task_id, evidence, task_timeout, cancel, deadline=None):
+    """Fallback for platforms without fork. A live thread is never overlapped by a retry.
+
+    The attempt stops at the earliest of the task timeout, the absolute run
+    deadline, or external cancellation.
+    """
     holder = {}
 
     def invoke():
@@ -771,17 +814,28 @@ def _run_thread_attempt(runner, task_id, evidence, task_timeout, cancel):
 
     worker = threading.Thread(target=invoke, daemon=True)
     started = time.monotonic()
+    timeout_at = started + task_timeout
     worker.start()
-    worker.join(task_timeout)
-    if worker.is_alive() or cancel.is_set():
-        cancel_requested = cancel.is_set()
-        _raise_in_thread(worker)
-        worker.join(0.2)
+    trigger = None
+    while worker.is_alive():
+        now = time.monotonic()
+        trigger = _thread_stop_trigger(cancel, now, timeout_at, deadline)
+        if trigger:
+            break
+        limit = timeout_at if deadline is None else min(timeout_at, deadline)
+        worker.join(max(0.0, min(_THREAD_POLL_SECONDS, limit - now)))
+    if trigger is None and cancel.is_set():
+        trigger = "cancelled"
+    if trigger:
+        if worker.is_alive():
+            _raise_in_thread(worker)
+            worker.join(_THREAD_QUIESCENCE_SECONDS)
         reaped = not worker.is_alive()
         return {
             "kind": "timeout",
+            "trigger": trigger,
             "reaped": reaped,
-            "cancelled": cancel_requested,
+            "cancelled": trigger == "cancelled",
             "unterminated": not reaped,
             "elapsed": time.monotonic() - started,
         }
@@ -795,14 +849,69 @@ def _run_thread_attempt(runner, task_id, evidence, task_timeout, cancel):
             "elapsed": time.monotonic() - started,
         }
     if "cancelled" in holder:
-        return {"kind": "timeout", "reaped": True, "cancelled": True, "elapsed": time.monotonic() - started}
+        return {"kind": "timeout", "trigger": "cancelled", "reaped": True, "cancelled": True, "elapsed": time.monotonic() - started}
     return {"kind": "ok", "value": holder.get("value"), "elapsed": time.monotonic() - started}
+
+
+_THREAD_TRIGGER_DIAGNOSTIC = {
+    "timeout": "task timeout reached",
+    "budget": "run deadline reached",
+    "cancelled": "cancelled",
+}
+
+
+def _thread_timeout_result(task_id, attempt, task_timeout, outcome, records):
+    """Return (terminal_result_or_none, retry). Budget and cancellation never retry."""
+    trigger = outcome.get("trigger") or ("cancelled" if outcome.get("cancelled") else "timeout")
+    if outcome.get("unterminated"):
+        records.append(
+            {
+                "attempt": attempt,
+                "outcome": "timeout",
+                "reason": "termination could not be guaranteed",
+                "transient": False,
+                "diagnostic": f"termination could not be guaranteed after {_THREAD_TRIGGER_DIAGNOSTIC[trigger]}",
+            }
+        )
+        return {"task_id": task_id, "ok": False, "cached": False, "error": "termination could not be guaranteed", "attempts": records}
+    if trigger == "budget":
+        records.append(
+            {
+                "attempt": attempt,
+                "outcome": "timeout",
+                "reason": "run budget exhausted",
+                "transient": False,
+                "diagnostic": _THREAD_TRIGGER_DIAGNOSTIC[trigger],
+            }
+        )
+        return {"task_id": task_id, "ok": False, "cached": False, "error": "budget exhausted", "attempts": records}
+    if trigger == "cancelled":
+        records.append(
+            {
+                "attempt": attempt,
+                "outcome": "timeout",
+                "reason": "cancelled",
+                "transient": False,
+                "diagnostic": _THREAD_TRIGGER_DIAGNOSTIC[trigger],
+            }
+        )
+        return {"task_id": task_id, "ok": False, "cached": False, "error": "cancelled", "attempts": records}
+    records.append(_timeout_record(attempt, task_timeout, f"elapsed>{task_timeout}", True))
+    return None
+
+
+def _thread_backoff(seconds, cancel, deadline):
+    if seconds <= 0:
+        return
+    if deadline is not None:
+        seconds = min(seconds, max(0.0, deadline - time.monotonic()))
+    cancel.wait(seconds)
 
 
 def _run_thread_task(task_id, runner, evidence, key, task_timeout, max_attempts, backoff, cancel, deadline, cache_dir):
     records = []
     for attempt in range(1, max_attempts + 1):
-        if cancel.is_set() or (deadline is not None and time.monotonic() > deadline):
+        if cancel.is_set() or (deadline is not None and time.monotonic() >= deadline):
             records.append(
                 {
                     "attempt": attempt,
@@ -814,27 +923,14 @@ def _run_thread_task(task_id, runner, evidence, key, task_timeout, max_attempts,
             )
             error = "cancelled" if cancel.is_set() else "budget exhausted"
             return {"task_id": task_id, "ok": False, "cached": False, "error": error, "attempts": records}
-        outcome = _run_thread_attempt(runner, task_id, evidence, task_timeout, cancel)
+        outcome = _run_thread_attempt(runner, task_id, evidence, task_timeout, cancel, deadline)
         if outcome["kind"] == "timeout":
-            if outcome.get("unterminated"):
-                records.append(
-                    {
-                        "attempt": attempt,
-                        "outcome": "timeout",
-                        "reason": "termination could not be guaranteed",
-                        "transient": False,
-                        "diagnostic": "termination could not be guaranteed",
-                    }
-                )
-                return {"task_id": task_id, "ok": False, "cached": False, "error": "termination could not be guaranteed", "attempts": records}
-            transient = bool(outcome["reaped"] and not outcome["cancelled"])
-            records.append(_timeout_record(attempt, task_timeout, "cancelled" if outcome["cancelled"] else (f"elapsed>{task_timeout}" if transient else "attempt did not terminate"), transient))
-            if outcome["cancelled"]:
-                records[-1]["reason"] = "cancelled"
-                records[-1]["transient"] = False
-            if not transient or attempt == max_attempts:
-                return {"task_id": task_id, "ok": False, "cached": False, "error": "cancelled" if outcome["cancelled"] else "timeout", "attempts": records}
-            time.sleep(backoff * attempt)
+            terminal = _thread_timeout_result(task_id, attempt, task_timeout, outcome, records)
+            if terminal is not None:
+                return terminal
+            if attempt == max_attempts:
+                return {"task_id": task_id, "ok": False, "cached": False, "error": "timeout", "attempts": records}
+            _thread_backoff(backoff * attempt, cancel, deadline)
             continue
         if outcome["kind"] == "error":
             records.append(
@@ -848,7 +944,7 @@ def _run_thread_task(task_id, runner, evidence, key, task_timeout, max_attempts,
             )
             if not outcome["transient"] or attempt == max_attempts:
                 return {"task_id": task_id, "ok": False, "cached": False, "error": outcome["message"], "attempts": records}
-            time.sleep(backoff * attempt)
+            _thread_backoff(backoff * attempt, cancel, deadline)
             continue
         records.append(
             {
@@ -880,39 +976,35 @@ def _run_processes(jobs, concurrency, task_timeout, max_attempts, backoff, cance
         if not result.get("ok"):
             failed.add(job.task_id)
 
+    budget_spent = False
+
+    def not_started(job):
+        job.records.append(
+            {
+                "attempt": job.attempt,
+                "outcome": "timeout",
+                "reason": "run budget exhausted" if budget_spent else "cancelled",
+                "transient": False,
+                "diagnostic": "cancelled before start",
+            }
+        )
+        store(job, _finish_job(job, False, "budget exhausted" if budget_spent else "cancelled", None, None))
+
     while queue or delayed or inflight:
         now = time.monotonic()
-        if deadline is not None and now > deadline:
+        if deadline is not None and now > deadline and not cancel.is_set():
+            budget_spent = True
             cancel.set()
         if cancel.is_set() and not inflight:
             for job in queue + delayed:
-                job.records.append(
-                    {
-                        "attempt": job.attempt,
-                        "outcome": "timeout",
-                        "reason": "cancelled" if cancel.is_set() and (deadline is None or now <= deadline) else "run budget exhausted",
-                        "transient": False,
-                        "diagnostic": "cancelled before start",
-                    }
-                )
-                error = "budget exhausted" if deadline is not None and now > deadline else "cancelled"
-                store(job, _finish_job(job, False, error, None, None))
+                not_started(job)
             break
         still_delayed = []
         for job in delayed:
             if job.next_time <= now and not cancel.is_set():
                 queue.append(job)
             elif cancel.is_set():
-                job.records.append(
-                    {
-                        "attempt": job.attempt,
-                        "outcome": "timeout",
-                        "reason": "cancelled",
-                        "transient": False,
-                        "diagnostic": "cancelled before start",
-                    }
-                )
-                store(job, _finish_job(job, False, "cancelled", None, None))
+                not_started(job)
             else:
                 still_delayed.append(job)
         delayed = still_delayed
@@ -926,7 +1018,7 @@ def _run_processes(jobs, concurrency, task_timeout, max_attempts, backoff, cance
             continue
         progressed = False
         for job in list(inflight):
-            result, running = _poll_job(job, time.monotonic(), cancel, max_attempts, backoff)
+            result, running = _poll_job(job, time.monotonic(), cancel, max_attempts, backoff, budget_spent)
             if running:
                 continue
             inflight.remove(job)
@@ -948,7 +1040,10 @@ def execute(selected, registry, runners, evidence, options=None):
     Deterministic exceptions are not retried. Each attempt runs in a killable
     process session on POSIX. The next attempt starts only after the previous
     process has been reaped. Exhausted retries and timeouts are terminal errors;
-    callers must treat them as fail-closed.
+    callers must treat them as fail-closed. An expired run deadline
+    ("budget exhausted"), external cancellation ("cancelled"), and a fallback
+    thread that could not be stopped ("termination could not be guaranteed")
+    are terminal and never retried.
     """
     options = options or {}
     nodes = dag(selected, registry)
@@ -1016,7 +1111,7 @@ def execute(selected, registry, runners, evidence, options=None):
                                     "attempt": 1,
                                     "outcome": "timeout",
                                     "reason": "run budget exhausted",
-                                    "transient": True,
+                                    "transient": False,
                                     "diagnostic": "fail-closed",
                                 }
                             ],

@@ -18,6 +18,7 @@ import time
 import unittest
 import warnings
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILL = ROOT / ".cursor" / "skills" / "code-quality-auditor"
@@ -27,6 +28,8 @@ spec = importlib.util.spec_from_file_location("auditor", SKILL / "scripts" / "au
 auditor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(auditor)
 
+import cqa.audit as audit_module  # noqa: E402
+import cqa.executor as executor_module  # noqa: E402
 from cqa.executor import (  # noqa: E402
     Tombstone,
     TransientFailure,
@@ -152,6 +155,162 @@ class ExecutorCancellationTests(unittest.TestCase):
         first_pid = int(starts[0].split()[1])
         self.assertFalse(_alive(first_pid))
         self.assertTrue(any(line.startswith("end ") for line in log.read_text(encoding="utf-8").splitlines()))
+
+    def test_two_timed_out_attempts_never_overlap_and_leave_no_late_side_effect(self):
+        late = self.tmp / "late"
+        late.mkdir()
+        attempt_pids = []
+        overlaps = []
+        real_fork = executor_module._fork_attempt
+
+        def tracking_fork(*args):
+            overlaps.extend(pid for pid in attempt_pids if _alive(pid))
+            pid, ready = real_fork(*args)
+            attempt_pids.append(pid)
+            return pid, ready
+
+        def sleepy(_task, _store):
+            time.sleep(0.5)
+            (late / str(os.getpid())).write_text("late", encoding="utf-8")
+            return {"late": True}
+
+        started = time.monotonic()
+        with mock.patch.object(executor_module, "_fork_attempt", tracking_fork):
+            result = execute(
+                {"left"},
+                REGISTRY,
+                {"left": sleepy},
+                {},
+                {"concurrency": 1, "max_retries": 2, "retry_backoff_seconds": 0, "task_timeout_seconds": 0.05},
+            )
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(len(attempt_pids), 2)
+        self.assertEqual(overlaps, [])
+        for pid in attempt_pids:
+            self.assertFalse(_alive(pid), pid)
+        task = result["tasks"][0]
+        self.assertFalse(result["ok"])
+        self.assertFalse(task["ok"])
+        self.assertEqual(task["error"], "timeout")
+        self.assertNotIn("value", task)
+        self.assertEqual([record["outcome"] for record in task["attempts"]], ["timeout", "timeout"])
+        self.assertEqual([record["attempt"] for record in task["attempts"]], [1, 2])
+        time.sleep(0.8)
+        self.assertEqual(list(late.iterdir()), [])
+
+    def test_noncooperative_runner_and_descendant_cannot_survive_or_publish(self):
+        leader_marker = self.tmp / "leader-late"
+        child_marker = self.tmp / "child-late"
+        pid_file = self.tmp / "stubborn-pids"
+        cache_dir = self.tmp / "cache"
+        child_script = textwrap.dedent(
+            """
+            import signal, sys, time
+            for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+                signal.signal(getattr(signal, name), signal.SIG_IGN)
+            end = time.monotonic() + 1.0
+            while time.monotonic() < end:
+                try:
+                    time.sleep(0.05)
+                except BaseException:
+                    pass
+            open(sys.argv[1], "w", encoding="utf-8").write("late")
+            """
+        )
+
+        def stubborn(_task, store):
+            for name in ("SIGTERM", "SIGINT", "SIGHUP"):
+                signal.signal(getattr(signal, name), signal.SIG_IGN)
+            child = subprocess.Popen([sys.executable, "-c", child_script, str(child_marker)])
+            pid_file.write_text(f"{os.getpid()} {child.pid}", encoding="utf-8")
+            store["findings"]["leaked"] = True
+            end = time.monotonic() + 1.0
+            while time.monotonic() < end:
+                try:
+                    time.sleep(0.05)
+                except BaseException:
+                    pass
+            leader_marker.write_text("late", encoding="utf-8")
+            return {"published": True}
+
+        evidence = {"findings": {}}
+        started = time.monotonic()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            result = execute(
+                {"left"},
+                REGISTRY,
+                {"left": stubborn},
+                evidence,
+                {
+                    "concurrency": 1,
+                    "max_retries": 1,
+                    "task_timeout_seconds": 0.5,
+                    "cache_dir": str(cache_dir),
+                    "fingerprint": lambda _task: "stubborn",
+                },
+            )
+        self.assertLess(time.monotonic() - started, 5)
+        task = result["tasks"][0]
+        self.assertFalse(task["ok"])
+        self.assertEqual(task["error"], "timeout")
+        self.assertNotIn("value", task)
+        self.assertEqual(evidence, {"findings": {}})
+        self.assertFalse((cache_dir / "stubborn.json").exists())
+        leader, child = (int(value) for value in pid_file.read_text(encoding="utf-8").split())
+        self.assertFalse(_alive(leader))
+        self._wait_until_dead(child)
+        time.sleep(1.2)
+        self.assertFalse(leader_marker.exists())
+        self.assertFalse(child_marker.exists())
+
+    def test_run_deadline_stops_inflight_attempt_and_blocks_pending_and_dependents(self):
+        registry = {
+            "a_slow": {"id": "a_slow", "depends_on": []},
+            "b_pending": {"id": "b_pending", "depends_on": []},
+            "c_dependent": {"id": "c_dependent", "depends_on": ["a_slow"]},
+        }
+        pid_file = self.tmp / "slow-pid"
+        ran = self.tmp / "ran"
+        ran.mkdir()
+
+        def slow(_task, _store):
+            pid_file.write_text(str(os.getpid()), encoding="utf-8")
+            time.sleep(30)
+            (ran / "a_slow").write_text("late", encoding="utf-8")
+            return {"ok": True}
+
+        def record(task_id, _store):
+            (ran / task_id).write_text("ran", encoding="utf-8")
+            return {"ok": True}
+
+        started = time.monotonic()
+        result = execute(
+            set(registry),
+            registry,
+            {"a_slow": slow, "b_pending": record, "c_dependent": record},
+            {},
+            {
+                "concurrency": 1,
+                "max_retries": 3,
+                "retry_backoff_seconds": 0,
+                "task_timeout_seconds": 30,
+                "deadline": time.monotonic() + 0.3,
+            },
+        )
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertFalse(result["ok"])
+        tasks = {task["task_id"]: task for task in result["tasks"]}
+        slow_task = tasks["a_slow"]
+        self.assertEqual(slow_task["error"], "budget exhausted")
+        self.assertEqual(len(slow_task["attempts"]), 1)
+        self.assertEqual(slow_task["attempts"][0]["reason"], "run budget exhausted")
+        self.assertFalse(slow_task["attempts"][0]["transient"])
+        self.assertEqual(tasks["b_pending"]["error"], "budget exhausted")
+        self.assertEqual(tasks["b_pending"]["attempts"][0]["diagnostic"], "cancelled before start")
+        self.assertEqual(tasks["c_dependent"]["error"], "dependency failed")
+        self.assertFalse(_alive(int(pid_file.read_text(encoding="utf-8"))))
+        self.assertEqual(list(ran.iterdir()), [])
 
     def test_cancel_event_stops_a_running_attempt_and_a_pending_one(self):
         marker = self.tmp / "ran"
@@ -360,20 +519,194 @@ class ExecutorCancellationTests(unittest.TestCase):
 
     def test_blocking_io_without_fork_reports_unterminated_work(self):
         read_fd, write_fd = os.pipe()
+        self.addCleanup(os.close, read_fd)
+        self.addCleanup(os.close, write_fd)
+        marker = self.tmp / "after-release"
+        cache_dir = self.tmp / "cache"
+        calls = []
 
         def blocked(_task, _store):
+            calls.append(1)
             os.read(read_fd, 1)
+            marker.write_text("late", encoding="utf-8")
             return {"done": True}
 
         started = time.monotonic()
-        result = _run_thread_task("left", blocked, {}, "key", 0.2, 2, 0, threading.Event(), None, None)
+        result = _run_thread_task("left", blocked, {}, "key", 0.2, 2, 0, threading.Event(), None, str(cache_dir))
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "termination could not be guaranteed")
+        self.assertNotIn("value", result)
+        self.assertEqual(len(result["attempts"]), 1)
+        self.assertEqual(result["attempts"][0]["reason"], "termination could not be guaranteed")
+        self.assertFalse(result["attempts"][0]["transient"])
+        os.write(write_fd, b"x")
+        time.sleep(0.5)
+        self.assertEqual(calls, [1])
+        self.assertFalse(marker.exists())
+        self.assertFalse((cache_dir / "key.json").exists())
+
+    def test_fallback_without_async_exception_api_fails_closed(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        calls = []
+
+        def waits(_task, _store):
+            calls.append(1)
+            release.wait(10)
+            return {"done": True}
+
+        started = time.monotonic()
+        with mock.patch("ctypes.pythonapi", new=object()):
+            result = _run_thread_task("left", waits, {}, "key", 0.1, 3, 0, threading.Event(), None, None)
         self.assertLess(time.monotonic() - started, 3)
         self.assertFalse(result["ok"])
         self.assertEqual(result["error"], "termination could not be guaranteed")
         self.assertEqual(len(result["attempts"]), 1)
         self.assertFalse(result["attempts"][0]["transient"])
-        os.close(write_fd)
-        os.close(read_fd)
+        self.assertEqual(calls, [1])
+
+    def _spinning_runner(self, marker, calls):
+        def spin(_task, _store):
+            calls.append(1)
+            end = time.monotonic() + 30
+            while time.monotonic() < end:
+                time.sleep(0.01)
+            marker.write_text("late", encoding="utf-8")
+            return {"late": True}
+
+        return spin
+
+    def test_fallback_attempt_stops_at_the_run_deadline(self):
+        marker = self.tmp / "fallback-deadline"
+        calls = []
+        started = time.monotonic()
+        result = _run_thread_task(
+            "left",
+            self._spinning_runner(marker, calls),
+            {},
+            None,
+            30,
+            3,
+            0,
+            threading.Event(),
+            time.monotonic() + 0.2,
+            None,
+        )
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "budget exhausted")
+        self.assertEqual(len(result["attempts"]), 1)
+        self.assertEqual(result["attempts"][0]["reason"], "run budget exhausted")
+        self.assertFalse(result["attempts"][0]["transient"])
+        self.assertEqual(calls, [1])
+        self.assertFalse(marker.exists())
+
+    def test_fallback_attempt_stops_on_external_cancel(self):
+        marker = self.tmp / "fallback-cancel"
+        calls = []
+        cancel = threading.Event()
+        timer = threading.Timer(0.2, cancel.set)
+        timer.start()
+        self.addCleanup(timer.cancel)
+        started = time.monotonic()
+        result = _run_thread_task("left", self._spinning_runner(marker, calls), {}, None, 30, 3, 0, cancel, None, None)
+        self.assertLess(time.monotonic() - started, 3)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "cancelled")
+        self.assertEqual(len(result["attempts"]), 1)
+        self.assertEqual(result["attempts"][0]["reason"], "cancelled")
+        self.assertFalse(result["attempts"][0]["transient"])
+        self.assertEqual(calls, [1])
+        self.assertFalse(marker.exists())
+
+    def test_fallback_run_deadline_blocks_pending_and_dependent_tasks(self):
+        registry = {
+            "left": {"id": "left", "depends_on": []},
+            "other": {"id": "other", "depends_on": []},
+            "right": {"id": "right", "depends_on": ["left"]},
+        }
+        marker = self.tmp / "fallback-late"
+        ran = []
+        calls = []
+
+        def record(task_id, _store):
+            ran.append(task_id)
+            return {"ok": True}
+
+        started = time.monotonic()
+        with mock.patch.object(executor_module, "_isolated_processes", return_value=False):
+            result = execute(
+                set(registry),
+                registry,
+                {"left": self._spinning_runner(marker, calls), "other": record, "right": record},
+                {},
+                {"concurrency": 1, "max_retries": 3, "task_timeout_seconds": 30, "deadline": time.monotonic() + 0.2},
+            )
+        self.assertLess(time.monotonic() - started, 3)
+        tasks = {task["task_id"]: task for task in result["tasks"]}
+        self.assertEqual(tasks["left"]["error"], "budget exhausted")
+        self.assertEqual(len(tasks["left"]["attempts"]), 1)
+        self.assertEqual(tasks["other"]["error"], "budget exhausted")
+        self.assertEqual(tasks["right"]["error"], "dependency failed")
+        self.assertEqual(ran, [])
+        self.assertEqual(calls, [1])
+        self.assertFalse(marker.exists())
+
+    def _timeout_only_execution(self, selected, ok_values=None):
+        ok_values = ok_values or {}
+        timeout_records = [
+            {"attempt": 1, "outcome": "timeout", "reason": "exceeded 0.050s", "transient": True, "diagnostic": "elapsed>0.050"},
+            {"attempt": 2, "outcome": "timeout", "reason": "exceeded 0.050s", "transient": True, "diagnostic": "elapsed>0.050"},
+        ]
+
+        def fake_execute(chosen, _registry, _runners, _evidence, _options=None):
+            tasks = []
+            for task_id in sorted(chosen):
+                if task_id in ok_values:
+                    tasks.append({"task_id": task_id, "ok": True, "cached": False, "value": ok_values[task_id], "attempts": []})
+                else:
+                    tasks.append({"task_id": task_id, "ok": False, "cached": False, "error": "timeout", "attempts": list(timeout_records)})
+            return {
+                "ok": False,
+                "tasks": tasks,
+                "order": sorted(chosen),
+                "layers": [sorted(chosen)],
+                "cache_hits": [],
+                "cancelled": False,
+            }
+
+        repo = self.tmp / "repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+        (repo / "quality-auditor.yaml").write_text(
+            "version: 1\ndefault_profile: focused\nprofiles:\n  focused:\n    include: [" + ", ".join(selected) + "]\n",
+            encoding="utf-8",
+        )
+        with mock.patch.object(audit_module, "execute", fake_execute):
+            report = auditor.audit(repo, skill_root=SKILL, profile="focused", output_dir=self.tmp / "out")
+        return report, timeout_records
+
+    def test_timeout_only_audit_is_incomplete_with_error_metrics(self):
+        report, timeout_records = self._timeout_only_execution(["syntax_static"])
+        self.assertEqual(report["decision"], "INCOMPLETE")
+        metric = next(item for item in report["metrics"] if item["metric_id"] == "REL-004")
+        self.assertEqual(metric["status"], "ERROR")
+        self.assertEqual(metric["reason"], "timeout")
+        task = next(item for item in report["execution"]["tasks"] if item["task_id"] == "syntax_static")
+        self.assertFalse(task["ok"])
+        self.assertEqual(task["error"], "timeout")
+        self.assertEqual(task["attempts"], timeout_records)
+
+    def test_confirmed_blocking_breach_still_fails_beside_a_timeout(self):
+        report, _records = self._timeout_only_execution(
+            ["syntax_static", "insecure_config"],
+            {"insecure_config": {"measurements": {"SEC-006": {"value": 1}, "SEC-012": {"value": 0}}}},
+        )
+        self.assertEqual(report["decision"], "FAIL")
+        statuses = {item["metric_id"]: item["status"] for item in report["metrics"]}
+        self.assertEqual(statuses["SEC-006"], "FAIL")
+        self.assertEqual(statuses["REL-004"], "ERROR")
 
     def test_audit_keeps_graph_evidence_across_parallel_checks(self):
         repo = self.tmp / "repo"
