@@ -36,6 +36,11 @@ from cqa.project import init_repository, manage_profile  # noqa: E402
 from cqa.reporting import compare_history, render_html, trends  # noqa: E402
 from cqa import checks as check_module  # noqa: E402
 
+requires_macos_sandbox = unittest.skipUnless(
+    sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").is_file(),
+    "requires macOS /usr/bin/sandbox-exec",
+)
+
 
 def _write(path, text):
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -510,6 +515,7 @@ class AcceptanceTests(unittest.TestCase):
         plain_report = self.audit(plain, profile="full")
         self.assertEqual({item["metric_id"]: item["status"] for item in plain_report["metrics"]}["QUANT-003"], "NOT_APPLICABLE")
 
+    @requires_macos_sandbox
     def test_authorized_line_coverage(self):
         """Requirements: 8.3."""
         repo = self.repo("covered")
@@ -893,6 +899,7 @@ class AcceptanceTests(unittest.TestCase):
         files = {item["file"] for item in report["findings"] if "REL-001" in item["metric_ids"]}
         self.assertEqual(files, {"app.py", "app.js", "app.cpp"})
 
+    @requires_macos_sandbox
     def test_clang_syntax_requires_tool_approval(self):
         """Requirements: 4.4, 8.7."""
         self.assertIsNotNone(shutil.which("clang"))
@@ -1806,6 +1813,7 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(metrics["REQ-004"]["measured_value"], 1)
         self.assertEqual(metrics["REQ-004"]["status"], "FAIL")
 
+    @requires_macos_sandbox
     def test_authorized_acceptance_failures_count(self):
         """Requirements: 7.8, 8.8."""
         repo = self.repo("accept")
@@ -1847,6 +1855,7 @@ class AcceptanceTests(unittest.TestCase):
         self.assertIn("tests/test_add.py:test_add", metrics["REQ-008"]["evidence_refs"])
         self.assertNotIn("tests/test_add.py:test_other", metrics["REQ-008"]["evidence_refs"])
 
+    @requires_macos_sandbox
     def test_pytest_project_uses_its_runner(self):
         """Requirements: 4.4, 7.6, 8.3."""
         repo = self.repo("pyrunner")
@@ -1893,6 +1902,7 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(metrics["TEST-002"]["status"], "UNAVAILABLE")
         self.assertIn("coverage.py", metrics["TEST-002"]["reason"])
 
+    @requires_macos_sandbox
     def test_pytest_collection_error_stays_unavailable(self):
         """Requirements: 4.4, 7.6, 8.3."""
         repo = self.repo("pycollect")

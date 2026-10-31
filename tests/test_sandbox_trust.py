@@ -28,6 +28,11 @@ spec.loader.exec_module(auditor)
 from cqa.project import discover_repository, init_repository  # noqa: E402
 from cqa.security import ExecutionLog, _profile, probe_sandbox, run_contained, run_tool  # noqa: E402
 
+requires_macos_sandbox = unittest.skipUnless(
+    sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").is_file(),
+    "requires macOS /usr/bin/sandbox-exec",
+)
+
 
 def _write_executable(path, text):
     path.write_text(textwrap.dedent(text).lstrip(), encoding="utf-8")
@@ -83,6 +88,7 @@ class SandboxTrustTests(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 run_contained(["/usr/bin/true"], self.repo, self._log())
 
+    @requires_macos_sandbox
     def test_sandbox_apply_failure_is_not_rerun(self):
         import subprocess
 
@@ -116,6 +122,7 @@ class SandboxTrustTests(unittest.TestCase):
             run_tool([str(tool)], self.repo, self._log())
         self.assertFalse(marker.exists())
 
+    @requires_macos_sandbox
     def test_tool_timeout_kills_the_grandchild(self):
         pid_file = self.tmp / "grandchild"
         tool = self.tmp / "parent-tool"
@@ -157,6 +164,7 @@ class SandboxTrustTests(unittest.TestCase):
             run_tool([str(self.repo / "eslint.config.js")], self.repo, self._log())
         self.assertFalse(marker.exists())
 
+    @requires_macos_sandbox
     def test_tool_environment_drops_startup_hooks(self):
         os.environ["PYTHONSTARTUP"] = str(self.tmp / "startup.py")
         os.environ["LD_PRELOAD"] = str(self.tmp / "preload.so")
@@ -193,6 +201,7 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertNotIn('(allow file-read* (subpath "/etc"))', profile)
         self.assertNotIn('(allow file-read* (subpath "/opt"))', profile)
 
+    @requires_macos_sandbox
     def test_contained_command_cannot_read_home_secrets(self):
         secret_dir = Path.home() / ".ssh"
         secret_dir.mkdir(exist_ok=True)
@@ -278,6 +287,7 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertFalse(log_path.exists())
 
+    @requires_macos_sandbox
     def test_path_sandbox_exec_is_never_executed(self):
         fake_dir = self.repo / ".venv" / "bin"
         fake_dir.mkdir(parents=True)
