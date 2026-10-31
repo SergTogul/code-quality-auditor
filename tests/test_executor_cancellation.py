@@ -1033,6 +1033,81 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertTrue(result["ok"], result)
         self.assertEqual(evidence, {"findings": {"kept": 2, "fresh": 3}})
 
+    def test_fallback_completion_after_the_timeout_is_not_success(self):
+        class FinishedThread:
+            def __init__(self, target=None, daemon=None):
+                self._target = target
+                self.ident = None
+
+            def start(self):
+                self._target()
+
+            def is_alive(self):
+                return False
+
+            def join(self, _timeout=None):
+                return None
+
+        immediate = type(threading)("immediate_threading")
+        immediate.Thread = FinishedThread
+        immediate.Event = threading.Event
+        closed = {"kept": 1}
+        cache_dir = self.tmp / "late-cache"
+
+        def late(_task, store):
+            closed["late"] = True
+            store["late"] = True
+            return {"late": True}
+
+        evidence = {"findings": {}}
+        with mock.patch.object(executor_module, "threading", immediate):
+            result = _run_thread_task("left", late, evidence, "late", 0, 1, 0, threading.Event(), None, str(cache_dir))
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "timeout")
+        self.assertNotIn("value", result)
+        self.assertEqual(evidence, {"findings": {}})
+        self.assertEqual(closed, {"kept": 1})
+        self.assertFalse((cache_dir / "late.json").exists())
+
+    def test_fallback_system_exit_is_a_terminal_error(self):
+        closed = {"kept": 1}
+        calls = []
+        cache_dir = self.tmp / "system-exit-cache"
+
+        def exits(_task, store):
+            calls.append(1)
+            store["findings"]["leaked"] = True
+            closed["leaked"] = True
+            raise SystemExit(3)
+
+        evidence = {"findings": {}}
+        with mock.patch.object(executor_module, "_isolated_processes", return_value=False):
+            result = execute(
+                {"left"},
+                REGISTRY,
+                {"left": exits},
+                evidence,
+                {
+                    "concurrency": 1,
+                    "max_retries": 2,
+                    "retry_backoff_seconds": 0,
+                    "task_timeout_seconds": 5,
+                    "cache_dir": str(cache_dir),
+                    "fingerprint": lambda _task: "system-exit",
+                },
+            )
+        task = result["tasks"][0]
+        self.assertFalse(result["ok"])
+        self.assertFalse(task["ok"])
+        self.assertEqual(len(task["attempts"]), 1)
+        self.assertEqual(task["attempts"][0]["outcome"], "error")
+        self.assertEqual(task["attempts"][0]["diagnostic"], "SystemExit")
+        self.assertFalse(task["attempts"][0]["transient"])
+        self.assertEqual(calls, [1])
+        self.assertEqual(evidence, {"findings": {}})
+        self.assertEqual(closed, {"kept": 1})
+        self.assertFalse((cache_dir / "system-exit.json").exists())
+
     def test_fallback_deadline_during_grace_is_terminal_budget(self):
         calls = []
 

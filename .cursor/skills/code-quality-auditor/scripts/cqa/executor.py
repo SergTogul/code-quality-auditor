@@ -933,6 +933,9 @@ def _run_thread_attempt(runner, task_id, evidence, task_timeout, cancel, deadlin
             holder["cancelled"] = exc
         except Exception as exc:  # noqa: BLE001 - classified by the caller
             holder["error"] = exc
+        except BaseException as exc:  # noqa: BLE001 - SystemExit must not look like success
+            holder["error"] = exc
+            holder["fatal"] = True
 
     worker = threading.Thread(target=invoke, daemon=True)
     started = time.monotonic()
@@ -946,8 +949,10 @@ def _run_thread_attempt(runner, task_id, evidence, task_timeout, cancel, deadlin
             break
         limit = timeout_at if deadline is None else min(timeout_at, deadline)
         worker.join(max(0.0, min(_THREAD_POLL_SECONDS, limit - now)))
-    if trigger is None and cancel.is_set():
-        trigger = "cancelled"
+    if trigger is None:
+        # The worker may have finished after a stop condition but before this
+        # thread observed it; a late result must not be accepted as success.
+        trigger = _thread_stop_trigger(cancel, time.monotonic(), timeout_at, deadline)
     if trigger:
         if worker.is_alive():
             _raise_in_thread(worker)
@@ -970,8 +975,8 @@ def _run_thread_attempt(runner, task_id, evidence, task_timeout, cancel, deadlin
         return {
             "kind": "error",
             "type": exc.__class__.__name__,
-            "message": str(exc),
-            "transient": isinstance(exc, (TransientFailure, TimeoutError)),
+            "message": str(exc) or exc.__class__.__name__,
+            "transient": not holder.get("fatal") and isinstance(exc, (TransientFailure, TimeoutError)),
             "elapsed": time.monotonic() - started,
         }
     if "cancelled" in holder:
