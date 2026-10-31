@@ -684,6 +684,123 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertFalse(task["attempts"][0]["transient"])
         self.assertFalse(marker.exists())
 
+    def _scripted_sweep(self, root, tables):
+        def table():
+            return tables.pop(0) if len(tables) > 1 else tables[0]
+
+        sent = []
+        with mock.patch.object(executor_module, "_process_table", side_effect=table), mock.patch.object(
+            executor_module, "_send", side_effect=lambda pid, sig, group=False: sent.append((pid, sig, group))
+        ):
+            killed = executor_module._kill_descendants(root)
+        return killed, sent
+
+    def test_sweep_waits_for_stopped_state_before_declaring_the_tree_empty(self):
+        me = os.getpid()
+        root, child, grandchild = 999_001, 999_002, 999_003
+        base = {me: (1, me, "R"), root: (me, root, "T")}
+        killed, sent = self._scripted_sweep(
+            root,
+            [
+                {**base, child: (root, child, "S")},
+                {**base, child: (root, child, "S")},
+                {**base, child: (root, child, "T"), grandchild: (child, grandchild, "R")},
+                {**base, child: (root, child, "T"), grandchild: (child, grandchild, "T")},
+                {**base, child: (root, child, "Z"), grandchild: (child, grandchild, "Z")},
+            ],
+        )
+        self.assertEqual(killed, {child, grandchild})
+        first_kill = next(index for index, item in enumerate(sent) if item[1] == signal.SIGKILL)
+        self.assertGreater(first_kill, sent.index((grandchild, signal.SIGSTOP, False)))
+        self.assertIn((child, signal.SIGKILL, False), sent)
+        self.assertIn((grandchild, signal.SIGKILL, False), sent)
+
+    def test_sweep_that_never_settles_kills_what_it_found_and_reports_none(self):
+        me = os.getpid()
+        root, child = 999_011, 999_012
+        cases = {
+            "descendant keeps running": {me: (1, me, "R"), root: (me, root, "T"), child: (root, child, "S")},
+            "root keeps running": {me: (1, me, "R"), root: (me, root, "R")},
+            "killed pid never exits": {me: (1, me, "R"), root: (me, root, "T"), child: (root, child, "T")},
+        }
+        for name, table in cases.items():
+            with self.subTest(name=name), mock.patch.object(executor_module, "_SWEEP_SECONDS", 0.1):
+                killed, sent = self._scripted_sweep(root, [table])
+                self.assertIsNone(killed)
+                if child in table:
+                    self.assertIn((child, signal.SIGKILL, False), sent)
+
+    def test_runner_still_forking_new_sessions_at_timeout_leaves_no_survivor(self):
+        late = self.tmp / "fork-loop-late"
+        late.mkdir()
+        pid_log = self.tmp / "fork-loop-pids"
+        counter = self.tmp / "fork-loop-count"
+        leaders = []
+        overlaps = []
+        real_fork = executor_module._fork_attempt
+
+        def grandchildren():
+            return [int(line) for line in _logged(pid_log)]
+
+        def tracking_fork(*args):
+            overlaps.extend(pid for pid in grandchildren() if _running(pid))
+            pid, ready = real_fork(*args)
+            leaders.append(pid)
+            return pid, ready
+
+        def runner(_task, _store):
+            count = int(counter.read_text(encoding="utf-8")) if counter.exists() else 0
+            count += 1
+            counter.write_text(str(count), encoding="utf-8")
+            if count > 1:
+                return {"count": count}
+            for _ in range(40):
+                if os.fork() == 0:
+                    try:
+                        os.setsid()
+                        _log_call(pid_log, str(os.getpid()))
+                        time.sleep(1.5)
+                        (late / str(os.getpid())).write_text("late", encoding="utf-8")
+                    finally:
+                        os._exit(0)
+                time.sleep(0.02)
+            time.sleep(30)
+            return {"count": count}
+
+        started = time.monotonic()
+        try:
+            with mock.patch.object(executor_module, "_fork_attempt", tracking_fork):
+                result = execute(
+                    {"left"},
+                    REGISTRY,
+                    {"left": runner},
+                    {},
+                    {"concurrency": 1, "max_retries": 2, "retry_backoff_seconds": 0, "task_timeout_seconds": 0.3},
+                )
+            task = result["tasks"][0]
+            outcomes = [record["outcome"] for record in task["attempts"]]
+            if task["ok"]:
+                self.assertEqual(outcomes, ["timeout", "success"])
+                self.assertEqual(overlaps, [])
+            else:
+                self.assertEqual(task["error"], "termination could not be guaranteed")
+                self.assertEqual(len(task["attempts"]), 1)
+                self.assertFalse(task["attempts"][0]["transient"])
+            self.assertTrue(grandchildren())
+            time.sleep(max(0.0, started + 2.3 - time.monotonic()))
+            for pid in grandchildren():
+                self.assertFalse(_running(pid), pid)
+            self.assertEqual(list(late.iterdir()), [])
+        finally:
+            for pid in grandchildren() + leaders:
+                if _alive(pid):
+                    os.kill(pid, signal.SIGKILL)
+            for pid in leaders:
+                try:
+                    os.waitpid(pid, os.WNOHANG)
+                except ChildProcessError:
+                    pass
+
     def test_queued_jobs_after_an_expired_deadline_report_budget_not_cancel(self):
         ran = []
 
@@ -1217,6 +1334,63 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertFalse(result["attempts"][0]["transient"])
         self.assertEqual(_logged(calls), [])
         self.assertEqual(len(items), 1)
+
+    def test_fallback_event_in_closure_dict_is_terminal_without_running(self):
+        state = {"flag": threading.Event()}
+        calls = self.tmp / "calls"
+
+        def runner(_task, _store):
+            _log_call(calls)
+            state["flag"].set()
+            time.sleep(30)
+            return {"ok": True}
+
+        with mock.patch.object(executor_module, "_isolated_processes", return_value=False):
+            result = execute(
+                {"left"},
+                REGISTRY,
+                {"left": runner},
+                {},
+                {"concurrency": 1, "max_retries": 3, "retry_backoff_seconds": 0, "task_timeout_seconds": 0.3},
+            )
+        task = result["tasks"][0]
+        self.assertFalse(task["ok"])
+        self.assertEqual(task["error"], "evidence could not be isolated")
+        self.assertEqual(len(task["attempts"]), 1)
+        self.assertFalse(task["attempts"][0]["transient"])
+        self.assertEqual(_logged(calls), [])
+        self.assertFalse(state["flag"].is_set())
+
+    def test_fallback_capture_of_an_audit_context_omits_only_its_lock(self):
+        from cqa.security import ExecutionLog
+
+        ctx = audit_module.AuditContext(self.tmp, [self.tmp / "app.py"], {"budgets": {"concurrency": 1}}, ExecutionLog())
+        ctx.analyses = [{"path": "app.py", "functions": [{"name": "main"}]}]
+        ctx.texts["app.py"] = "x = 1\n"
+        lock = ctx.lock
+
+        def runner(_task, _store):
+            return ctx.config
+
+        saved = executor_module._capture_closures(runner)
+        entries = saved[0][3]
+        self.assertNotIn("lock", entries)
+        self.assertIsNot(entries["config"], ctx.config)
+        self.assertIsNot(entries["analyses"][0], ctx.analyses[0])
+        ctx.files.append(self.tmp / "partial.py")
+        ctx.config["budgets"]["concurrency"] = 9
+        ctx.analyses[0]["functions"].append({"name": "partial"})
+        ctx.log.record("partial", "ran")
+        ctx.limitations.append("partial")
+        ctx.partial = True
+        executor_module._restore_closures(saved)
+        self.assertEqual(ctx.files, [self.tmp / "app.py"])
+        self.assertEqual(ctx.config, {"budgets": {"concurrency": 1}})
+        self.assertEqual(ctx.analyses, [{"path": "app.py", "functions": [{"name": "main"}]}])
+        self.assertEqual(ctx.log.commands, [])
+        self.assertEqual(ctx.limitations, [])
+        self.assertFalse(hasattr(ctx, "partial"))
+        self.assertIs(ctx.lock, lock)
 
     def test_fallback_success_merges_isolated_evidence(self):
         evidence = {"findings": {"stale": 1, "kept": 2}}

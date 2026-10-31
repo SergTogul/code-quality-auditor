@@ -630,14 +630,19 @@ def _send(pid, sig, group=False):
         pass
 
 
-_TREE_ROUNDS = 5
+_SWEEP_SECONDS = 2.0
+_SWEEP_POLL_SECONDS = 0.005
+# Stopped, traced, zombie, or dead: a process in one of these states cannot fork.
+_QUIESCENT = frozenset("TtZX")
+_GONE = frozenset("ZX")
 
 
 def _process_table():
-    """Return {pid: (ppid, pgid)} for visible processes, or None when no listing could be read.
+    """Return {pid: (ppid, pgid, state)} for visible processes, or None when no listing could be read.
 
-    A listing that does not include the caller is treated as unreadable, so an
-    empty or truncated table never passes for "no descendants".
+    state is the one-letter process state. A listing that does not include the
+    caller is treated as unreadable, so an empty or truncated table never
+    passes for "no descendants".
     """
     table = {}
     try:
@@ -654,15 +659,15 @@ def _process_table():
             except OSError:
                 continue
             fields = data.rpartition(b")")[2].split()
-            if len(fields) >= 3:
-                table[int(name)] = (int(fields[1]), int(fields[2]))
+            if len(fields) >= 3 and fields[0]:
+                table[int(name)] = (int(fields[1]), int(fields[2]), fields[0][:1].decode("ascii", "replace"))
         if os.getpid() in table:
             return table
         table = {}
     if sys.platform == "darwin":
         try:
             listing = subprocess.run(
-                ["/bin/ps", "-A", "-o", "pid=,ppid=,pgid="],
+                ["/bin/ps", "-A", "-o", "pid=,ppid=,pgid=,state="],
                 capture_output=True,
                 text=True,
                 timeout=2,
@@ -672,8 +677,8 @@ def _process_table():
             return None
         for line in listing.splitlines():
             parts = line.split()
-            if len(parts) == 3 and all(part.isdigit() for part in parts):
-                table[int(parts[0])] = (int(parts[1]), int(parts[2]))
+            if len(parts) == 4 and all(part.isdigit() for part in parts[:3]):
+                table[int(parts[0])] = (int(parts[1]), int(parts[2]), parts[3][:1])
         if os.getpid() in table:
             return table
     return None
@@ -681,7 +686,7 @@ def _process_table():
 
 def _descendants(table, roots):
     children = {}
-    for pid, (ppid, _pgid) in table.items():
+    for pid, (ppid, _pgid, _state) in table.items():
         children.setdefault(ppid, []).append(pid)
     found = set()
     stack = list(roots)
@@ -697,33 +702,55 @@ def _kill_descendants(root):
     """SIGKILL every live descendant of root, including ones in their own session.
 
     Descendants are traced through parent links, so this must run before root
-    dies; afterwards they are reparented and untraceable. Each bounded round
-    stops what it finds, so a process that forks during the scan is caught by
-    the next round instead of racing the kill.
+    dies; afterwards they are reparented and untraceable. SIGSTOP is
+    asynchronous, so a signalled process may still fork until the table shows
+    it stopped. Nothing is killed until a scan finds no new descendant and every
+    found pid, and a root other than the caller, is quiescent. After the kill,
+    the sweep waits until those pids are gone or zombies and nothing new has
+    appeared; a newcomer is stopped and the cycle repeats.
 
-    Returns the killed pids, or None when the tree could not be fully
-    enumerated: a round could not read the process table, or the last round
-    still found new processes. Whatever was found is killed either way.
+    Returns the killed pids, or None when the tree could not be proven
+    contained: a table read failed or the time bound expired first. Whatever
+    was found is killed either way.
     """
     protected = {os.getpid(), 0, 1}
     own_group = os.getpgrp()
     found = {}
+    watched = [] if root in protected else [root]
+    killed = False
     complete = False
-    for _ in range(_TREE_ROUNDS):
+
+    def kill_found():
+        for pid, pgid in found.items():
+            if pgid == pid and pgid not in (own_group, root):
+                _send(pgid, signal.SIGKILL, group=True)
+            _send(pid, signal.SIGKILL)
+
+    def settled(table, pids, states):
+        return all(pid not in table or table[pid][2] in states for pid in pids)
+
+    limit = time.monotonic() + _SWEEP_SECONDS
+    while time.monotonic() < limit:
         table = _process_table()
         if table is None:
             break
         fresh = _descendants(table, {root} | set(found)) - set(found) - protected
-        if not fresh:
+        if fresh:
+            for pid in fresh:
+                found[pid] = table[pid][1]
+                _send(pid, signal.SIGSTOP)
+            killed = False
+            continue
+        if not killed:
+            if settled(table, list(found) + watched, _QUIESCENT):
+                kill_found()
+                killed = True
+                continue
+        elif settled(table, found, _GONE):
             complete = True
             break
-        for pid in fresh:
-            found[pid] = table[pid][1]
-            _send(pid, signal.SIGSTOP)
-    for pid, pgid in found.items():
-        if pgid == pid and pgid not in (own_group, root):
-            _send(pgid, signal.SIGKILL, group=True)
-        _send(pid, signal.SIGKILL)
+        time.sleep(_SWEEP_POLL_SECONDS)
+    kill_found()
     return set(found) if complete else None
 
 
@@ -1117,15 +1144,29 @@ def _isolated_copy(value):
         return copy.deepcopy(value)
 
 
-def _copy_entries(mapping):
-    return {key: (_snapshot(value) if _pickleable(value) else value) for key, value in mapping.items()}
+_LOCK_TYPES = (type(threading.Lock()), type(threading.RLock()))
+
+
+def _own_lock(key, value):
+    return key == "lock" and isinstance(value, _LOCK_TYPES)
+
+
+def _copy_entries(mapping, omit_lock=False):
+    """Deep copies that share no mutable value with mapping; raises when a value cannot be copied.
+
+    With omit_lock, an object's own lock attribute is left out: it guards
+    shared state, is never part of an attempt's result, and cannot be copied.
+    """
+    return {key: copy.deepcopy(value) for key, value in mapping.items() if not (omit_lock and _own_lock(key, value))}
 
 
 def _capture_closures(fn):
     """Thread-fallback snapshot of closure cells: bindings plus dict, object, list, bytearray, and set contents.
 
     Unlike the forward delta merged after a forked attempt, this records enough
-    to undo rebinding, added keys or attributes, and deletions.
+    to undo rebinding, added keys or attributes, and deletions. Contents are
+    deep-copied so restoring never hands back an object the attempt mutated;
+    a value that cannot be copied raises before the attempt starts.
     """
     saved = []
     for cell in getattr(fn, "__closure__", None) or ():
@@ -1139,7 +1180,7 @@ def _capture_closures(fn):
         elif isinstance(current, (list, bytearray, set)):
             saved.append((cell, current, "contents", copy.deepcopy(current)))
         elif hasattr(current, "__dict__") and not _skip_cell(current):
-            saved.append((cell, current, "object", _copy_entries(vars(current))))
+            saved.append((cell, current, "object", _copy_entries(vars(current), omit_lock=True)))
         else:
             saved.append((cell, current, None, None))
     return saved
@@ -1156,7 +1197,7 @@ def _restore_dict(current, entries):
 def _restore_object(obj, entries):
     attributes = vars(obj)
     for key in [key for key in attributes if key not in entries]:
-        if key != "lock" and _pickleable(attributes[key]):
+        if not _own_lock(key, attributes[key]):
             try:
                 delattr(obj, key)
             except AttributeError:
