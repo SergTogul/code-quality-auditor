@@ -554,7 +554,108 @@ def _uncontained_payload(diagnostic):
     }
 
 
+# The runner raised SystemExit or similar: no result, but cleanup did finish.
+_ABORTED_PAYLOAD = {"status": "aborted", "value": None, "error": None, "evidence": None, "cells": []}
+_WORKER_VANISHED = "attempt worker exited without a result"
+_LEADER_VANISHED = "attempt leader exited before its cleanup sweep finished"
+
+
+def _setup_pid_namespace():
+    """Enter a user namespace that maps only our own ids, then unshare a pid namespace.
+
+    Returns "entered" when the next fork becomes PID 1 of a new pid namespace,
+    "unavailable" when nothing changed, or "broken" when a user namespace was
+    entered but the id mapping failed, so this process can no longer be
+    trusted to run the attempt.
+    """
+    if not sys.platform.startswith("linux") or not all(
+        hasattr(os, name) for name in ("unshare", "CLONE_NEWUSER", "CLONE_NEWPID")
+    ):
+        return "unavailable"
+    uid, gid = os.getuid(), os.getgid()
+    try:
+        os.unshare(os.CLONE_NEWUSER)
+    except OSError:
+        return "unavailable"
+    try:
+        for name, text in (("setgroups", "deny"), ("uid_map", f"{uid} {uid} 1"), ("gid_map", f"{gid} {gid} 1")):
+            with open(f"/proc/self/{name}", "w", encoding="ascii") as handle:
+                handle.write(text)
+    except OSError:
+        return "broken"
+    try:
+        os.unshare(os.CLONE_NEWPID)
+    except OSError:
+        return "unavailable"
+    return "entered"
+
+
+def _probe_pid_namespace():
+    pid = os.fork()
+    if pid == 0:
+        code = 1
+        try:
+            if _setup_pid_namespace() == "entered":
+                worker = os.fork()
+                if worker == 0:
+                    os._exit(0 if os.getpid() == 1 else 1)
+                _waited, status = os.waitpid(worker, 0)
+                code = 0 if os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0 else 1
+        except BaseException:  # noqa: BLE001 - any failure means unavailable
+            pass
+        finally:
+            os._exit(code)
+    try:
+        _waited, status = os.waitpid(pid, 0)
+    except ChildProcessError:
+        return False
+    return os.WIFEXITED(status) and os.WEXITSTATUS(status) == 0
+
+
+_pid_namespace_probe = []
+
+
+def _pid_namespace_usable():
+    """Probe once per process, in a throwaway child, whether attempts can get their own pid namespace."""
+    if not _pid_namespace_probe:
+        usable = sys.platform.startswith("linux") and hasattr(os, "unshare") and _probe_pid_namespace()
+        _pid_namespace_probe.append(bool(usable))
+    return _pid_namespace_probe[0]
+
+
+def _run_in_pid_namespace(runner, task_id, evidence, result_path):
+    """Run the attempt in PID 1 of the namespace this process just unshared.
+
+    When PID 1 exits by any route, os._exit included, the kernel kills every
+    other process in its namespace before the exit is reported, so nothing
+    the runner started can outlive it. PID 1 must not sweep: /proc still
+    shows the outer namespace, where pid 1 is the host init.
+    """
+    worker_path = result_path + ".worker"
+    worker = os.fork()
+    if worker == 0:
+        try:
+            try:
+                payload = _attempt_payload(runner, task_id, evidence)
+            except BaseException:  # noqa: BLE001 - reported as an aborted attempt
+                payload = _ABORTED_PAYLOAD
+            _write_payload(worker_path, payload)
+        finally:
+            os._exit(0)
+    try:
+        os.waitpid(worker, 0)
+    except ChildProcessError:
+        pass
+    payload = _read_payload(worker_path)
+    try:
+        os.unlink(worker_path)
+    except OSError:
+        pass
+    return payload if payload is not None else _uncontained_payload(_WORKER_VANISHED)
+
+
 def _fork_attempt(runner, task_id, evidence, result_path):
+    namespaced = _pid_namespace_usable()
     ready_read, ready_write = os.pipe()
     pid = os.fork()
     if pid == 0:
@@ -568,23 +669,29 @@ def _fork_attempt(runner, task_id, evidence, result_path):
                 signal.setitimer(signal.ITIMER_REAL, 0)
             os.write(ready_write, b"1")
             os.close(ready_write)
-            if contained:
-                payload = _attempt_payload(runner, task_id, evidence)
-            else:
+            namespace = _setup_pid_namespace() if contained and namespaced else "unavailable"
+            if not contained:
                 payload = _uncontained_payload("child subreaper could not be enabled")
+            elif namespace == "entered":
+                payload = _run_in_pid_namespace(runner, task_id, evidence, result_path)
+            elif namespace == "broken":
+                payload = _uncontained_payload("user namespace id mapping failed")
+            else:
+                payload = _attempt_payload(runner, task_id, evidence)
         except BaseException:  # noqa: BLE001 - SystemExit and friends still need the sweep below
-            payload = None
+            payload = _ABORTED_PAYLOAD
         finally:
             # Once this leader exits, descendants in their own session are
             # reparented and the parent can no longer find them, so the sweep
-            # runs on every exit path and before the payload is published.
+            # runs on every exit path. The payload is written only after it
+            # finishes, so a missing payload means the sweep never completed
+            # (for example the runner called os._exit in this process).
             written = False
             try:
                 if _kill_descendants(os.getpid()) is None:
                     payload = _uncontained_payload(_UNENUMERATED)
-                if payload is not None:
-                    _write_payload(result_path, payload)
-                    written = True
+                _write_payload(result_path, payload)
+                written = True
             except BaseException:  # noqa: BLE001 - the child must still exit
                 pass
             os._exit(0 if written else 1)
@@ -642,7 +749,8 @@ def _process_table():
 
     state is the one-letter process state. A listing that does not include the
     caller is treated as unreadable, so an empty or truncated table never
-    passes for "no descendants".
+    passes for "no descendants". So is a /proc that belongs to another pid
+    namespace, as seen from PID 1 of an attempt namespace.
     """
     table = {}
     try:
@@ -650,6 +758,11 @@ def _process_table():
     except OSError:
         names = None
     if names is not None:
+        try:
+            if os.readlink("/proc/self") != str(os.getpid()):
+                return None
+        except OSError:
+            return None
         for name in names:
             if not name.isdigit():
                 continue
@@ -754,14 +867,16 @@ def _kill_descendants(root):
     return set(found) if complete else None
 
 
-def _reap(pid, seconds=2):
+def _reap(pid, seconds=2, statuses=None):
     deadline = time.monotonic() + seconds
     while True:
         try:
-            waited, _status = os.waitpid(pid, os.WNOHANG)
+            waited, status = os.waitpid(pid, os.WNOHANG)
         except ChildProcessError:
             return True
         if waited == pid:
+            if statuses is not None:
+                statuses.append(status)
             return True
         if time.monotonic() >= deadline:
             return False
@@ -885,6 +1000,7 @@ def _poll_job(job, now, cancel, max_attempts, backoff, budget_spent=False):
     swept = True
     if exited:
         reaped = True
+        self_exited = True
         if job.group_ready:
             # The group id cannot be reused while any member is alive, so this
             # cannot reach an unrelated process even though the leader is gone.
@@ -897,29 +1013,38 @@ def _poll_job(job, now, cancel, max_attempts, backoff, budget_spent=False):
             swept = False
         finally:
             _signal_pid(job.pid, job.group_ready)
-        reaped = _reap(job.pid)
+        statuses = []
+        reaped = _reap(job.pid, statuses=statuses)
+        # The leader may have exited on its own just before it was stopped.
+        self_exited = bool(statuses) and os.WIFEXITED(statuses[0])
     payload = _read_payload(job.result_path) if reaped else None
     uncontained = payload.get("uncontained") if isinstance(payload, dict) else None
+    # The leader writes its payload only after its own sweep, so a leader that
+    # exited by itself without one may have left a descendant behind.
+    vanished = self_exited and payload is None
     # A stop condition outranks a payload the leader managed to write: a late
     # result must not be merged into evidence or cached.
     stopped = timed_out or cancelled
-    if stopped or uncontained:
+    if stopped or uncontained or (payload and payload.get("status") == "aborted"):
         payload = None
     if payload and payload.get("status") == "ok":
         _apply_payload(job.runner, job.evidence, payload)
     _close_pipe(job.ready_read)
     if job.result_path:
-        try:
-            os.unlink(job.result_path)
-        except OSError:
-            pass
+        for suffix in ("", ".tmp", ".worker", ".worker.tmp"):
+            try:
+                os.unlink(job.result_path + suffix)
+            except OSError:
+                pass
     job.pid = None
     if not reaped:
         failure = "attempt leader was not reaped within the kill bound"
     elif not swept:
         failure = _UNENUMERATED
-    else:
+    elif uncontained:
         failure = uncontained
+    else:
+        failure = _LEADER_VANISHED if vanished else None
     if failure:
         job.records.append(
             {
@@ -1399,7 +1524,9 @@ def execute(selected, registry, runners, evidence, options=None):
     """Run independent tasks in parallel, reuse cached successful results, and retry transient failures.
 
     Deterministic exceptions are not retried. Each attempt runs in a killable
-    process session on POSIX. The next attempt starts only after the previous
+    process session on POSIX and, on Linux when unprivileged user namespaces
+    allow it, as PID 1 of its own pid namespace, so runner exit by any route
+    takes its descendants with it. The next attempt starts only after the previous
     process has been reaped. Exhausted retries and timeouts are terminal errors;
     callers must treat them as fail-closed. An expired run deadline
     ("budget exhausted"), external cancellation ("cancelled"), and an attempt

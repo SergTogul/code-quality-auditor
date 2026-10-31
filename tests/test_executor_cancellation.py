@@ -66,6 +66,46 @@ def _running(pid):
         return _alive(pid)
 
 
+# On Linux a forked attempt runs as PID 1 of its own pid namespace, where
+# os.getpid() and Popen.pid are namespace pids. /proc there is still the test
+# process's, so runners record the pids the test can check and signal.
+def _host_pid():
+    try:
+        return int(os.readlink("/proc/self"))
+    except (OSError, ValueError):
+        return os.getpid()
+
+
+def _host_child_pid(pid):
+    parent = _host_pid()
+    if parent == os.getpid():
+        return pid
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/status", encoding="utf-8") as handle:
+                status = dict(line.rstrip("\n").split(":\t", 1) for line in handle if ":\t" in line)
+        except OSError:
+            continue
+        if status.get("PPid") == str(parent) and status.get("NSpid", "").split()[-1:] == [str(pid)]:
+            return int(name)
+    raise AssertionError(f"child {pid} is not visible from the test process")
+
+
+# Prepended to child scripts that must report their own test-visible pid.
+_HOST_PID_SCRIPT = textwrap.dedent(
+    """
+    import os
+    def host_pid():
+        try:
+            return os.readlink("/proc/self")
+        except OSError:
+            return str(os.getpid())
+    """
+)
+
+
 # A stopped fallback attempt has its closure lists rolled back, so runners
 # record their calls in a file the rollback cannot reach.
 def _log_call(path, entry="call"):
@@ -126,6 +166,14 @@ class ExecutorCancellationTests(unittest.TestCase):
                             living = []
                             for pid in pids:
                                 try:
+                                    with open(f"/proc/{pid}/stat", "rb") as handle:
+                                        if handle.read().rpartition(b")")[2].split()[0] == b"Z":
+                                            continue
+                                except FileNotFoundError:
+                                    continue
+                                except OSError:
+                                    pass
+                                try:
                                     os.kill(pid, 0)
                                 except OSError:
                                     continue
@@ -148,11 +196,11 @@ class ExecutorCancellationTests(unittest.TestCase):
             count += 1
             counter.write_text(str(count), encoding="utf-8")
             with log.open("a", encoding="utf-8") as handle:
-                handle.write(f"start {os.getpid()} {count}\n")
+                handle.write(f"start {_host_pid()} {count}\n")
             if count == 1:
                 time.sleep(30)
             with log.open("a", encoding="utf-8") as handle:
-                handle.write(f"end {os.getpid()} {count}\n")
+                handle.write(f"end {_host_pid()} {count}\n")
             return {"count": count}
 
         started = time.monotonic()
@@ -175,7 +223,7 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertEqual(attempts[1]["outcome"], "success")
         starts = [line for line in log.read_text(encoding="utf-8").splitlines() if line.startswith("start ")]
         first_pid = int(starts[0].split()[1])
-        self.assertFalse(_alive(first_pid))
+        self.assertFalse(_running(first_pid))
         self.assertTrue(any(line.startswith("end ") for line in log.read_text(encoding="utf-8").splitlines()))
 
     def test_two_timed_out_attempts_never_overlap_and_leave_no_late_side_effect(self):
@@ -193,7 +241,7 @@ class ExecutorCancellationTests(unittest.TestCase):
 
         def sleepy(_task, _store):
             time.sleep(0.5)
-            (late / str(os.getpid())).write_text("late", encoding="utf-8")
+            (late / str(_host_pid())).write_text("late", encoding="utf-8")
             return {"late": True}
 
         started = time.monotonic()
@@ -244,7 +292,7 @@ class ExecutorCancellationTests(unittest.TestCase):
             for name in ("SIGTERM", "SIGINT", "SIGHUP"):
                 signal.signal(getattr(signal, name), signal.SIG_IGN)
             child = subprocess.Popen([sys.executable, "-c", child_script, str(child_marker)])
-            pid_file.write_text(f"{os.getpid()} {child.pid}", encoding="utf-8")
+            pid_file.write_text(f"{_host_pid()} {_host_child_pid(child.pid)}", encoding="utf-8")
             store["findings"]["leaked"] = True
             end = time.monotonic() + 1.0
             while time.monotonic() < end:
@@ -280,7 +328,7 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertEqual(evidence, {"findings": {}})
         self.assertFalse((cache_dir / "stubborn.json").exists())
         leader, child = (int(value) for value in pid_file.read_text(encoding="utf-8").split())
-        self.assertFalse(_alive(leader))
+        self.assertFalse(_running(leader))
         self._wait_until_dead(child)
         time.sleep(1.2)
         self.assertFalse(leader_marker.exists())
@@ -297,7 +345,7 @@ class ExecutorCancellationTests(unittest.TestCase):
         ran.mkdir()
 
         def slow(_task, _store):
-            pid_file.write_text(str(os.getpid()), encoding="utf-8")
+            pid_file.write_text(str(_host_pid()), encoding="utf-8")
             time.sleep(30)
             (ran / "a_slow").write_text("late", encoding="utf-8")
             return {"ok": True}
@@ -331,7 +379,7 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertEqual(tasks["b_pending"]["error"], "budget exhausted")
         self.assertEqual(tasks["b_pending"]["attempts"][0]["diagnostic"], "cancelled before start")
         self.assertEqual(tasks["c_dependent"]["error"], "dependency failed")
-        self.assertFalse(_alive(int(pid_file.read_text(encoding="utf-8"))))
+        self.assertFalse(_running(int(pid_file.read_text(encoding="utf-8"))))
         self.assertEqual(list(ran.iterdir()), [])
 
     def _exited_job_with_payload(self, evidence, cache_dir, deadline_offset):
@@ -394,12 +442,19 @@ class ExecutorCancellationTests(unittest.TestCase):
         grandchild_sentinel = self.tmp / "session-grandchild-late"
         child_pid_file = self.tmp / "session-child-pid"
         grandchild_pid_file = self.tmp / "session-grandchild-pid"
-        grandchild_script = "import sys, time\ntime.sleep(2.0)\nopen(sys.argv[1], 'w').write('late')\n"
+        grandchild_script = _HOST_PID_SCRIPT + textwrap.dedent(
+            """
+            import sys, time
+            open(sys.argv[2] + ".tmp", "w").write(host_pid())
+            os.replace(sys.argv[2] + ".tmp", sys.argv[2])
+            time.sleep(2.0)
+            open(sys.argv[1], "w").write("late")
+            """
+        )
         child_script = textwrap.dedent(
             """
             import subprocess, sys, time
-            grandchild = subprocess.Popen([sys.executable, "-c", sys.argv[1], sys.argv[2]], start_new_session=True)
-            open(sys.argv[3], "w").write(str(grandchild.pid))
+            subprocess.Popen([sys.executable, "-c", sys.argv[1], sys.argv[2], sys.argv[3]], start_new_session=True)
             time.sleep(2.0)
             open(sys.argv[4], "w").write("late")
             """
@@ -410,7 +465,7 @@ class ExecutorCancellationTests(unittest.TestCase):
                 [sys.executable, "-c", child_script, grandchild_script, str(grandchild_sentinel), str(grandchild_pid_file), str(child_sentinel)],
                 start_new_session=True,
             )
-            child_pid_file.write_text(str(process.pid), encoding="utf-8")
+            child_pid_file.write_text(str(_host_child_pid(process.pid)), encoding="utf-8")
             end = time.monotonic() + 5
             while not grandchild_pid_file.exists() and time.monotonic() < end:
                 time.sleep(0.01)
@@ -442,7 +497,7 @@ class ExecutorCancellationTests(unittest.TestCase):
 
         def runner(_task, _store):
             process = subprocess.Popen([sys.executable, "-c", script, str(sentinel)], start_new_session=True)
-            pid_file.write_text(str(process.pid), encoding="utf-8")
+            pid_file.write_text(str(_host_child_pid(process.pid)), encoding="utf-8")
             return {"ok": True}
 
         started = time.monotonic()
@@ -479,7 +534,7 @@ class ExecutorCancellationTests(unittest.TestCase):
         def runner(_task, _store):
             process = subprocess.Popen([sys.executable, "-c", script, str(sentinel)], start_new_session=True)
             with pid_log.open("a", encoding="utf-8") as handle:
-                handle.write(f"{process.pid}\n")
+                handle.write(f"{_host_child_pid(process.pid)}\n")
             raise SystemExit(3)
 
         started = time.monotonic()
@@ -581,7 +636,7 @@ class ExecutorCancellationTests(unittest.TestCase):
                     if os.fork() == 0:
                         os.setsid()
                         temporary = self.tmp / "double-fork-pid.tmp"
-                        temporary.write_text(str(os.getpid()), encoding="utf-8")
+                        temporary.write_text(str(_host_pid()), encoding="utf-8")
                         os.replace(temporary, pid_file)
                         time.sleep(2.0)
                         sentinel.write_text("late", encoding="utf-8")
@@ -684,6 +739,107 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertFalse(task["attempts"][0]["transient"])
         self.assertFalse(marker.exists())
 
+    def _os_exit_runner(self, sentinel, pid_file):
+        script = _HOST_PID_SCRIPT + textwrap.dedent(
+            """
+            import sys, time
+            open(sys.argv[2] + ".tmp", "w").write(host_pid())
+            os.replace(sys.argv[2] + ".tmp", sys.argv[2])
+            time.sleep(1.0)
+            open(sys.argv[1], "w").write("late")
+            """
+        )
+
+        def runner(_task, _store):
+            subprocess.Popen([sys.executable, "-c", script, str(sentinel), str(pid_file)], start_new_session=True)
+            end = time.monotonic() + 5
+            while not pid_file.exists() and time.monotonic() < end:
+                time.sleep(0.01)
+            os._exit(0)
+
+        return runner
+
+    def _run_os_exit_attempts(self, runner):
+        attempt_pids = []
+        real_fork = executor_module._fork_attempt
+
+        def tracking_fork(*args):
+            pid, ready = real_fork(*args)
+            attempt_pids.append(pid)
+            return pid, ready
+
+        with warnings.catch_warnings(), mock.patch.object(executor_module, "_fork_attempt", tracking_fork):
+            warnings.simplefilter("ignore", ResourceWarning)
+            result = execute(
+                {"left"},
+                REGISTRY,
+                {"left": runner},
+                {},
+                {"concurrency": 1, "max_retries": 3, "retry_backoff_seconds": 0, "task_timeout_seconds": 10},
+            )
+        return result, attempt_pids
+
+    def _kill_escaped(self, pid_file):
+        if not pid_file.exists():
+            return
+        pid = int(pid_file.read_text(encoding="utf-8"))
+        if _running(pid):
+            os.kill(pid, signal.SIGKILL)
+        deadline = time.monotonic() + 2
+        while _running(pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "pid namespaces are Linux-only")
+    def test_os_exit_in_the_runner_takes_new_session_descendants_with_it(self):
+        if not executor_module._pid_namespace_usable():
+            self.skipTest("unprivileged user and pid namespaces are unavailable")
+        sentinel = self.tmp / "os-exit-late"
+        pid_file = self.tmp / "os-exit-pid"
+        started = time.monotonic()
+        try:
+            result, attempt_pids = self._run_os_exit_attempts(self._os_exit_runner(sentinel, pid_file))
+            pid = int(pid_file.read_text(encoding="utf-8"))
+            self.assertFalse(_running(pid))
+            task = result["tasks"][0]
+            self.assertFalse(task["ok"])
+            self.assertEqual(task["error"], "termination could not be guaranteed")
+            self.assertEqual(len(task["attempts"]), 1)
+            self.assertEqual(task["attempts"][0]["diagnostic"], "attempt worker exited without a result")
+            self.assertFalse(task["attempts"][0]["transient"])
+            self.assertEqual(len(attempt_pids), 1)
+            time.sleep(max(0.0, started + 1.5 - time.monotonic()))
+            self.assertFalse(sentinel.exists())
+        finally:
+            self._kill_escaped(pid_file)
+
+    def test_os_exit_without_a_pid_namespace_is_terminal_and_not_retried(self):
+        executor_module._pid_namespace_usable()
+        cases = (
+            ("unavailable", "attempt leader exited before its cleanup sweep finished"),
+            ("broken", "user namespace id mapping failed"),
+        )
+        for outcome, diagnostic in cases:
+            with self.subTest(outcome=outcome):
+                sentinel = self.tmp / f"no-namespace-{outcome}-late"
+                pid_file = self.tmp / f"no-namespace-{outcome}-pid"
+                try:
+                    with mock.patch.object(executor_module, "_pid_namespace_usable", return_value=True), mock.patch.object(
+                        executor_module, "_setup_pid_namespace", return_value=outcome
+                    ):
+                        result, attempt_pids = self._run_os_exit_attempts(self._os_exit_runner(sentinel, pid_file))
+                    task = result["tasks"][0]
+                    self.assertFalse(task["ok"])
+                    self.assertEqual(task["error"], "termination could not be guaranteed")
+                    self.assertEqual(len(task["attempts"]), 1)
+                    self.assertEqual(task["attempts"][0]["diagnostic"], diagnostic)
+                    self.assertFalse(task["attempts"][0]["transient"])
+                    self.assertEqual(len(attempt_pids), 1)
+                    self.assertNotIn("value", task)
+                    if outcome == "broken":
+                        self.assertFalse(pid_file.exists())
+                finally:
+                    self._kill_escaped(pid_file)
+
     def _scripted_sweep(self, root, tables):
         def table():
             return tables.pop(0) if len(tables) > 1 else tables[0]
@@ -758,9 +914,9 @@ class ExecutorCancellationTests(unittest.TestCase):
                 if os.fork() == 0:
                     try:
                         os.setsid()
-                        _log_call(pid_log, str(os.getpid()))
+                        _log_call(pid_log, str(_host_pid()))
                         time.sleep(1.5)
-                        (late / str(os.getpid())).write_text("late", encoding="utf-8")
+                        (late / str(_host_pid())).write_text("late", encoding="utf-8")
                     finally:
                         os._exit(0)
                 time.sleep(0.02)
@@ -987,7 +1143,7 @@ class ExecutorCancellationTests(unittest.TestCase):
 
         def runner(_task, _store):
             process = subprocess.Popen(["sleep", "30"])
-            pid_file.write_text(str(process.pid), encoding="utf-8")
+            pid_file.write_text(str(_host_child_pid(process.pid)), encoding="utf-8")
             return {"ok": True}
 
         with warnings.catch_warnings():
@@ -1008,7 +1164,7 @@ class ExecutorCancellationTests(unittest.TestCase):
 
         def runner(_task, _store):
             process = subprocess.Popen(["sleep", "30"])
-            pid_file.write_text(str(process.pid), encoding="utf-8")
+            pid_file.write_text(str(_host_child_pid(process.pid)), encoding="utf-8")
             time.sleep(30)
             return {"ok": True}
 
