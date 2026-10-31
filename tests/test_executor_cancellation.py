@@ -886,6 +886,134 @@ class ExecutorCancellationTests(unittest.TestCase):
                 if child in table:
                     self.assertIn((child, signal.SIGKILL, False), sent)
 
+    def test_sweep_gives_up_at_once_when_the_stopped_root_is_lost(self):
+        me = os.getpid()
+        root, child = 999_021, 999_022
+        cases = {
+            "root absent": [{me: (1, me, "R")}],
+            "root zombie": [{me: (1, me, "R"), root: (me, root, "Z")}],
+            "root dead": [{me: (1, me, "R"), root: (me, root, "X")}],
+            "root lost after a child was found": [
+                {me: (1, me, "R"), root: (me, root, "T"), child: (root, child, "S")},
+                {me: (1, me, "R"), root: (me, root, "Z"), child: (root, child, "T")},
+            ],
+            "root lost after the kill": [
+                {me: (1, me, "R"), root: (me, root, "T"), child: (root, child, "T")},
+                {me: (1, me, "R"), root: (me, root, "T"), child: (root, child, "T")},
+                {me: (1, me, "R"), child: (1, child, "Z")},
+            ],
+        }
+        for name, tables in cases.items():
+            with self.subTest(name=name):
+                had_child = any(child in table for table in tables)
+                started = time.monotonic()
+                killed, sent = self._scripted_sweep(root, tables)
+                self.assertIsNone(killed)
+                self.assertLess(time.monotonic() - started, 0.5)
+                if had_child:
+                    self.assertIn((child, signal.SIGKILL, False), sent)
+
+    def test_sweep_waits_for_a_running_root_to_stop(self):
+        me = os.getpid()
+        root, child = 999_031, 999_032
+        killed, sent = self._scripted_sweep(
+            root,
+            [
+                {me: (1, me, "R"), root: (me, root, "R"), child: (root, child, "S")},
+                {me: (1, me, "R"), root: (me, root, "S"), child: (root, child, "T")},
+                {me: (1, me, "R"), root: (me, root, "T"), child: (root, child, "T")},
+                {me: (1, me, "R"), root: (me, root, "T"), child: (root, child, "Z")},
+            ],
+        )
+        self.assertEqual(killed, {child})
+        self.assertIn((child, signal.SIGKILL, False), sent)
+
+    @unittest.skipUnless(os.path.isdir("/proc"), "the child watches the leader's state through /proc")
+    def test_leader_killed_by_its_descendant_during_the_sweep_is_terminal(self):
+        pid_dir = self.tmp / "leader-killer-pids"
+        pid_dir.mkdir()
+        cache_dir = self.tmp / "leader-killer-cache"
+        script = textwrap.dedent(
+            """
+            import os, signal, sys, time
+            leader, pid_file = int(sys.argv[1]), sys.argv[2]
+            open(pid_file + ".tmp", "w").write(str(os.getpid()))
+            os.replace(pid_file + ".tmp", pid_file)
+            end = time.monotonic() + 10
+            while time.monotonic() < end:
+                try:
+                    with open(f"/proc/{leader}/stat", "rb") as handle:
+                        state = handle.read().rpartition(b")")[2].split()[0]
+                except OSError:
+                    break
+                if state in (b"T", b"t"):
+                    os.kill(leader, signal.SIGKILL)
+                    break
+                time.sleep(0.002)
+            time.sleep(10)
+            """
+        )
+        attempt_pids = []
+        real_fork = executor_module._fork_attempt
+        real_table = executor_module._process_table
+
+        def tracking_fork(*args):
+            pid, ready = real_fork(*args)
+            attempt_pids.append(pid)
+            return pid, ready
+
+        # Delaying each scan lets the child kill the stopped leader before the
+        # parent's first look at the tree.
+        def slow_table():
+            time.sleep(0.1)
+            return real_table()
+
+        def runner(_task, store):
+            pid_file = pid_dir / str(time.monotonic_ns())
+            subprocess.Popen([sys.executable, "-c", script, str(_host_pid()), str(pid_file)], start_new_session=True)
+            end = time.monotonic() + 5
+            while not pid_file.exists() and time.monotonic() < end:
+                time.sleep(0.01)
+            store["findings"]["leaked"] = True
+            time.sleep(30)
+            return {"late": True}
+
+        evidence = {"findings": {}}
+        try:
+            with warnings.catch_warnings(), mock.patch.object(
+                executor_module, "_pid_namespace_usable", return_value=False
+            ), mock.patch.object(executor_module, "_process_table", side_effect=slow_table), mock.patch.object(
+                executor_module, "_fork_attempt", tracking_fork
+            ):
+                warnings.simplefilter("ignore", ResourceWarning)
+                result = execute(
+                    {"left"},
+                    REGISTRY,
+                    {"left": runner},
+                    evidence,
+                    {
+                        "concurrency": 1,
+                        "max_retries": 3,
+                        "retry_backoff_seconds": 0,
+                        "task_timeout_seconds": 0.5,
+                        "cache_dir": str(cache_dir),
+                        "fingerprint": lambda _task: "leader-killer",
+                    },
+                )
+            task = result["tasks"][0]
+            self.assertFalse(task["ok"])
+            self.assertEqual(task["error"], "termination could not be guaranteed")
+            self.assertEqual(len(task["attempts"]), 1)
+            self.assertFalse(task["attempts"][0]["transient"])
+            self.assertEqual(len(attempt_pids), 1)
+            self.assertNotIn("value", task)
+            self.assertEqual(evidence, {"findings": {}})
+            self.assertFalse((cache_dir / "leader-killer.json").exists())
+        finally:
+            for pid_file in pid_dir.iterdir():
+                if not pid_file.name.endswith(".tmp"):
+                    self._kill_escaped(pid_file)
+
     def test_runner_still_forking_new_sessions_at_timeout_leaves_no_survivor(self):
         late = self.tmp / "fork-loop-late"
         late.mkdir()

@@ -742,6 +742,7 @@ _SWEEP_POLL_SECONDS = 0.005
 # Stopped, traced, zombie, or dead: a process in one of these states cannot fork.
 _QUIESCENT = frozenset("TtZX")
 _GONE = frozenset("ZX")
+_STOPPED = frozenset("Tt")
 
 
 def _process_table():
@@ -818,18 +819,22 @@ def _kill_descendants(root):
     dies; afterwards they are reparented and untraceable. SIGSTOP is
     asynchronous, so a signalled process may still fork until the table shows
     it stopped. Nothing is killed until a scan finds no new descendant and every
-    found pid, and a root other than the caller, is quiescent. After the kill,
-    the sweep waits until those pids are gone or zombies and nothing new has
-    appeared; a newcomer is stopped and the cycle repeats.
+    found pid is quiescent. After the kill, the sweep waits until those pids
+    are gone or zombies and nothing new has appeared; a newcomer is stopped
+    and the cycle repeats.
+
+    When root is another process, only a scan that sees root stopped can count
+    toward success. A root that is gone, a zombie, or dead may already have had
+    its descendants reparented out of reach, so the sweep gives up at once.
 
     Returns the killed pids, or None when the tree could not be proven
-    contained: a table read failed or the time bound expired first. Whatever
-    was found is killed either way.
+    contained: a table read failed, root was lost, or the time bound expired
+    first. Whatever was found is killed either way.
     """
     protected = {os.getpid(), 0, 1}
     own_group = os.getpgrp()
     found = {}
-    watched = [] if root in protected else [root]
+    watching = root not in protected
     killed = False
     complete = False
 
@@ -847,6 +852,12 @@ def _kill_descendants(root):
         table = _process_table()
         if table is None:
             break
+        root_stopped = True
+        if watching:
+            state = table[root][2] if root in table else None
+            if state is None or state in _GONE:
+                break
+            root_stopped = state in _STOPPED
         fresh = _descendants(table, {root} | set(found)) - set(found) - protected
         if fresh:
             for pid in fresh:
@@ -854,12 +865,12 @@ def _kill_descendants(root):
                 _send(pid, signal.SIGSTOP)
             killed = False
             continue
-        if not killed:
-            if settled(table, list(found) + watched, _QUIESCENT):
+        if root_stopped and not killed:
+            if settled(table, found, _QUIESCENT):
                 kill_found()
                 killed = True
                 continue
-        elif settled(table, found, _GONE):
+        elif root_stopped and settled(table, found, _GONE):
             complete = True
             break
         time.sleep(_SWEEP_POLL_SECONDS)
