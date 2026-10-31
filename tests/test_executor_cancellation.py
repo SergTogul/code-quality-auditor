@@ -66,6 +66,17 @@ def _running(pid):
         return _alive(pid)
 
 
+# A stopped fallback attempt has its closure lists rolled back, so runners
+# record their calls in a file the rollback cannot reach.
+def _log_call(path, entry="call"):
+    with open(path, "a", encoding="utf-8") as handle:
+        handle.write(f"{entry}\n")
+
+
+def _logged(path):
+    return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
+
 class ExecutorCancellationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="cqa-cancel-"))
@@ -541,6 +552,138 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertEqual(evidence, {"findings": {}})
         self.assertFalse((cache_dir / "unreaped.json").exists())
 
+    @unittest.skipUnless(sys.platform.startswith("linux"), "PR_SET_CHILD_SUBREAPER is Linux-only")
+    def test_double_forked_new_session_descendant_dies_before_the_retry(self):
+        sentinel = self.tmp / "double-fork-late"
+        pid_file = self.tmp / "double-fork-pid"
+        counter = self.tmp / "double-fork-count"
+        overlaps = []
+        real_fork = executor_module._fork_attempt
+
+        def grandchild_pid():
+            return int(pid_file.read_text(encoding="utf-8")) if pid_file.exists() else None
+
+        def tracking_fork(*args):
+            pid = grandchild_pid()
+            if pid is not None and _running(pid):
+                overlaps.append(pid)
+            return real_fork(*args)
+
+        def runner(_task, _store):
+            count = int(counter.read_text(encoding="utf-8")) if counter.exists() else 0
+            count += 1
+            counter.write_text(str(count), encoding="utf-8")
+            if count > 1:
+                return {"count": count}
+            intermediate = os.fork()
+            if intermediate == 0:
+                try:
+                    if os.fork() == 0:
+                        os.setsid()
+                        temporary = self.tmp / "double-fork-pid.tmp"
+                        temporary.write_text(str(os.getpid()), encoding="utf-8")
+                        os.replace(temporary, pid_file)
+                        time.sleep(2.0)
+                        sentinel.write_text("late", encoding="utf-8")
+                finally:
+                    os._exit(0)
+            os.waitpid(intermediate, 0)
+            end = time.monotonic() + 5
+            while not pid_file.exists() and time.monotonic() < end:
+                time.sleep(0.01)
+            time.sleep(30)
+            return {"count": count}
+
+        started = time.monotonic()
+        with mock.patch.object(executor_module, "_fork_attempt", tracking_fork):
+            result = execute(
+                {"left"},
+                REGISTRY,
+                {"left": runner},
+                {},
+                {"concurrency": 1, "max_retries": 2, "retry_backoff_seconds": 0, "task_timeout_seconds": 1.0},
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual([record["outcome"] for record in result["tasks"][0]["attempts"]], ["timeout", "success"])
+        pid = grandchild_pid()
+        self.assertIsNotNone(pid)
+        self.assertEqual(overlaps, [])
+        self._wait_until_dead(pid)
+        time.sleep(max(0.0, started + 2.6 - time.monotonic()))
+        self.assertFalse(sentinel.exists())
+
+    def test_unreadable_process_table_is_terminal_and_not_retried(self):
+        for mode in ("timeout", "exit"):
+            with self.subTest(mode=mode):
+                attempt_pids = []
+                real_fork = executor_module._fork_attempt
+
+                def tracking_fork(*args):
+                    pid, ready = real_fork(*args)
+                    attempt_pids.append(pid)
+                    return pid, ready
+
+                def runner(_task, store, mode=mode):
+                    store["findings"]["leaked"] = True
+                    if mode == "timeout":
+                        time.sleep(30)
+                    return {"late": True}
+
+                evidence = {"findings": {}}
+                cache_dir = self.tmp / f"unreadable-{mode}"
+                with mock.patch.object(executor_module, "_fork_attempt", tracking_fork), mock.patch.object(
+                    executor_module, "_process_table", return_value=None
+                ):
+                    result = execute(
+                        {"left"},
+                        REGISTRY,
+                        {"left": runner},
+                        evidence,
+                        {
+                            "concurrency": 1,
+                            "max_retries": 3,
+                            "retry_backoff_seconds": 0,
+                            "task_timeout_seconds": 0.3 if mode == "timeout" else 10,
+                            "cache_dir": str(cache_dir),
+                            "fingerprint": lambda _task: "unreadable",
+                        },
+                    )
+                task = result["tasks"][0]
+                self.assertFalse(task["ok"])
+                self.assertEqual(task["error"], "termination could not be guaranteed")
+                self.assertEqual(len(task["attempts"]), 1)
+                self.assertEqual(task["attempts"][0]["reason"], "termination could not be guaranteed")
+                self.assertEqual(task["attempts"][0]["diagnostic"], "attempt descendants could not be enumerated")
+                self.assertFalse(task["attempts"][0]["transient"])
+                self.assertEqual(len(attempt_pids), 1)
+                self.assertFalse(_alive(attempt_pids[0]))
+                self.assertNotIn("value", task)
+                self.assertEqual(evidence, {"findings": {}})
+                self.assertFalse((cache_dir / "unreadable.json").exists())
+
+    def test_subreaper_failure_does_not_run_the_runner_or_retry(self):
+        marker = self.tmp / "subreaper-ran"
+
+        def runner(_task, _store):
+            marker.write_text("ran", encoding="utf-8")
+            return {"ok": True}
+
+        with mock.patch.object(executor_module, "_enable_subreaper", return_value=False):
+            result = execute(
+                {"left"},
+                REGISTRY,
+                {"left": runner},
+                {},
+                {"concurrency": 1, "max_retries": 3, "retry_backoff_seconds": 0, "task_timeout_seconds": 10},
+            )
+        task = result["tasks"][0]
+        self.assertFalse(task["ok"])
+        self.assertEqual(task["error"], "termination could not be guaranteed")
+        self.assertEqual(len(task["attempts"]), 1)
+        self.assertEqual(task["attempts"][0]["diagnostic"], "child subreaper could not be enabled")
+        self.assertFalse(task["attempts"][0]["transient"])
+        self.assertFalse(marker.exists())
+
     def test_queued_jobs_after_an_expired_deadline_report_budget_not_cancel(self):
         ran = []
 
@@ -774,10 +917,10 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.addCleanup(os.close, write_fd)
         marker = self.tmp / "after-release"
         cache_dir = self.tmp / "cache"
-        calls = []
+        calls = self.tmp / "calls"
 
         def blocked(_task, _store):
-            calls.append(1)
+            _log_call(calls)
             os.read(read_fd, 1)
             marker.write_text("late", encoding="utf-8")
             return {"done": True}
@@ -793,17 +936,17 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertFalse(result["attempts"][0]["transient"])
         os.write(write_fd, b"x")
         time.sleep(0.5)
-        self.assertEqual(calls, [1])
+        self.assertEqual(_logged(calls), ["call"])
         self.assertFalse(marker.exists())
         self.assertFalse((cache_dir / "key.json").exists())
 
     def test_fallback_without_async_exception_api_fails_closed(self):
         release = threading.Event()
         self.addCleanup(release.set)
-        calls = []
+        calls = self.tmp / "calls"
 
         def waits(_task, _store):
-            calls.append(1)
+            _log_call(calls)
             release.wait(10)
             return {"done": True}
 
@@ -815,11 +958,11 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertEqual(result["error"], "termination could not be guaranteed")
         self.assertEqual(len(result["attempts"]), 1)
         self.assertFalse(result["attempts"][0]["transient"])
-        self.assertEqual(calls, [1])
+        self.assertEqual(_logged(calls), ["call"])
 
     def _spinning_runner(self, marker, calls):
         def spin(_task, _store):
-            calls.append(1)
+            _log_call(calls)
             end = time.monotonic() + 30
             while time.monotonic() < end:
                 time.sleep(0.01)
@@ -830,7 +973,7 @@ class ExecutorCancellationTests(unittest.TestCase):
 
     def test_fallback_attempt_stops_at_the_run_deadline(self):
         marker = self.tmp / "fallback-deadline"
-        calls = []
+        calls = self.tmp / "calls"
         started = time.monotonic()
         result = _run_thread_task(
             "left",
@@ -850,12 +993,12 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertEqual(len(result["attempts"]), 1)
         self.assertEqual(result["attempts"][0]["reason"], "run budget exhausted")
         self.assertFalse(result["attempts"][0]["transient"])
-        self.assertEqual(calls, [1])
+        self.assertEqual(_logged(calls), ["call"])
         self.assertFalse(marker.exists())
 
     def test_fallback_attempt_stops_on_external_cancel(self):
         marker = self.tmp / "fallback-cancel"
-        calls = []
+        calls = self.tmp / "calls"
         cancel = threading.Event()
         timer = threading.Timer(0.2, cancel.set)
         timer.start()
@@ -868,7 +1011,7 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertEqual(len(result["attempts"]), 1)
         self.assertEqual(result["attempts"][0]["reason"], "cancelled")
         self.assertFalse(result["attempts"][0]["transient"])
-        self.assertEqual(calls, [1])
+        self.assertEqual(_logged(calls), ["call"])
         self.assertFalse(marker.exists())
 
     def test_fallback_run_deadline_blocks_pending_and_dependent_tasks(self):
@@ -879,7 +1022,7 @@ class ExecutorCancellationTests(unittest.TestCase):
         }
         marker = self.tmp / "fallback-late"
         ran = []
-        calls = []
+        calls = self.tmp / "calls"
 
         def record(task_id, _store):
             ran.append(task_id)
@@ -901,15 +1044,15 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertEqual(tasks["other"]["error"], "budget exhausted")
         self.assertEqual(tasks["right"]["error"], "dependency failed")
         self.assertEqual(ran, [])
-        self.assertEqual(calls, [1])
+        self.assertEqual(_logged(calls), ["call"])
         self.assertFalse(marker.exists())
 
     def test_fallback_unterminated_thread_cannot_mutate_caller_evidence(self):
         finished = threading.Event()
-        calls = []
+        calls = self.tmp / "calls"
 
         def swallowing(_task, store):
-            calls.append(1)
+            _log_call(calls)
             store["leaked"] = 1
             end = time.monotonic() + 1.0
             while True:
@@ -944,7 +1087,7 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertFalse(task["ok"])
         self.assertEqual(task["error"], "termination could not be guaranteed")
         self.assertEqual(len(task["attempts"]), 1)
-        self.assertEqual(calls, [1])
+        self.assertEqual(_logged(calls), ["call"])
         self.assertEqual(evidence, {"findings": {}})
         self.assertTrue(finished.wait(5))
         self.assertEqual(evidence, {"findings": {}})
@@ -987,17 +1130,17 @@ class ExecutorCancellationTests(unittest.TestCase):
         context = Context()
         closed = {"kept": 1}
         counter = 0
-        observed = []
+        observed = self.tmp / f"observed-{mode}"
 
         def runner(_task, _store):
             nonlocal counter
-            observed.append((hasattr(context, "added"), getattr(context, "existing", None), counter, dict(closed)))
+            _log_call(observed, repr((hasattr(context, "added"), getattr(context, "existing", None), counter, dict(closed))))
             context.added = True
             del context.existing
             counter = 99
             closed["added"] = 1
             del closed["kept"]
-            if len(observed) == 1:
+            if len(_logged(observed)) == 1:
                 if mode == "stopped":
                     while True:
                         time.sleep(0.01)
@@ -1014,12 +1157,66 @@ class ExecutorCancellationTests(unittest.TestCase):
             )
         self.assertFalse(result["ok"])
         self.assertEqual(len(result["tasks"][0]["attempts"]), 2)
-        original = (False, "orig", 0, {"kept": 1})
-        self.assertEqual(observed, [original, original])
+        original = repr((False, "orig", 0, {"kept": 1}))
+        self.assertEqual(_logged(observed), [original, original])
         self.assertFalse(hasattr(context, "added"))
         self.assertEqual(context.existing, "orig")
         self.assertEqual(counter, 0)
         self.assertEqual(closed, {"kept": 1})
+
+    def test_fallback_retry_sees_original_closure_list_set_and_bytearray(self):
+        items = ["orig"]
+        tags = {"orig"}
+        raw = bytearray(b"orig")
+        log = self.tmp / "sequence-observed"
+
+        def runner(_task, _store):
+            attempt = len(_logged(log)) + 1
+            _log_call(log, repr((list(items), sorted(tags), bytes(raw))))
+            items.append(f"attempt-{attempt}")
+            tags.add(f"attempt-{attempt}")
+            raw.extend(b"-%d" % attempt)
+            if attempt == 1:
+                while True:
+                    time.sleep(0.01)
+            return {"attempt": attempt}
+
+        with mock.patch.object(executor_module, "_isolated_processes", return_value=False):
+            result = execute(
+                {"left"},
+                REGISTRY,
+                {"left": runner},
+                {},
+                {"concurrency": 1, "max_retries": 2, "retry_backoff_seconds": 0, "task_timeout_seconds": 0.3},
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual([record["outcome"] for record in result["tasks"][0]["attempts"]], ["timeout", "success"])
+        original = repr((["orig"], ["orig"], b"orig"))
+        self.assertEqual(_logged(log), [original, original])
+        self.assertEqual(items, ["orig", "attempt-2"])
+        self.assertEqual(tags, {"orig", "attempt-2"})
+        self.assertEqual(raw, bytearray(b"orig-2"))
+
+    def test_fallback_uncopyable_closure_list_is_terminal_without_running(self):
+        class Uncopyable:
+            def __deepcopy__(self, _memo):
+                raise TypeError("cannot copy")
+
+        items = [Uncopyable()]
+        calls = self.tmp / "calls"
+
+        def runner(_task, _store):
+            _log_call(calls)
+            items.append("partial")
+            return {"ok": True}
+
+        result = _run_thread_task("left", runner, {}, None, 5, 3, 0, threading.Event(), None, None)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "evidence could not be isolated")
+        self.assertEqual(len(result["attempts"]), 1)
+        self.assertFalse(result["attempts"][0]["transient"])
+        self.assertEqual(_logged(calls), [])
+        self.assertEqual(len(items), 1)
 
     def test_fallback_success_merges_isolated_evidence(self):
         evidence = {"findings": {"stale": 1, "kept": 2}}
@@ -1071,11 +1268,11 @@ class ExecutorCancellationTests(unittest.TestCase):
 
     def test_fallback_system_exit_is_a_terminal_error(self):
         closed = {"kept": 1}
-        calls = []
+        calls = self.tmp / "calls"
         cache_dir = self.tmp / "system-exit-cache"
 
         def exits(_task, store):
-            calls.append(1)
+            _log_call(calls)
             store["findings"]["leaked"] = True
             closed["leaked"] = True
             raise SystemExit(3)
@@ -1103,16 +1300,16 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertEqual(task["attempts"][0]["outcome"], "error")
         self.assertEqual(task["attempts"][0]["diagnostic"], "SystemExit")
         self.assertFalse(task["attempts"][0]["transient"])
-        self.assertEqual(calls, [1])
+        self.assertEqual(_logged(calls), ["call"])
         self.assertEqual(evidence, {"findings": {}})
         self.assertEqual(closed, {"kept": 1})
         self.assertFalse((cache_dir / "system-exit.json").exists())
 
     def test_fallback_deadline_during_grace_is_terminal_budget(self):
-        calls = []
+        calls = self.tmp / "calls"
 
         def slow_exit(_task, _store):
-            calls.append(1)
+            _log_call(calls)
             time.sleep(0.15)
             return {"late": True}
 
@@ -1133,7 +1330,7 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertEqual(result["error"], "budget exhausted")
         self.assertEqual(len(result["attempts"]), 1)
         self.assertEqual(result["attempts"][0]["reason"], "run budget exhausted")
-        self.assertEqual(calls, [1])
+        self.assertEqual(_logged(calls), ["call"])
 
     def _timeout_only_execution(self, selected, ok_values=None):
         ok_values = ok_values or {}

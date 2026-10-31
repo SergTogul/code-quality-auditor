@@ -520,29 +520,71 @@ def _write_payload(path, payload):
     os.replace(temporary, path)
 
 
+_PR_SET_CHILD_SUBREAPER = 36
+_TERMINATION_NOT_GUARANTEED = "termination could not be guaranteed"
+_UNENUMERATED = "attempt descendants could not be enumerated"
+
+
+def _enable_subreaper():
+    """Make orphaned descendants reparent to this process. Returns False when Linux refuses.
+
+    Darwin has no equivalent: a descendant that double-forks into its own
+    session there is reparented to launchd and can still escape the sweep.
+    """
+    if not sys.platform.startswith("linux"):
+        return True
+    try:
+        import ctypes
+
+        libc = ctypes.CDLL(None, use_errno=True)
+        one, zero = ctypes.c_ulong(1), ctypes.c_ulong(0)
+        return libc.prctl(ctypes.c_int(_PR_SET_CHILD_SUBREAPER), one, zero, zero, zero) == 0
+    except Exception:  # noqa: BLE001 - no prctl means orphans cannot be contained
+        return False
+
+
+def _uncontained_payload(diagnostic):
+    return {
+        "status": "error",
+        "value": None,
+        "error": {"type": "TerminationNotGuaranteed", "message": _TERMINATION_NOT_GUARANTEED, "transient": False},
+        "evidence": None,
+        "cells": [],
+        "uncontained": diagnostic,
+    }
+
+
 def _fork_attempt(runner, task_id, evidence, result_path):
     ready_read, ready_write = os.pipe()
     pid = os.fork()
     if pid == 0:
-        written = False
+        payload = None
         try:
             os.close(ready_read)
             os.setsid()
+            contained = _enable_subreaper()
             signal.signal(signal.SIGALRM, signal.SIG_DFL)
             if hasattr(signal, "setitimer"):
                 signal.setitimer(signal.ITIMER_REAL, 0)
             os.write(ready_write, b"1")
             os.close(ready_write)
-            _write_payload(result_path, _attempt_payload(runner, task_id, evidence))
-            written = True
+            if contained:
+                payload = _attempt_payload(runner, task_id, evidence)
+            else:
+                payload = _uncontained_payload("child subreaper could not be enabled")
         except BaseException:  # noqa: BLE001 - SystemExit and friends still need the sweep below
-            pass
+            payload = None
         finally:
             # Once this leader exits, descendants in their own session are
             # reparented and the parent can no longer find them, so the sweep
-            # runs on every exit path.
+            # runs on every exit path and before the payload is published.
+            written = False
             try:
-                _kill_descendants(os.getpid())
+                if _kill_descendants(os.getpid()) is None:
+                    payload = _uncontained_payload(_UNENUMERATED)
+                if payload is not None:
+                    _write_payload(result_path, payload)
+                    written = True
             except BaseException:  # noqa: BLE001 - the child must still exit
                 pass
             os._exit(0 if written else 1)
@@ -592,7 +634,11 @@ _TREE_ROUNDS = 5
 
 
 def _process_table():
-    """Return {pid: (ppid, pgid)} for visible processes, or {} when no listing is available."""
+    """Return {pid: (ppid, pgid)} for visible processes, or None when no listing could be read.
+
+    A listing that does not include the caller is treated as unreadable, so an
+    empty or truncated table never passes for "no descendants".
+    """
     table = {}
     try:
         names = os.listdir("/proc")
@@ -610,8 +656,9 @@ def _process_table():
             fields = data.rpartition(b")")[2].split()
             if len(fields) >= 3:
                 table[int(name)] = (int(fields[1]), int(fields[2]))
-        if table:
+        if os.getpid() in table:
             return table
+        table = {}
     if sys.platform == "darwin":
         try:
             listing = subprocess.run(
@@ -622,12 +669,14 @@ def _process_table():
                 check=False,
             ).stdout
         except (OSError, subprocess.SubprocessError):
-            return {}
+            return None
         for line in listing.splitlines():
             parts = line.split()
             if len(parts) == 3 and all(part.isdigit() for part in parts):
                 table[int(parts[0])] = (int(parts[1]), int(parts[2]))
-    return table
+        if os.getpid() in table:
+            return table
+    return None
 
 
 def _descendants(table, roots):
@@ -651,14 +700,22 @@ def _kill_descendants(root):
     dies; afterwards they are reparented and untraceable. Each bounded round
     stops what it finds, so a process that forks during the scan is caught by
     the next round instead of racing the kill.
+
+    Returns the killed pids, or None when the tree could not be fully
+    enumerated: a round could not read the process table, or the last round
+    still found new processes. Whatever was found is killed either way.
     """
     protected = {os.getpid(), 0, 1}
     own_group = os.getpgrp()
     found = {}
+    complete = False
     for _ in range(_TREE_ROUNDS):
         table = _process_table()
+        if table is None:
+            break
         fresh = _descendants(table, {root} | set(found)) - set(found) - protected
         if not fresh:
+            complete = True
             break
         for pid in fresh:
             found[pid] = table[pid][1]
@@ -667,7 +724,7 @@ def _kill_descendants(root):
         if pgid == pid and pgid not in (own_group, root):
             _send(pgid, signal.SIGKILL, group=True)
         _send(pid, signal.SIGKILL)
-    return set(found)
+    return set(found) if complete else None
 
 
 def _reap(pid, seconds=2):
@@ -798,6 +855,7 @@ def _poll_job(job, now, cancel, max_attempts, backoff, budget_spent=False):
     cancelled = cancel.is_set()
     if not exited and not timed_out and not cancelled:
         return None, True
+    swept = True
     if exited:
         reaped = True
         if job.group_ready:
@@ -806,13 +864,20 @@ def _poll_job(job, now, cancel, max_attempts, backoff, budget_spent=False):
             _send(job.pid, signal.SIGKILL, group=True)
     else:
         _signal_pid(job.pid, job.group_ready, signal.SIGSTOP)
-        _kill_descendants(job.pid)
-        _signal_pid(job.pid, job.group_ready)
+        try:
+            swept = _kill_descendants(job.pid) is not None
+        except Exception:  # noqa: BLE001 - an unfinished sweep cannot prove containment
+            swept = False
+        finally:
+            _signal_pid(job.pid, job.group_ready)
         reaped = _reap(job.pid)
+    payload = _read_payload(job.result_path) if reaped else None
+    uncontained = payload.get("uncontained") if isinstance(payload, dict) else None
     # A stop condition outranks a payload the leader managed to write: a late
     # result must not be merged into evidence or cached.
     stopped = timed_out or cancelled
-    payload = None if stopped or not reaped else _read_payload(job.result_path)
+    if stopped or uncontained:
+        payload = None
     if payload and payload.get("status") == "ok":
         _apply_payload(job.runner, job.evidence, payload)
     _close_pipe(job.ready_read)
@@ -823,16 +888,22 @@ def _poll_job(job, now, cancel, max_attempts, backoff, budget_spent=False):
             pass
     job.pid = None
     if not reaped:
+        failure = "attempt leader was not reaped within the kill bound"
+    elif not swept:
+        failure = _UNENUMERATED
+    else:
+        failure = uncontained
+    if failure:
         job.records.append(
             {
                 "attempt": job.attempt,
-                "outcome": "timeout",
-                "reason": "termination could not be guaranteed",
+                "outcome": "timeout" if stopped else "error",
+                "reason": _TERMINATION_NOT_GUARANTEED,
                 "transient": False,
-                "diagnostic": "attempt leader was not reaped within the kill bound",
+                "diagnostic": failure,
             }
         )
-        return _finish_job(job, False, "termination could not be guaranteed", None, None), False
+        return _finish_job(job, False, _TERMINATION_NOT_GUARANTEED, None, None), False
     if payload is None:
         budget_spent = bool(cancelled and budget_spent)
         record = _stopped_record(job, cancelled, budget_spent)
@@ -1051,7 +1122,7 @@ def _copy_entries(mapping):
 
 
 def _capture_closures(fn):
-    """Thread-fallback snapshot of closure cells: bindings plus dict and object contents.
+    """Thread-fallback snapshot of closure cells: bindings plus dict, object, list, bytearray, and set contents.
 
     Unlike the forward delta merged after a forked attempt, this records enough
     to undo rebinding, added keys or attributes, and deletions.
@@ -1065,6 +1136,8 @@ def _capture_closures(fn):
             continue
         if isinstance(current, dict):
             saved.append((cell, current, "dict", _copy_entries(current)))
+        elif isinstance(current, (list, bytearray, set)):
+            saved.append((cell, current, "contents", copy.deepcopy(current)))
         elif hasattr(current, "__dict__") and not _skip_cell(current):
             saved.append((cell, current, "object", _copy_entries(vars(current))))
         else:
@@ -1096,6 +1169,16 @@ def _restore_object(obj, entries):
                 pass
 
 
+def _restore_contents(current, entries):
+    if _same(current, entries):
+        return
+    if isinstance(current, set):
+        current.clear()
+        current.update(entries)
+    else:
+        current[:] = entries
+
+
 def _restore_closures(saved):
     # Undoes what a failed or stopped attempt changed in closure state. A thread
     # that could not be stopped may still write closure cells after this
@@ -1115,6 +1198,8 @@ def _restore_closures(saved):
             _restore_dict(original, entries)
         elif kind == "object":
             _restore_object(original, entries)
+        elif kind == "contents":
+            _restore_contents(original, entries)
 
 
 def _run_thread_task(task_id, runner, evidence, key, task_timeout, max_attempts, backoff, cancel, deadline, cache_dir):
@@ -1276,9 +1361,9 @@ def execute(selected, registry, runners, evidence, options=None):
     process session on POSIX. The next attempt starts only after the previous
     process has been reaped. Exhausted retries and timeouts are terminal errors;
     callers must treat them as fail-closed. An expired run deadline
-    ("budget exhausted"), external cancellation ("cancelled"), and a fallback
-    thread that could not be stopped ("termination could not be guaranteed")
-    are terminal and never retried.
+    ("budget exhausted"), external cancellation ("cancelled"), and an attempt
+    whose leader, descendants, or fallback thread could not be proven stopped
+    ("termination could not be guaranteed") are terminal and never retried.
     """
     options = options or {}
     nodes = dag(selected, registry)
