@@ -55,6 +55,17 @@ def _alive(pid):
     return True
 
 
+def _running(pid):
+    """Like _alive, but a killed zombie still waiting for init to reap it counts as dead."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            return handle.read().rpartition(b")")[2].split()[0] != b"Z"
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return _alive(pid)
+
+
 class ExecutorCancellationTests(unittest.TestCase):
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp(prefix="cqa-cancel-"))
@@ -435,6 +446,48 @@ class ExecutorCancellationTests(unittest.TestCase):
             )
         self.assertTrue(result["ok"], result)
         self._wait_until_dead(int(pid_file.read_text(encoding="utf-8")))
+        time.sleep(max(0.0, started + 1.5 - time.monotonic()))
+        self.assertFalse(sentinel.exists())
+
+    def test_new_session_descendant_dies_when_the_runner_raises_system_exit(self):
+        sentinel = self.tmp / "system-exit-late"
+        pid_log = self.tmp / "system-exit-pids"
+        script = "import sys, time\ntime.sleep(1.0)\nopen(sys.argv[1], 'w').write('late')\n"
+        overlaps = []
+        real_fork = executor_module._fork_attempt
+
+        def sleeper_pids():
+            if not pid_log.exists():
+                return []
+            return [int(line) for line in pid_log.read_text(encoding="utf-8").split()]
+
+        def tracking_fork(*args):
+            overlaps.extend(pid for pid in sleeper_pids() if _running(pid))
+            return real_fork(*args)
+
+        def runner(_task, _store):
+            process = subprocess.Popen([sys.executable, "-c", script, str(sentinel)], start_new_session=True)
+            with pid_log.open("a", encoding="utf-8") as handle:
+                handle.write(f"{process.pid}\n")
+            raise SystemExit(3)
+
+        started = time.monotonic()
+        with warnings.catch_warnings(), mock.patch.object(executor_module, "_fork_attempt", tracking_fork):
+            warnings.simplefilter("ignore", ResourceWarning)
+            result = execute(
+                {"left"},
+                REGISTRY,
+                {"left": runner},
+                {},
+                {"concurrency": 1, "max_retries": 2, "retry_backoff_seconds": 0, "task_timeout_seconds": 10},
+            )
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertFalse(result["ok"])
+        pids = sleeper_pids()
+        self.assertEqual(len(pids), 2)
+        self.assertEqual(overlaps, [])
+        for pid in pids:
+            self._wait_until_dead(pid)
         time.sleep(max(0.0, started + 1.5 - time.monotonic()))
         self.assertFalse(sentinel.exists())
 
@@ -920,6 +973,53 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertEqual(closed, {"kept": 1})
         self.assertEqual(context.analyses, ["before"])
         self.assertEqual(evidence, {"findings": {}})
+
+    def test_fallback_restores_added_deleted_and_rebound_closure_state(self):
+        for mode in ("error", "stopped"):
+            with self.subTest(mode=mode):
+                self._fallback_closure_restore(mode)
+
+    def _fallback_closure_restore(self, mode):
+        class Context:
+            def __init__(self):
+                self.existing = "orig"
+
+        context = Context()
+        closed = {"kept": 1}
+        counter = 0
+        observed = []
+
+        def runner(_task, _store):
+            nonlocal counter
+            observed.append((hasattr(context, "added"), getattr(context, "existing", None), counter, dict(closed)))
+            context.added = True
+            del context.existing
+            counter = 99
+            closed["added"] = 1
+            del closed["kept"]
+            if len(observed) == 1:
+                if mode == "stopped":
+                    while True:
+                        time.sleep(0.01)
+                raise TransientFailure("retry me")
+            raise ValueError("deterministic")
+
+        with mock.patch.object(executor_module, "_isolated_processes", return_value=False):
+            result = execute(
+                {"left"},
+                REGISTRY,
+                {"left": runner},
+                {},
+                {"concurrency": 1, "max_retries": 2, "retry_backoff_seconds": 0, "task_timeout_seconds": 0.3},
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(len(result["tasks"][0]["attempts"]), 2)
+        original = (False, "orig", 0, {"kept": 1})
+        self.assertEqual(observed, [original, original])
+        self.assertFalse(hasattr(context, "added"))
+        self.assertEqual(context.existing, "orig")
+        self.assertEqual(counter, 0)
+        self.assertEqual(closed, {"kept": 1})
 
     def test_fallback_success_merges_isolated_evidence(self):
         evidence = {"findings": {"stale": 1, "kept": 2}}

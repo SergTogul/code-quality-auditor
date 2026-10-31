@@ -524,6 +524,7 @@ def _fork_attempt(runner, task_id, evidence, result_path):
     ready_read, ready_write = os.pipe()
     pid = os.fork()
     if pid == 0:
+        written = False
         try:
             os.close(ready_read)
             os.setsid()
@@ -533,12 +534,18 @@ def _fork_attempt(runner, task_id, evidence, result_path):
             os.write(ready_write, b"1")
             os.close(ready_write)
             _write_payload(result_path, _attempt_payload(runner, task_id, evidence))
+            written = True
+        except BaseException:  # noqa: BLE001 - SystemExit and friends still need the sweep below
+            pass
+        finally:
             # Once this leader exits, descendants in their own session are
-            # reparented and the parent can no longer find them.
-            _kill_descendants(os.getpid())
-            os._exit(0)
-        except BaseException:
-            os._exit(1)
+            # reparented and the parent can no longer find them, so the sweep
+            # runs on every exit path.
+            try:
+                _kill_descendants(os.getpid())
+            except BaseException:  # noqa: BLE001 - the child must still exit
+                pass
+            os._exit(0 if written else 1)
     os.close(ready_write)
     return pid, ready_read
 
@@ -1034,12 +1041,75 @@ def _isolated_copy(value):
         return copy.deepcopy(value)
 
 
-def _restore_closures(runner, before_cells):
+def _copy_entries(mapping):
+    return {key: (_snapshot(value) if _pickleable(value) else value) for key, value in mapping.items()}
+
+
+def _capture_closures(fn):
+    """Thread-fallback snapshot of closure cells: bindings plus dict and object contents.
+
+    Unlike the forward delta merged after a forked attempt, this records enough
+    to undo rebinding, added keys or attributes, and deletions.
+    """
+    saved = []
+    for cell in getattr(fn, "__closure__", None) or ():
+        try:
+            current = cell.cell_contents
+        except ValueError:
+            saved.append((cell, _MISSING, None, None))
+            continue
+        if isinstance(current, dict):
+            saved.append((cell, current, "dict", _copy_entries(current)))
+        elif hasattr(current, "__dict__") and not _skip_cell(current):
+            saved.append((cell, current, "object", _copy_entries(vars(current))))
+        else:
+            saved.append((cell, current, None, None))
+    return saved
+
+
+def _restore_dict(current, entries):
+    for key in [key for key in current if key not in entries]:
+        del current[key]
+    for key, value in entries.items():
+        if key not in current or not _same(current[key], value):
+            current[key] = value
+
+
+def _restore_object(obj, entries):
+    attributes = vars(obj)
+    for key in [key for key in attributes if key not in entries]:
+        if key != "lock" and _pickleable(attributes[key]):
+            try:
+                delattr(obj, key)
+            except AttributeError:
+                pass
+    for key, value in entries.items():
+        if key not in attributes or not _same(attributes[key], value):
+            try:
+                setattr(obj, key, value)
+            except AttributeError:
+                pass
+
+
+def _restore_closures(saved):
     # Undoes what a failed or stopped attempt changed in closure state. A thread
     # that could not be stopped may still write closure cells after this
     # restore; that race is accepted because the caller's evidence dict is
     # never handed to the thread and cannot be mutated by it.
-    _merge_closures(runner, _closure_delta(_export_closures(runner), before_cells))
+    for cell, original, kind, entries in saved:
+        try:
+            current = cell.cell_contents
+        except ValueError:
+            current = _MISSING
+        if current is not original:
+            if original is _MISSING:
+                del cell.cell_contents
+                continue
+            cell.cell_contents = original
+        if kind == "dict":
+            _restore_dict(original, entries)
+        elif kind == "object":
+            _restore_object(original, entries)
 
 
 def _run_thread_task(task_id, runner, evidence, key, task_timeout, max_attempts, backoff, cancel, deadline, cache_dir):
@@ -1058,7 +1128,7 @@ def _run_thread_task(task_id, runner, evidence, key, task_timeout, max_attempts,
             error = "cancelled" if cancel.is_set() else "budget exhausted"
             return {"task_id": task_id, "ok": False, "cached": False, "error": error, "attempts": records}
         try:
-            before_cells = _snapshot(_export_closures(runner))
+            before_cells = _capture_closures(runner)
             before_evidence = _isolated_copy(evidence)
             working = _isolated_copy(evidence)
         except Exception as exc:  # noqa: BLE001 - the attempt cannot be isolated
@@ -1077,7 +1147,7 @@ def _run_thread_task(task_id, runner, evidence, key, task_timeout, max_attempts,
             if isinstance(evidence, dict) and isinstance(working, dict):
                 _merge_evidence(evidence, _dict_delta(before_evidence, working))
         else:
-            _restore_closures(runner, before_cells)
+            _restore_closures(before_cells)
         if outcome["kind"] == "timeout":
             terminal = _thread_timeout_result(task_id, attempt, task_timeout, outcome, records)
             if terminal is not None:
