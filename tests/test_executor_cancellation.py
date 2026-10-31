@@ -312,6 +312,204 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertFalse(_alive(int(pid_file.read_text(encoding="utf-8"))))
         self.assertEqual(list(ran.iterdir()), [])
 
+    def _exited_job_with_payload(self, evidence, cache_dir, deadline_offset):
+        def runner(_task, _store):
+            return {"late": True}
+
+        job = executor_module._Job("left", runner, evidence, "late-key")
+        job.cache_dir = str(cache_dir)
+        descriptor, path = tempfile.mkstemp(prefix="payload-", dir=self.tmp)
+        os.close(descriptor)
+        executor_module._write_payload(
+            path,
+            {"status": "ok", "value": {"late": True}, "error": None, "evidence": {"late": True}, "cells": []},
+        )
+        pid = os.fork()
+        if pid == 0:
+            os._exit(0)
+        os.waitpid(pid, 0)
+        job.pid = pid
+        job.ready_read = None
+        job.group_ready = False
+        job.result_path = path
+        job.started = time.monotonic() - 1
+        job.deadline = time.monotonic() + deadline_offset
+        return job
+
+    def test_stop_condition_outranks_a_payload_from_an_exited_leader(self):
+        cases = (
+            ("timeout", -0.5, False, False, "timeout"),
+            ("cancel", 30, True, False, "cancelled"),
+            ("budget", 30, True, True, "budget exhausted"),
+        )
+        for name, offset, cancel_set, budget_spent, error in cases:
+            with self.subTest(name=name):
+                evidence = {}
+                cache_dir = self.tmp / f"cache-{name}"
+                job = self._exited_job_with_payload(evidence, cache_dir, offset)
+                cancel = threading.Event()
+                if cancel_set:
+                    cancel.set()
+                result, running = executor_module._poll_job(job, time.monotonic(), cancel, 1, 0, budget_spent)
+                self.assertFalse(running)
+                self.assertFalse(result["ok"])
+                self.assertEqual(result["error"], error)
+                self.assertNotIn("value", result)
+                self.assertEqual(evidence, {})
+                self.assertFalse((cache_dir / "late-key.json").exists())
+                self.assertFalse(Path(job.result_path).exists())
+
+        evidence = {}
+        cache_dir = self.tmp / "cache-control"
+        job = self._exited_job_with_payload(evidence, cache_dir, 30)
+        result, _running = executor_module._poll_job(job, time.monotonic(), threading.Event(), 1, 0)
+        self.assertTrue(result["ok"])
+        self.assertEqual(evidence, {"late": True})
+        self.assertTrue((cache_dir / "late-key.json").exists())
+
+    def test_new_session_descendants_die_when_the_attempt_times_out(self):
+        child_sentinel = self.tmp / "session-child-late"
+        grandchild_sentinel = self.tmp / "session-grandchild-late"
+        child_pid_file = self.tmp / "session-child-pid"
+        grandchild_pid_file = self.tmp / "session-grandchild-pid"
+        grandchild_script = "import sys, time\ntime.sleep(2.0)\nopen(sys.argv[1], 'w').write('late')\n"
+        child_script = textwrap.dedent(
+            """
+            import subprocess, sys, time
+            grandchild = subprocess.Popen([sys.executable, "-c", sys.argv[1], sys.argv[2]], start_new_session=True)
+            open(sys.argv[3], "w").write(str(grandchild.pid))
+            time.sleep(2.0)
+            open(sys.argv[4], "w").write("late")
+            """
+        )
+
+        def runner(_task, _store):
+            process = subprocess.Popen(
+                [sys.executable, "-c", child_script, grandchild_script, str(grandchild_sentinel), str(grandchild_pid_file), str(child_sentinel)],
+                start_new_session=True,
+            )
+            child_pid_file.write_text(str(process.pid), encoding="utf-8")
+            end = time.monotonic() + 5
+            while not grandchild_pid_file.exists() and time.monotonic() < end:
+                time.sleep(0.01)
+            time.sleep(30)
+            return {"ok": True}
+
+        started = time.monotonic()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            result = execute(
+                {"left"},
+                REGISTRY,
+                {"left": runner},
+                {},
+                {"concurrency": 1, "max_retries": 1, "task_timeout_seconds": 1.0},
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["tasks"][0]["error"], "timeout")
+        self._wait_until_dead(int(child_pid_file.read_text(encoding="utf-8")))
+        self._wait_until_dead(int(grandchild_pid_file.read_text(encoding="utf-8")))
+        time.sleep(max(0.0, started + 2.6 - time.monotonic()))
+        self.assertFalse(child_sentinel.exists())
+        self.assertFalse(grandchild_sentinel.exists())
+
+    def test_new_session_descendant_dies_when_the_attempt_leader_exits(self):
+        sentinel = self.tmp / "session-leader-exit-late"
+        pid_file = self.tmp / "session-leader-exit-pid"
+        script = "import sys, time\ntime.sleep(1.0)\nopen(sys.argv[1], 'w').write('late')\n"
+
+        def runner(_task, _store):
+            process = subprocess.Popen([sys.executable, "-c", script, str(sentinel)], start_new_session=True)
+            pid_file.write_text(str(process.pid), encoding="utf-8")
+            return {"ok": True}
+
+        started = time.monotonic()
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", ResourceWarning)
+            result = execute(
+                {"left"},
+                REGISTRY,
+                {"left": runner},
+                {},
+                {"concurrency": 1, "max_retries": 1, "task_timeout_seconds": 5},
+            )
+        self.assertTrue(result["ok"], result)
+        self._wait_until_dead(int(pid_file.read_text(encoding="utf-8")))
+        time.sleep(max(0.0, started + 1.5 - time.monotonic()))
+        self.assertFalse(sentinel.exists())
+
+    def test_unreaped_leader_is_terminal_and_publishes_nothing(self):
+        attempt_pids = []
+        real_fork = executor_module._fork_attempt
+
+        def tracking_fork(*args):
+            pid, ready = real_fork(*args)
+            attempt_pids.append(pid)
+            return pid, ready
+
+        def reap_later():
+            for pid in attempt_pids:
+                try:
+                    os.waitpid(pid, 0)
+                except ChildProcessError:
+                    pass
+
+        self.addCleanup(reap_later)
+
+        def sleepy(_task, store):
+            store["findings"]["leaked"] = True
+            time.sleep(30)
+            return {"late": True}
+
+        evidence = {"findings": {}}
+        cache_dir = self.tmp / "unreaped-cache"
+        with mock.patch.object(executor_module, "_fork_attempt", tracking_fork), mock.patch.object(executor_module, "_reap", return_value=False):
+            result = execute(
+                {"left"},
+                REGISTRY,
+                {"left": sleepy},
+                evidence,
+                {
+                    "concurrency": 1,
+                    "max_retries": 3,
+                    "retry_backoff_seconds": 0,
+                    "task_timeout_seconds": 0.2,
+                    "cache_dir": str(cache_dir),
+                    "fingerprint": lambda _task: "unreaped",
+                },
+            )
+        task = result["tasks"][0]
+        self.assertFalse(task["ok"])
+        self.assertEqual(task["error"], "termination could not be guaranteed")
+        self.assertEqual(len(task["attempts"]), 1)
+        self.assertFalse(task["attempts"][0]["transient"])
+        self.assertEqual(len(attempt_pids), 1)
+        self.assertNotIn("value", task)
+        self.assertEqual(evidence, {"findings": {}})
+        self.assertFalse((cache_dir / "unreaped.json").exists())
+
+    def test_queued_jobs_after_an_expired_deadline_report_budget_not_cancel(self):
+        ran = []
+
+        def runner(task_id, _store):
+            ran.append(task_id)
+            return {"ok": True}
+
+        for name, deadline, error, reason in (
+            ("expired", time.monotonic() - 1, "budget exhausted", "run budget exhausted"),
+            ("caller", time.monotonic() + 60, "cancelled", "cancelled"),
+        ):
+            with self.subTest(name=name):
+                cancel = threading.Event()
+                cancel.set()
+                job = executor_module._Job("left", runner, {}, "key")
+                results, failed = executor_module._run_processes([job], 1, 30, 2, 0, cancel, deadline, None, None)
+                self.assertEqual(failed, {"left"})
+                self.assertEqual(results["left"]["error"], error)
+                self.assertEqual(results["left"]["attempts"][0]["reason"], reason)
+                self.assertFalse(results["left"]["attempts"][0]["transient"])
+        self.assertEqual(ran, [])
+
     def test_cancel_event_stops_a_running_attempt_and_a_pending_one(self):
         marker = self.tmp / "ran"
         cancel = threading.Event()
@@ -652,6 +850,115 @@ class ExecutorCancellationTests(unittest.TestCase):
         self.assertEqual(ran, [])
         self.assertEqual(calls, [1])
         self.assertFalse(marker.exists())
+
+    def test_fallback_unterminated_thread_cannot_mutate_caller_evidence(self):
+        finished = threading.Event()
+        calls = []
+
+        def swallowing(_task, store):
+            calls.append(1)
+            store["leaked"] = 1
+            end = time.monotonic() + 1.0
+            while True:
+                try:
+                    while time.monotonic() < end:
+                        time.sleep(0.02)
+                    break
+                except BaseException:
+                    continue
+            store["leaked"] = 2
+            finished.set()
+            return {"late": True}
+
+        evidence = {"findings": {}}
+        cache_dir = self.tmp / "fallback-cache"
+        with mock.patch.object(executor_module, "_isolated_processes", return_value=False):
+            result = execute(
+                {"left"},
+                REGISTRY,
+                {"left": swallowing},
+                evidence,
+                {
+                    "concurrency": 1,
+                    "max_retries": 3,
+                    "retry_backoff_seconds": 0,
+                    "task_timeout_seconds": 0.1,
+                    "cache_dir": str(cache_dir),
+                    "fingerprint": lambda _task: "swallowing",
+                },
+            )
+        task = result["tasks"][0]
+        self.assertFalse(task["ok"])
+        self.assertEqual(task["error"], "termination could not be guaranteed")
+        self.assertEqual(len(task["attempts"]), 1)
+        self.assertEqual(calls, [1])
+        self.assertEqual(evidence, {"findings": {}})
+        self.assertTrue(finished.wait(5))
+        self.assertEqual(evidence, {"findings": {}})
+        self.assertFalse((cache_dir / "swallowing.json").exists())
+
+    def test_fallback_stopped_attempt_restores_closures_and_keeps_evidence(self):
+        closed = {"kept": 1}
+
+        class Context:
+            def __init__(self):
+                self.analyses = ["before"]
+
+        context = Context()
+
+        def partial(_task, store):
+            closed["leaked"] = True
+            context.analyses.append("partial")
+            store["findings"]["leaked"] = True
+            while True:
+                time.sleep(0.01)
+
+        evidence = {"findings": {}}
+        result = _run_thread_task("left", partial, evidence, None, 0.1, 1, 0, threading.Event(), None, None)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "timeout")
+        self.assertEqual(closed, {"kept": 1})
+        self.assertEqual(context.analyses, ["before"])
+        self.assertEqual(evidence, {"findings": {}})
+
+    def test_fallback_success_merges_isolated_evidence(self):
+        evidence = {"findings": {"stale": 1, "kept": 2}}
+
+        def edit(_task, store):
+            del store["findings"]["stale"]
+            store["findings"]["fresh"] = 3
+            return {"ok": True}
+
+        result = _run_thread_task("left", edit, evidence, None, 5, 1, 0, threading.Event(), None, None)
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(evidence, {"findings": {"kept": 2, "fresh": 3}})
+
+    def test_fallback_deadline_during_grace_is_terminal_budget(self):
+        calls = []
+
+        def slow_exit(_task, _store):
+            calls.append(1)
+            time.sleep(0.15)
+            return {"late": True}
+
+        started = time.monotonic()
+        result = _run_thread_task(
+            "left",
+            slow_exit,
+            {},
+            None,
+            0.05,
+            2,
+            0,
+            threading.Event(),
+            started + 0.10,
+            None,
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "budget exhausted")
+        self.assertEqual(len(result["attempts"]), 1)
+        self.assertEqual(result["attempts"][0]["reason"], "run budget exhausted")
+        self.assertEqual(calls, [1])
 
     def _timeout_only_execution(self, selected, ok_values=None):
         ok_values = ok_values or {}

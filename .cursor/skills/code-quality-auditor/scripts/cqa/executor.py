@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import pickle
 import select
 import signal
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -530,6 +533,9 @@ def _fork_attempt(runner, task_id, evidence, result_path):
             os.write(ready_write, b"1")
             os.close(ready_write)
             _write_payload(result_path, _attempt_payload(runner, task_id, evidence))
+            # Once this leader exits, descendants in their own session are
+            # reparented and the parent can no longer find them.
+            _kill_descendants(os.getpid())
             os._exit(0)
         except BaseException:
             os._exit(1)
@@ -550,19 +556,111 @@ def _group_ready(ready_read):
     return True
 
 
-def _signal_pid(pid, group_ready):
+def _signal_pid(pid, group_ready, sig=signal.SIGKILL):
     try:
         if group_ready:
-            os.killpg(pid, signal.SIGKILL)
+            os.killpg(pid, sig)
         else:
-            os.kill(pid, signal.SIGKILL)
+            os.kill(pid, sig)
     except ProcessLookupError:
         return
     except PermissionError:
         try:
-            os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
+            os.kill(pid, sig)
+        except OSError:
             return
+
+
+def _send(pid, sig, group=False):
+    try:
+        if group:
+            os.killpg(pid, sig)
+        else:
+            os.kill(pid, sig)
+    except OSError:
+        pass
+
+
+_TREE_ROUNDS = 5
+
+
+def _process_table():
+    """Return {pid: (ppid, pgid)} for visible processes, or {} when no listing is available."""
+    table = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        names = None
+    if names is not None:
+        for name in names:
+            if not name.isdigit():
+                continue
+            try:
+                with open(f"/proc/{name}/stat", "rb") as handle:
+                    data = handle.read()
+            except OSError:
+                continue
+            fields = data.rpartition(b")")[2].split()
+            if len(fields) >= 3:
+                table[int(name)] = (int(fields[1]), int(fields[2]))
+        if table:
+            return table
+    if sys.platform == "darwin":
+        try:
+            listing = subprocess.run(
+                ["/bin/ps", "-A", "-o", "pid=,ppid=,pgid="],
+                capture_output=True,
+                text=True,
+                timeout=2,
+                check=False,
+            ).stdout
+        except (OSError, subprocess.SubprocessError):
+            return {}
+        for line in listing.splitlines():
+            parts = line.split()
+            if len(parts) == 3 and all(part.isdigit() for part in parts):
+                table[int(parts[0])] = (int(parts[1]), int(parts[2]))
+    return table
+
+
+def _descendants(table, roots):
+    children = {}
+    for pid, (ppid, _pgid) in table.items():
+        children.setdefault(ppid, []).append(pid)
+    found = set()
+    stack = list(roots)
+    while stack:
+        for child in children.get(stack.pop(), ()):
+            if child not in found and child not in roots:
+                found.add(child)
+                stack.append(child)
+    return found
+
+
+def _kill_descendants(root):
+    """SIGKILL every live descendant of root, including ones in their own session.
+
+    Descendants are traced through parent links, so this must run before root
+    dies; afterwards they are reparented and untraceable. Each bounded round
+    stops what it finds, so a process that forks during the scan is caught by
+    the next round instead of racing the kill.
+    """
+    protected = {os.getpid(), 0, 1}
+    own_group = os.getpgrp()
+    found = {}
+    for _ in range(_TREE_ROUNDS):
+        table = _process_table()
+        fresh = _descendants(table, {root} | set(found)) - set(found) - protected
+        if not fresh:
+            break
+        for pid in fresh:
+            found[pid] = table[pid][1]
+            _send(pid, signal.SIGSTOP)
+    for pid, pgid in found.items():
+        if pgid == pid and pgid not in (own_group, root):
+            _send(pgid, signal.SIGKILL, group=True)
+        _send(pid, signal.SIGKILL)
+    return set(found)
 
 
 def _reap(pid, seconds=2):
@@ -649,14 +747,14 @@ def _finish_job(job, ok, error, value, cache_dir):
     }
 
 
-def _stopped_record(job, cancelled, budget_spent, reaped):
+def _stopped_record(job, cancelled, budget_spent):
     if budget_spent:
         return {
             "attempt": job.attempt,
             "outcome": "timeout",
             "reason": "run budget exhausted",
             "transient": False,
-            "diagnostic": "run deadline reached" if reaped else "attempt did not terminate",
+            "diagnostic": "run deadline reached",
         }
     if cancelled:
         return {
@@ -671,8 +769,8 @@ def _stopped_record(job, cancelled, budget_spent, reaped):
         "attempt": job.attempt,
         "outcome": "timeout",
         "reason": f"exceeded {limit}s",
-        "transient": reaped,
-        "diagnostic": f"elapsed>{limit}" if reaped else "attempt did not terminate",
+        "transient": True,
+        "diagnostic": f"elapsed>{limit}",
     }
 
 
@@ -688,20 +786,26 @@ def _poll_job(job, now, cancel, max_attempts, backoff, budget_spent=False):
         waited, _status = os.waitpid(job.pid, os.WNOHANG)
     except ChildProcessError:
         waited = job.pid
+    exited = waited == job.pid
     timed_out = now >= job.deadline
     cancelled = cancel.is_set()
-    if waited != job.pid and not timed_out and not cancelled:
+    if not exited and not timed_out and not cancelled:
         return None, True
-    killed = False
-    if waited != job.pid:
-        _signal_pid(job.pid, job.group_ready)
-        killed = True
-        reaped = _reap(job.pid)
-    else:
+    if exited:
         reaped = True
         if job.group_ready:
-            _signal_pid(job.pid, True)
-    payload = None if killed else _read_payload(job.result_path)
+            # The group id cannot be reused while any member is alive, so this
+            # cannot reach an unrelated process even though the leader is gone.
+            _send(job.pid, signal.SIGKILL, group=True)
+    else:
+        _signal_pid(job.pid, job.group_ready, signal.SIGSTOP)
+        _kill_descendants(job.pid)
+        _signal_pid(job.pid, job.group_ready)
+        reaped = _reap(job.pid)
+    # A stop condition outranks a payload the leader managed to write: a late
+    # result must not be merged into evidence or cached.
+    stopped = timed_out or cancelled
+    payload = None if stopped or not reaped else _read_payload(job.result_path)
     if payload and payload.get("status") == "ok":
         _apply_payload(job.runner, job.evidence, payload)
     _close_pipe(job.ready_read)
@@ -711,9 +815,20 @@ def _poll_job(job, now, cancel, max_attempts, backoff, budget_spent=False):
         except OSError:
             pass
     job.pid = None
-    if killed or payload is None:
+    if not reaped:
+        job.records.append(
+            {
+                "attempt": job.attempt,
+                "outcome": "timeout",
+                "reason": "termination could not be guaranteed",
+                "transient": False,
+                "diagnostic": "attempt leader was not reaped within the kill bound",
+            }
+        )
+        return _finish_job(job, False, "termination could not be guaranteed", None, None), False
+    if payload is None:
         budget_spent = bool(cancelled and budget_spent)
-        record = _stopped_record(job, cancelled, budget_spent, reaped)
+        record = _stopped_record(job, cancelled, budget_spent)
         job.records.append(record)
         if cancelled or not record["transient"] or job.attempt >= max_attempts:
             error = "budget exhausted" if budget_spent else ("cancelled" if cancelled else "timeout")
@@ -831,6 +946,10 @@ def _run_thread_attempt(runner, task_id, evidence, task_timeout, cancel, deadlin
             _raise_in_thread(worker)
             worker.join(_THREAD_QUIESCENCE_SECONDS)
         reaped = not worker.is_alive()
+        if reaped:
+            # A deadline or cancel that arrived during the grace period must
+            # not be reported as a retryable task timeout.
+            trigger = _thread_stop_trigger(cancel, time.monotonic(), timeout_at, deadline) or trigger
         return {
             "kind": "timeout",
             "trigger": trigger,
@@ -861,7 +980,7 @@ _THREAD_TRIGGER_DIAGNOSTIC = {
 
 
 def _thread_timeout_result(task_id, attempt, task_timeout, outcome, records):
-    """Return (terminal_result_or_none, retry). Budget and cancellation never retry."""
+    """Return a terminal result, or None when a plain task timeout may be retried."""
     trigger = outcome.get("trigger") or ("cancelled" if outcome.get("cancelled") else "timeout")
     if outcome.get("unterminated"):
         records.append(
@@ -908,6 +1027,21 @@ def _thread_backoff(seconds, cancel, deadline):
     cancel.wait(seconds)
 
 
+def _isolated_copy(value):
+    try:
+        return _snapshot(value)
+    except Exception:  # noqa: BLE001 - fall back to a structural copy
+        return copy.deepcopy(value)
+
+
+def _restore_closures(runner, before_cells):
+    # Undoes what a failed or stopped attempt changed in closure state. A thread
+    # that could not be stopped may still write closure cells after this
+    # restore; that race is accepted because the caller's evidence dict is
+    # never handed to the thread and cannot be mutated by it.
+    _merge_closures(runner, _closure_delta(_export_closures(runner), before_cells))
+
+
 def _run_thread_task(task_id, runner, evidence, key, task_timeout, max_attempts, backoff, cancel, deadline, cache_dir):
     records = []
     for attempt in range(1, max_attempts + 1):
@@ -923,7 +1057,27 @@ def _run_thread_task(task_id, runner, evidence, key, task_timeout, max_attempts,
             )
             error = "cancelled" if cancel.is_set() else "budget exhausted"
             return {"task_id": task_id, "ok": False, "cached": False, "error": error, "attempts": records}
-        outcome = _run_thread_attempt(runner, task_id, evidence, task_timeout, cancel, deadline)
+        try:
+            before_cells = _snapshot(_export_closures(runner))
+            before_evidence = _isolated_copy(evidence)
+            working = _isolated_copy(evidence)
+        except Exception as exc:  # noqa: BLE001 - the attempt cannot be isolated
+            records.append(
+                {
+                    "attempt": attempt,
+                    "outcome": "error",
+                    "reason": "evidence could not be isolated",
+                    "transient": False,
+                    "diagnostic": exc.__class__.__name__,
+                }
+            )
+            return {"task_id": task_id, "ok": False, "cached": False, "error": "evidence could not be isolated", "attempts": records}
+        outcome = _run_thread_attempt(runner, task_id, working, task_timeout, cancel, deadline)
+        if outcome["kind"] == "ok":
+            if isinstance(evidence, dict) and isinstance(working, dict):
+                _merge_evidence(evidence, _dict_delta(before_evidence, working))
+        else:
+            _restore_closures(runner, before_cells)
         if outcome["kind"] == "timeout":
             terminal = _thread_timeout_result(task_id, attempt, task_timeout, outcome, records)
             if terminal is not None:
@@ -990,9 +1144,15 @@ def _run_processes(jobs, concurrency, task_timeout, max_attempts, backoff, cance
         )
         store(job, _finish_job(job, False, "budget exhausted" if budget_spent else "cancelled", None, None))
 
+    caller_cancelled = False
     while queue or delayed or inflight:
         now = time.monotonic()
-        if deadline is not None and now > deadline and not cancel.is_set():
+        expired = deadline is not None and now > deadline
+        if cancel.is_set() and not expired and not budget_spent:
+            caller_cancelled = True
+        # execute() may already have set cancel because the deadline passed
+        # while it built this layer; that is still an exhausted budget.
+        if expired and not caller_cancelled:
             budget_spent = True
             cancel.set()
         if cancel.is_set() and not inflight:
