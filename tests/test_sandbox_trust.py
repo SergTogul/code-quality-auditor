@@ -151,13 +151,15 @@ class SandboxTrustTests(unittest.TestCase):
         marker = self.tmp / "payload-ran"
         payload = self.tmp / "payload"
         _write_executable(payload, f"#!/bin/sh\n: > {marker}\n")
+        work = self.tmp / "work"
+        work.mkdir()
         failures = {
             "status 71": (71, "", ""),
             "sandbox_apply": (1, "", "sandbox-exec: sandbox_apply: Operation not permitted"),
             "silent signal": (-6, "", ""),
         }
         launchers = {
-            "run_contained": lambda log: run_contained([str(payload)], self.repo, log, write_path=self.tmp),
+            "run_contained": lambda log: run_contained([str(payload)], self.repo, log, write_path=work),
             "run_tool": lambda log: run_tool([str(payload)], self.repo, log),
         }
         for failure, (code, stdout, stderr) in failures.items():
@@ -291,7 +293,7 @@ class SandboxTrustTests(unittest.TestCase):
         sibling = home / "cqa-allowlist-sibling.txt"
         sibling.write_text("outside", encoding="utf-8")
         with mock.patch.object(Path, "home", return_value=home):
-            profile = _profile([str(repo)], str(repo))
+            profile = _profile([str(repo)], str(repo), repo)
         self.assertNotIn("(allow default)", profile)
         self.assertEqual(_unfiltered_file_allows(profile), [])
         self.assertFalse(_read_allowed(profile, "/etc/passwd"))
@@ -315,7 +317,7 @@ class SandboxTrustTests(unittest.TestCase):
         private = home / "private-note"
         private.write_text("private", encoding="utf-8")
         with mock.patch.object(Path, "home", return_value=home):
-            profile = _profile([str(home), str(home / ".ssh"), str(home / ".config" / "gh")], str(home / ".ssh"))
+            profile = _profile([str(home), str(home / ".ssh"), str(home / ".config" / "gh")], str(home / ".ssh"), self.repo)
         self.assertFalse(_read_allowed(profile, private))
         self.assertFalse(_read_allowed(profile, home / ".ssh" / "id_ed25519"))
         self.assertFalse(_read_allowed(profile, home / ".config" / "gh" / "hosts.yml"))
@@ -327,7 +329,7 @@ class SandboxTrustTests(unittest.TestCase):
     def test_profile_has_no_unfiltered_file_rules_and_scopes_writes(self):
         work = self.tmp / "work"
         work.mkdir()
-        profile = _profile([str(self.repo)], str(work))
+        profile = _profile([str(self.repo)], str(work), self.repo)
         self.assertEqual(_unfiltered_file_allows(profile), [])
         self.assertEqual(_write_roots(profile), [work])
         self.assertTrue(_allowed(profile, "file-write-data", work / "out.txt"))
@@ -335,12 +337,12 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertFalse(_allowed(profile, "file-write-data", self.repo / "app.py"))
         self.assertFalse(_allowed(profile, "file-write-data", self.tmp / "sibling.txt"))
         self.assertFalse(_allowed(profile, "file-write-data", "/dev/null"))
-        no_write = _profile([str(self.repo)], None)
+        no_write = _profile([str(self.repo)], None, self.repo)
         self.assertEqual(_write_roots(no_write), [])
         self.assertEqual(_unfiltered_file_allows(no_write), [])
 
     def test_profile_denies_network_and_limits_process_rules(self):
-        profile = _profile([str(self.repo)], str(self.repo))
+        profile = _profile([str(self.repo)], str(self.repo), self.repo)
         lines = [line.strip() for line in profile.splitlines() if line.strip()]
         self.assertIn("(deny network*)", lines)
         self.assertFalse([line for line in lines if line.startswith("(allow network")])
@@ -352,7 +354,7 @@ class SandboxTrustTests(unittest.TestCase):
 
     def test_profile_uses_literal_device_rules_and_reviewed_roots(self):
         self.assertEqual(security._SYSTEM_READ_ROOTS, ("/usr", "/bin", "/sbin", "/System", "/Library/Developer", "/opt/homebrew"))
-        profile = _profile([str(self.repo)], None)
+        profile = _profile([str(self.repo)], None, self.repo)
         for device in ("/dev/null", "/dev/random", "/dev/urandom"):
             self.assertIn(f'(allow file-read* (literal "{device}"))', profile)
             self.assertTrue(_read_allowed(profile, device))
@@ -368,7 +370,7 @@ class SandboxTrustTests(unittest.TestCase):
         work = Path(tempfile.mkdtemp(prefix="cqa-scratch-")).resolve()
         self.addCleanup(__import__("shutil").rmtree, work, True)
         shared = Path(tempfile.gettempdir()).resolve()
-        profile = _profile([str(self.repo), str(shared), "/tmp", "/var/tmp"], str(work))
+        profile = _profile([str(self.repo), str(shared), "/tmp", "/var/tmp"], str(work), self.repo)
         self.assertTrue(_read_allowed(profile, work / "scratch.txt"))
         self.assertFalse(_read_allowed(profile, shared / "cqa-unrelated-file"))
         for raw in ("/tmp/cqa-unrelated", "/private/tmp/cqa-unrelated", "/var/tmp/cqa-unrelated", "/private/var/folders/ab/T/cqa-unrelated"):
@@ -589,18 +591,82 @@ class SandboxTrustTests(unittest.TestCase):
 
     def test_broad_or_missing_write_path_is_refused_before_launch(self):
         self._accept_fake_sandbox()
-        for write_path in ("/", str(Path.home()), tempfile.gettempdir(), str(self.tmp / "missing")):
+        (self.repo / "build").mkdir()
+        refused = ["/", str(Path.home()), tempfile.gettempdir(), str(self.tmp / "missing"), str(self.repo), str(self.repo / "build"), str(self.tmp)]
+        refused.extend(path for path in ("/etc", "/usr", "/Library") if Path(path).is_dir())
+        for write_path in refused:
             with self.subTest(write_path=write_path):
                 log = self._log()
-                with mock.patch("cqa.security._run_process") as runner:
+                calls = []
+                with mock.patch("cqa.security._run_process", side_effect=lambda *args, **kwargs: calls.append(args)):
                     with self.assertRaises(PermissionError):
-                        run_contained(["/usr/bin/true"], self.repo, log, write_path=write_path)
-                    runner.assert_not_called()
+                        run_contained(["/usr/bin/env"], self.repo, log, write_path=write_path)
+                self.assertEqual(calls, [])
+                self.assertFalse(any(item["outcome"] == "started" for item in log.commands))
                 self.assertTrue(any(item["operation"] == "containment" and "write path" in item["detail"] for item in log.denied))
-                self.assertEqual(_write_roots(_profile([str(self.repo)], write_path)), [])
+                self.assertEqual(_write_roots(_profile([str(self.repo)], write_path, self.repo)), [])
+                wrapped = security._contained_command(["/usr/bin/true"], self.repo, write_path)
+                self.assertEqual(_write_roots(wrapped[2]), [])
         child = Path(tempfile.mkdtemp(prefix="cqa-tool-")).resolve()
         self.addCleanup(__import__("shutil").rmtree, child, True)
-        self.assertEqual(_write_roots(_profile([str(self.repo)], str(child))), [child])
+        self.assertEqual(_write_roots(_profile([str(self.repo)], str(child), self.repo)), [child])
+        completed = run_contained(["/usr/bin/env"], self.repo, self._log(), timeout=10, write_path=child)
+        self.assertEqual(dict(line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line)["TMPDIR"], str(child))
+
+    def test_private_scratch_is_accepted_when_the_repository_is_under_temp(self):
+        self.assertIn(Path(tempfile.gettempdir()).resolve(), self.repo.parents)
+        child = Path(tempfile.mkdtemp(prefix="cqa-runner-")).resolve()
+        self.addCleanup(__import__("shutil").rmtree, child, True)
+        self.assertTrue(security._writable_scratch(child, self.repo))
+        nested = Path(tempfile.mkdtemp(prefix="cqa-runner-", dir=self.repo)).resolve()
+        self.assertFalse(security._writable_scratch(nested, self.repo))
+
+    def test_git_read_bounds_output_and_logs_no_child_output(self):
+        sentinel = "cqa-git-sentinel-" + os.urandom(6).hex()
+        fake_dir = self.tmp / "git-bin"
+        fake_dir.mkdir()
+        _write_executable(fake_dir / "git", f"#!/bin/sh\nwhile :; do echo {sentinel}; echo {sentinel} >&2; done\n")
+        os.environ["PATH"] = str(fake_dir) + os.pathsep + os.environ.get("PATH", "")
+        log = self._log()
+        started = time.monotonic()
+        self.assertIsNone(security.git_read(self.repo, ["log"], log, timeout=10, limit=4096))
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertNotIn(sentinel, json.dumps({"denied": log.denied, "commands": log.commands}))
+        self.assertTrue(any("output exceeded" in item["detail"] for item in log.commands))
+        _write_executable(fake_dir / "git", f"#!/bin/sh\necho {sentinel}\necho {sentinel} >&2\nsleep 30\n")
+        log = self._log()
+        self.assertIsNone(security.git_read(self.repo, ["log"], log, timeout=1, limit=4096))
+        self.assertNotIn(sentinel, json.dumps({"denied": log.denied, "commands": log.commands}))
+        self.assertTrue(any(item["outcome"] == "timeout" for item in log.commands))
+        _write_executable(fake_dir / "git", "#!/bin/sh\nprintf 'abc\\n'\n")
+        completed = security.git_read(self.repo, ["rev-parse", "HEAD"], self._log())
+        self.assertEqual(completed.stdout, b"abc\n")
+
+    def test_install_analyzer_bounds_output_and_logs_no_child_output(self):
+        import hashlib
+
+        sentinel = "cqa-install-sentinel-" + os.urandom(6).hex()
+        artifact = self.tmp / "tool.whl"
+        artifact.write_bytes(b"not a real wheel")
+        digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        tool = {"id": "fake", "version_constraint": "*"}
+        chatty = [sys.executable, "-c", f"import sys\nwhile True:\n    sys.stderr.write({sentinel!r} * 100)\n"]
+        slow = [sys.executable, "-c", f"import sys, time\nsys.stderr.write({sentinel!r})\nsys.stderr.flush()\ntime.sleep(30)\n"]
+        failing = [sys.executable, "-c", f"import sys\nsys.stderr.write({sentinel!r})\nsys.exit(3)\n"]
+        real = security._run_process
+        for name, command, kwargs, exit_code in (("overflow", chatty, {"limit": 4096}, None), ("timeout", slow, {"timeout": 1}, None), ("failure", failing, {}, 3)):
+            with self.subTest(case=name):
+                log = ExecutionLog()
+
+                def run(_command, cwd, env, timeout, limit=security._OUTPUT_LIMIT, text=True, command=command):
+                    return real(command, cwd, env, timeout, limit=limit, text=text)
+
+                with mock.patch("cqa.security._run_process", side_effect=run):
+                    result = security.install_analyzer(tool, approve=True, artifact=artifact, expected_sha256=digest, log=log, execute=True, **kwargs)
+                self.assertEqual(result["status"], "failed")
+                self.assertFalse(result["installed"])
+                self.assertEqual(result["exit_code"], exit_code)
+                self.assertNotIn(sentinel, json.dumps({"result": result, "denied": log.denied, "commands": log.commands}, default=str))
 
     def test_repository_symlink_to_a_host_binary_is_not_a_host_analyzer(self):
         self._accept_fake_sandbox()

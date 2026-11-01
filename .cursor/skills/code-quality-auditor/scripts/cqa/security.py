@@ -260,7 +260,7 @@ def _decode(chunks):
     return text.replace("\r\n", "\n").replace("\r", "\n")
 
 
-def _run_process(command, cwd, env, timeout, limit=_OUTPUT_LIMIT):
+def _run_process(command, cwd, env, timeout, limit=_OUTPUT_LIMIT, text=True):
     """Run a command in its own session with bounded output. Timeout or overflow kills the whole tree.
 
     Neither exception carries the child's output.
@@ -309,7 +309,8 @@ def _run_process(command, cwd, env, timeout, limit=_OUTPUT_LIMIT):
         raise subprocess.TimeoutExpired(command, timeout)
     if failure == "overflow":
         raise OutputLimitExceeded(f"output exceeded {limit} bytes on one stream; the process was killed and its output discarded")
-    return subprocess.CompletedProcess(command, process.returncode, _decode(streams[process.stdout]), _decode(streams[process.stderr]))
+    decode = _decode if text else b"".join
+    return subprocess.CompletedProcess(command, process.returncode, decode(streams[process.stdout]), decode(streams[process.stderr]))
 
 
 _PLATFORM_SANDBOX = {"darwin": "/usr/bin/sandbox-exec"}
@@ -441,8 +442,10 @@ def _policy_probe(base):
     """Run the production profile on synthetic files. Returns a failure reason, or None when every check holds."""
     allowed = base / "allowed"
     denied = base / "denied"
+    root = base / "root"
     allowed.mkdir()
     denied.mkdir()
+    root.mkdir()
     expected = secrets.token_hex(16).encode()
     sentinel = secrets.token_hex(16).encode()
     (allowed / "input").write_bytes(expected)
@@ -471,7 +474,7 @@ def _policy_probe(base):
         scratch = str(allowed)
         env = _sanitize_env({"CQA_PROBE_PORT": port, "TMPDIR": scratch, "TMP": scratch, "TEMP": scratch})
         try:
-            completed = _run_process(_contained_command(command, scratch, scratch), scratch, env, _PROBE_TIMEOUT)
+            completed = _run_process(_contained_command(command, str(root), scratch), str(root), env, _PROBE_TIMEOUT)
         except subprocess.TimeoutExpired:
             return "the containment probe timed out"
         except OutputLimitExceeded:
@@ -571,20 +574,28 @@ def _too_broad(path, protected):
     return any(path == root or path in root.parents for root in protected)
 
 
-def _writable_scratch(write_path):
+def _writable_scratch(write_path, cwd):
+    """A write path must be a private directory below the system temp root, apart from the audit tree."""
     path = Path(write_path).resolve()
-    return path.is_dir() and not _too_broad(path, _protected_roots())
+    temp = Path(tempfile.gettempdir()).resolve()
+    root = Path(cwd).resolve()
+    if not path.is_dir() or _too_broad(path, _protected_roots()) or temp not in path.parents:
+        return False
+    return not (path == root or root in path.parents or path in root.parents)
 
 
-def _profile(read_paths, write_path):
+def _profile(read_paths, write_path, cwd):
     """Deny by default and grant only scoped rules.
 
     No file rule is unfiltered. Reads cover the reviewed system roots, the device
-    files, and the command's own inputs, including the write path. Writes cover
-    only the write path. User roots are denied before the command's inputs are
-    re-opened, and credential directories are denied last. If seatbelt cannot
-    launch under this profile, probe_sandbox reports containment unavailable.
+    files, and the command's own inputs, including an accepted write path. Writes
+    cover only a write path that _writable_scratch accepts for cwd. User roots are
+    denied before the command's inputs are re-opened, and credential directories
+    are denied last. If seatbelt cannot launch under this profile, probe_sandbox
+    reports containment unavailable.
     """
+    if write_path and not _writable_scratch(write_path, cwd):
+        write_path = None
     user_roots = _user_roots()
     protected = _protected_roots()
     required = []
@@ -608,7 +619,7 @@ def _profile(read_paths, write_path):
     user_denies = "\n".join(_rules("deny", _READ_OPERATIONS, root) for root in user_roots)
     home = Path.home().resolve()
     secret_denies = "\n".join(_rules("deny", (*_READ_OPERATIONS, "file-write*"), home / name) for name in _SECRET_DIRS)
-    write = _rules("allow", ("file-write*",), Path(write_path).resolve()) if write_path and _writable_scratch(write_path) else ""
+    write = _rules("allow", ("file-write*",), Path(write_path).resolve()) if write_path else ""
     return f"""(version 1)
 (deny default)
 (deny network*)
@@ -635,7 +646,7 @@ def _contained_command(command, cwd, write_path):
         if executable.is_file():
             command[0] = str(executable.resolve())
     resolved_write = str(Path(write_path).resolve()) if write_path else None
-    profile = _profile(_command_read_paths(cwd, command), resolved_write)
+    profile = _profile(_command_read_paths(cwd, command), resolved_write, cwd)
     return _sandbox_command(profile, command)
 
 
@@ -654,8 +665,8 @@ def _run_sandboxed(command, cwd, log, timeout, write_path, env=None):
     if not ok:
         log.deny("containment", detail)
         raise PermissionError(detail)
-    if write_path and not _writable_scratch(write_path):
-        detail = "the write path is missing or too broad; the command was not run"
+    if write_path and not _writable_scratch(write_path, cwd):
+        detail = "the write path is not a private temporary directory outside the audit root; the command was not run"
         log.deny("containment", detail)
         raise PermissionError(detail)
     run_env = _sanitize_env(env)
@@ -713,7 +724,7 @@ def run_tool(command, cwd, log, timeout=60):
         shutil.rmtree(scratch, ignore_errors=True)
 
 
-def git_read(repo, args, log, timeout=20):
+def git_read(repo, args, log, timeout=20, limit=_OUTPUT_LIMIT):
     command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=", "-c", "protocol.allow=never", "--no-optional-locks"]
     for alias in GIT_ALIASES:
         command.extend(["-c", f"alias.{alias}="])
@@ -724,9 +735,15 @@ def git_read(repo, args, log, timeout=20):
     env["GIT_TERMINAL_PROMPT"] = "0"
     log.record(command, "started")
     try:
-        completed = subprocess.run(command, cwd=repo, capture_output=True, timeout=timeout, check=False, env=env)
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        log.record(command, "error", str(exc))
+        completed = _run_process(command, repo, env, timeout, limit=limit, text=False)
+    except subprocess.TimeoutExpired:
+        log.record(command, "timeout", f"timed out after {timeout} seconds; output was discarded")
+        return None
+    except OutputLimitExceeded:
+        log.record(command, "error", "output exceeded the limit; the process was killed and its output discarded")
+        return None
+    except OSError as exc:
+        log.record(command, "error", f"git could not start: {exc.strerror or type(exc).__name__}")
         return None
     log.record(command, f"exit {completed.returncode}")
     if completed.returncode != 0:
@@ -749,7 +766,7 @@ def install_skill(target, source, approve=False, log=None):
     return {"status": "installed", "installed": True, "path": str(destination)}
 
 
-def install_analyzer(tool, approve=False, artifact=None, expected_sha256=None, log=None, execute=False):
+def install_analyzer(tool, approve=False, artifact=None, expected_sha256=None, log=None, execute=False, timeout=600, limit=_OUTPUT_LIMIT):
     """Record an approved install plan. A download is never implied by the registry."""
     log = log or ExecutionLog()
     plan = {
@@ -777,8 +794,13 @@ def install_analyzer(tool, approve=False, artifact=None, expected_sha256=None, l
         return {"status": "verified", "installed": False, "plan": plan, "message": "Artifact verified. Execution of the installer was not requested."}
     command = [sys.executable, "-m", "pip", "install", "--no-index", str(artifact)]
     log.record(command, "started")
-    completed = subprocess.run(command, capture_output=True, text=True, check=False)
-    log.record(command, f"exit {completed.returncode}", completed.stderr[-500:])
+    try:
+        completed = _run_process(command, None, None, timeout, limit=limit)
+    except (OSError, subprocess.TimeoutExpired, OutputLimitExceeded) as exc:
+        reason = {subprocess.TimeoutExpired: "timed out", OutputLimitExceeded: "exceeded the output limit"}.get(type(exc), "could not start")
+        log.record(command, "error", f"the installer {reason}; it was killed and its output discarded")
+        return {"status": "failed", "installed": False, "plan": plan, "exit_code": None, "message": f"the installer {reason}"}
+    log.record(command, f"exit {completed.returncode}")
     return {
         "status": "installed" if completed.returncode == 0 else "failed",
         "installed": completed.returncode == 0,
