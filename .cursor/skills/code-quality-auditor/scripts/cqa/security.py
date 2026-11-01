@@ -526,18 +526,20 @@ def _command_read_paths(cwd, command):
     return [str(root)] if root.is_dir() else []
 
 
-# Reviewed runtime roots. /etc, /var, /opt, /Library outside Developer, /dev,
-# shared temporary roots, /Users, and /home are intentionally absent.
+# Reviewed runtime roots. /etc, /var, /opt, /Library outside Developer, /System
+# outside Library, /dev, shared temporary roots, /Users, and /home are intentionally absent.
 _SYSTEM_READ_ROOTS = (
     "/usr",
     "/bin",
     "/sbin",
-    "/System",
+    "/System/Library",
     "/Library/Developer",
     "/opt/homebrew",
 )
 _DEVICE_FILES = ("/dev/null", "/dev/random", "/dev/urandom")
 _SHARED_TEMP_ROOTS = ("/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", "/var/folders", "/private/var/folders")
+# The macOS Data volume holds a second path to every user home, /private, and shared temporary storage.
+_ALIAS_ROOTS = ("/System/Volumes/Data",)
 _READ_OPERATIONS = ("file-read*", "file-read-metadata", "file-map-executable")
 
 
@@ -556,7 +558,7 @@ def _user_roots():
 
 
 def _protected_roots():
-    """Roots whose contents are unrelated to any one command: user homes and shared temporary storage."""
+    """Roots whose contents are unrelated to any one command: user homes, shared temporary storage, and volumes that alias them."""
     roots = _user_roots()
     roots.append(Path.home().resolve())
     roots.append(Path(tempfile.gettempdir()).resolve())
@@ -564,11 +566,16 @@ def _protected_roots():
         path = Path(raw)
         if path.exists():
             roots.append(path.resolve())
+    for raw in _ALIAS_ROOTS:
+        path = Path(raw)
+        roots.append(path)
+        if path.exists():
+            roots.append(path.resolve())
     return roots
 
 
 def _too_broad(path, protected):
-    """Allowing `/`, a home, a shared temporary root, or any ancestor of one would undo the read closure."""
+    """Allowing `/`, a home, a shared temporary root, a volume that aliases them, or any ancestor of one would undo the read closure."""
     if path == Path("/"):
         return True
     return any(path == root or path in root.parents for root in protected)

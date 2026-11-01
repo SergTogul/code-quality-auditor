@@ -353,7 +353,7 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertFalse([line for line in lines if line.startswith("(allow system-socket")])
 
     def test_profile_uses_literal_device_rules_and_reviewed_roots(self):
-        self.assertEqual(security._SYSTEM_READ_ROOTS, ("/usr", "/bin", "/sbin", "/System", "/Library/Developer", "/opt/homebrew"))
+        self.assertEqual(security._SYSTEM_READ_ROOTS, ("/usr", "/bin", "/sbin", "/System/Library", "/Library/Developer", "/opt/homebrew"))
         profile = _profile([str(self.repo)], None, self.repo)
         for device in ("/dev/null", "/dev/random", "/dev/urandom"):
             self.assertIn(f'(allow file-read* (literal "{device}"))', profile)
@@ -365,6 +365,27 @@ class SandboxTrustTests(unittest.TestCase):
         for root in ("/usr", "/bin", "/sbin"):
             if Path(root).exists():
                 self.assertTrue(_read_allowed(profile, Path(root).resolve() / "cqa-tool"), root)
+
+    def test_profile_never_opens_the_macos_data_volume(self):
+        """/System/Volumes/Data is a second path to every user home and to /private on modern macOS."""
+        data = Path("/System/Volumes/Data")
+        for raw in security._SYSTEM_READ_ROOTS:
+            root = Path(raw)
+            self.assertFalse(root == data or root in data.parents, raw)
+        protected = security._protected_roots()
+        for broad in (data, data.parent, Path("/System"), Path("/")):
+            self.assertTrue(security._too_broad(broad, protected), broad)
+        repo = data / "Projects" / "cqa-repo"
+        self.assertFalse(security._too_broad(repo, protected))
+        requested = [str(data), str(data.parent), "/System", str(repo)]
+        with mock.patch("cqa.security._existing_reads", return_value=requested):
+            profile = _profile(requested, None, self.repo)
+        self.assertEqual(_unfiltered_file_allows(profile), [])
+        self.assertTrue(_read_allowed(profile, repo / "app.cpp"))
+        for raw in ("Users/someone/.ssh/id_ed25519", "private/etc/master.passwd", "private/var/folders/ab/T/cqa-unrelated", "Projects/cqa-sibling/secret.txt"):
+            self.assertFalse(_read_allowed(profile, data / raw), raw)
+        self.assertNotIn('(subpath "/System")', profile)
+        self.assertNotIn(f'(subpath "{data}")', profile)
 
     def test_profile_denies_shared_temporary_storage(self):
         work = Path(tempfile.mkdtemp(prefix="cqa-scratch-")).resolve()
