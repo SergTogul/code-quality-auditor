@@ -237,8 +237,9 @@ class SandboxTrustTests(unittest.TestCase):
 
         work = Path(tempfile.mkdtemp(prefix="cqa-alias-"))
         self.addCleanup(lambda: __import__("shutil").rmtree(work, ignore_errors=True))
-        os.environ["HOME"] = str(work / "home")
-        profile = _profile([str(work)], str(work), allow_temp_writes=True)
+        home = work / "home"
+        with mock.patch.dict(os.environ, {"HOME": str(home)}):
+            profile = _profile([str(work)], str(work), allow_temp_writes=True)
         work_aliases = _seatbelt_aliases(work)
         self.assertGreaterEqual(len(work_aliases), 2)
         for alias in work_aliases:
@@ -255,7 +256,7 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertIn('(allow file-read-metadata (literal "/tmp"))', profile)
 
         visible = [alias / "visible.txt" for alias in work_aliases]
-        secrets = _seatbelt_aliases(work / "home" / ".ssh" / "id_ed25519")
+        secrets = _seatbelt_aliases(home / ".ssh" / "id_ed25519")
         self.assertGreaterEqual(len(secrets), 2)
         closed = [
             *secrets,
