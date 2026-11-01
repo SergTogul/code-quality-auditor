@@ -391,12 +391,22 @@ def _compile_toolchain_grants(link, target):
 
 
 def _xcode_select_grants():
-    """Paths a sandboxed clang/xcrun needs in order to honor xcode-select."""
+    """Paths a sandboxed clang/xcrun needs in order to honor xcode-select.
+
+    Current macOS reads ``/var/select/developer_dir``. Older installs use
+    ``/var/db/xcode_select_link``. Both are granted only as that symlink plus
+    the selected developer bundle.
+    """
     if sys.platform != "darwin":
         return [], []
     reads = []
     metadata = []
-    for raw in ("/var/db/xcode_select_link", "/private/var/db/xcode_select_link"):
+    for raw in (
+        "/var/select/developer_dir",
+        "/private/var/select/developer_dir",
+        "/var/db/xcode_select_link",
+        "/private/var/db/xcode_select_link",
+    ):
         link = Path(raw)
         if not (link.is_symlink() or link.exists()):
             continue

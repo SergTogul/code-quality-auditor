@@ -299,6 +299,18 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertTrue(_read_allowed(profile, "/var/db", "file-read-metadata"))
         self.assertFalse(_read_allowed(profile, "/var/db", "file-read*"))
 
+        select = Path("/var/select/developer_dir")
+        select_reads, select_meta = _compile_toolchain_grants(select, target)
+        self.assertEqual(select_reads, [select, Path("/Applications/Xcode.app")])
+        self.assertIn(Path("/var/select"), select_meta)
+        self.assertNotIn(Path("/var/select"), select_reads)
+        select_profile = _profile([], None, extra_reads=select_reads, metadata_literals=select_meta)
+        self.assertIn('(allow file-read* (subpath "/var/select/developer_dir"))', select_profile)
+        self.assertIn('(allow file-read-metadata (literal "/var/select"))', select_profile)
+        self.assertNotIn('(allow file-read* (subpath "/var/select"))', select_profile)
+        self.assertFalse(_read_allowed(select_profile, "/var/select/other", "file-read*"))
+        self.assertFalse(_read_allowed(select_profile, "/var/select/other", "file-read-metadata"))
+
     @requires_macos_sandbox
     def test_contained_command_cannot_read_home_secrets(self):
         secret_dir = Path.home() / ".ssh"
