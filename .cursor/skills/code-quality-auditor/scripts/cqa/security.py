@@ -316,6 +316,11 @@ def _profile(read_paths, write_path, allow_temp_writes=False):
     `(allow file-read*)` stays first. The next rule denies `/`, and later rules
     re-open system roots plus the command's own inputs. Credential directories
     are denied last.
+
+    On macOS 15+ dyld reads the root directory inode to resolve absolute paths,
+    so denying `subpath "/"` without re-allowing `literal "/"` makes
+    sandbox-exec SIGABRT before the command runs. The literal allow matches
+    only the root node itself and does not re-open reads of any subtree.
     """
     user_roots = _user_roots()
     required = []
@@ -354,6 +359,8 @@ def _profile(read_paths, write_path, allow_temp_writes=False):
 (allow file-map-executable)
 (deny file-read* (subpath "/"))
 (deny file-read-metadata (subpath "/"))
+(allow file-read* (literal "/"))
+(allow file-read-metadata (literal "/"))
 (allow mach-lookup)
 (allow ipc-posix*)
 (allow system-socket)

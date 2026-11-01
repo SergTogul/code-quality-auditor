@@ -189,6 +189,13 @@ class SandboxTrustTests(unittest.TestCase):
         blanket = profile.index("(allow file-read*)")
         closure = profile.index('(deny file-read* (subpath "/"))')
         self.assertLess(blanket, closure)
+        root_inode = profile.index('(allow file-read* (literal "/"))')
+        self.assertLess(closure, root_inode)
+        self.assertLess(
+            profile.index('(deny file-read-metadata (subpath "/"))'),
+            profile.index('(allow file-read-metadata (literal "/"))'),
+        )
+        self.assertTrue(_read_allowed(profile, "/"))
         self.assertFalse(_read_allowed(profile, "/etc/passwd"))
         self.assertFalse(_read_allowed(profile, "/var/lib/cqa-not-allowed"))
         self.assertFalse(_read_allowed(profile, "/opt/cqa-not-allowed"))
@@ -335,12 +342,13 @@ def _read_allowed(profile, path):
             decision = False
             continue
         for verb, allowed in (("allow", True), ("deny", False)):
-            prefix = f'({verb} file-read* (subpath "'
-            if not line.startswith(prefix) or not line.endswith('"))'):
-                continue
-            root = Path(line[len(prefix):-3])
-            if target == root or root in target.parents:
-                decision = allowed
+            for kind in ("subpath", "literal"):
+                prefix = f'({verb} file-read* ({kind} "'
+                if not line.startswith(prefix) or not line.endswith('"))'):
+                    continue
+                root = Path(line[len(prefix):-3])
+                if target == root or (kind == "subpath" and root in target.parents):
+                    decision = allowed
     return decision
 
 
