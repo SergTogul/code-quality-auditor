@@ -154,8 +154,13 @@ def _lexically_inside(root, path):
     return False
 
 
-def _locate_executable(command, cwd):
-    """A bare name is a PATH lookup. A path is taken relative to the audit root, never the auditor's cwd."""
+def _locate_executable(command):
+    """A bare name is a PATH lookup. Only an absolute path is accepted otherwise.
+
+    A relative token (./tool, bin/tool, ../outside-tool) is not a host analyzer,
+    whether it stays inside the audit root or resolves outside it. It is rejected
+    instead of being resolved against the audit root or the process cwd.
+    """
     raw = str(command)
     if os.sep not in raw and (os.altsep is None or os.altsep not in raw):
         found = shutil.which(raw)
@@ -164,7 +169,7 @@ def _locate_executable(command, cwd):
         return Path(os.path.abspath(found))
     candidate = Path(raw)
     if not candidate.is_absolute():
-        candidate = Path(cwd) / candidate
+        raise PermissionError("relative executable path was not run")
     if not candidate.is_file():
         raise PermissionError(f"executable was not found: {command}")
     return Path(os.path.abspath(candidate))
@@ -743,7 +748,7 @@ def run_tool(command, cwd, log, timeout=60):
         log.deny("external-tool", "tool execution was not approved")
         raise PermissionError("tool execution was not approved")
     try:
-        located = _locate_executable(command[0], cwd)
+        located = _locate_executable(command[0])
     except PermissionError as exc:
         log.deny("external-tool", str(exc))
         raise

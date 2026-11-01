@@ -1249,6 +1249,31 @@ class SandboxTrustTests(unittest.TestCase):
                     runner.assert_not_called()
                 self.assertTrue(any(item["operation"] == "external-tool" for item in log.denied))
 
+    def test_relative_path_outside_the_audit_root_is_not_a_host_analyzer(self):
+        fake = self._accept_fake_sandbox()
+        tool = self.tmp / "outside-tool"
+        _write_executable(tool, "#!/bin/sh\nexit 0\n")
+        relative = Path(os.path.relpath(tool, self.repo))
+        self.assertEqual(relative.as_posix(), "../outside-tool")
+        log = self._log()
+        with mock.patch("cqa.security._run_process", return_value=subprocess.CompletedProcess([], 0, "", "")) as runner:
+            with self.assertRaises(PermissionError):
+                run_tool([relative.as_posix()], self.repo, log)
+            runner.assert_not_called()
+        self.assertTrue(any(item["operation"] == "external-tool" for item in log.denied))
+
+        calls = []
+
+        def record(command, cwd, env, timeout):
+            calls.append(list(command))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch("cqa.security._run_process", side_effect=record):
+            run_tool([str(tool)], self.repo, self._log())
+        self.assertEqual(calls[0][0], str(fake))
+        self.assertEqual(calls[0][3], "--")
+        self.assertEqual(calls[0][4], str(tool.resolve()))
+
     def test_relative_file_in_the_process_cwd_does_not_override_path(self):
         self._accept_fake_sandbox()
         elsewhere = self.tmp / "elsewhere"
