@@ -783,6 +783,11 @@ _GIT_FORCED_CONFIG = (
     # An empty value blanks the path. It does not name a file git can open.
     ("mailmap.file", ""),
     ("mailmap.blob", ""),
+    # An empty core.attributesFile leaves $HOME/.config/git/attributes in effect.
+    # /dev/null is an existing empty file. An empty diff.orderFile is the same mistake,
+    # and -O/dev/null is not a valid way to clear that setting.
+    ("core.attributesFile", "/dev/null"),
+    ("diff.orderFile", "/dev/null"),
 )
 _GIT_DIFF_COMMANDS = {"log", "diff", "show"}
 
@@ -1043,6 +1048,26 @@ def _git_config_overrides(repo):
     return overrides
 
 
+def _git_local_attribute_refusal(repo):
+    """Skip git when .gitattributes or .git/info/attributes is unsafe to open.
+
+    Git reads both paths even when core.attributesFile and diff.orderFile are /dev/null.
+    A symlink is refused without following it. A missing path is allowed. A regular file
+    inside the repository is allowed. A fifo, directory, or path that does not stay inside
+    the repository is refused.
+    """
+    root = Path(repo)
+    for relative in (".gitattributes", ".git/info/attributes"):
+        path = root / relative
+        if not os.path.lexists(path):
+            continue
+        if path.is_symlink():
+            return f"{relative} is a symlink; git was not run"
+        if contained_file(root, path) is None:
+            return f"{relative} is not a regular file inside the audit root; git was not run"
+    return None
+
+
 def git_read(repo, args, log, timeout=20, limit=_OUTPUT_LIMIT):
     git = _trusted_git(repo)
     if git is None:
@@ -1052,6 +1077,10 @@ def git_read(repo, args, log, timeout=20, limit=_OUTPUT_LIMIT):
         overrides = _git_config_overrides(repo)
     except _GitConfigRefused as exc:
         log.record(["git", *args], "skipped", str(exc))
+        return None
+    refusal = _git_local_attribute_refusal(repo)
+    if refusal is not None:
+        log.record(["git", *args], "skipped", refusal)
         return None
     # The path is this process's view of the audit root, never a value read from repository config.
     # --work-tree overrides core.worktree. -c pins the same path so config cannot choose another tree.

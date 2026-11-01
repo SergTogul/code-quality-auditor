@@ -1218,6 +1218,149 @@ class SandboxTrustTests(unittest.TestCase):
             self.assertIn("mailmap.file=", command)
             self.assertIn("mailmap.blob=", command)
 
+    def test_git_read_does_not_open_an_outside_attributes_file(self):
+        run_git = self._git_repository()
+        fifo = self.tmp / "attributes.fifo"
+        os.mkfifo(fifo)
+        run_git("config", "core.attributesFile", str(fifo))
+        log = self._log()
+        started = time.monotonic()
+        completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log, timeout=8)
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.returncode, 0)
+        commands = [item["command"] for item in log.commands if "log" in item["command"]]
+        self.assertTrue(commands)
+        for command in commands:
+            self.assertIn("core.attributesFile=/dev/null", command)
+            self.assertNotIn("core.attributesFile=", command)
+            self.assertNotIn("-O", command)
+            self.assertNotIn("-O/dev/null", command)
+
+    def test_git_read_does_not_open_an_outside_diff_order_file(self):
+        run_git = self._git_repository()
+        fifo = self.tmp / "order.fifo"
+        os.mkfifo(fifo)
+        run_git("config", "diff.orderFile", str(fifo))
+        log = self._log()
+        started = time.monotonic()
+        completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log, timeout=8)
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.returncode, 0)
+        commands = [item["command"] for item in log.commands if "log" in item["command"]]
+        self.assertTrue(commands)
+        for command in commands:
+            self.assertIn("diff.orderFile=/dev/null", command)
+            self.assertNotIn("diff.orderFile=", command)
+            self.assertNotIn("-O", command)
+            self.assertNotIn("-O/dev/null", command)
+
+    def test_git_read_does_not_open_the_default_home_attributes_file(self):
+        self._git_repository()
+        fifo = self.tmp / "home-attributes.fifo"
+        os.mkfifo(fifo)
+        home = self.tmp / "home"
+        attributes = home / ".config" / "git" / "attributes"
+        attributes.parent.mkdir(parents=True)
+        attributes.symlink_to(fifo)
+        saved_home = os.environ.get("HOME")
+        saved_global = os.environ.pop("GIT_CONFIG_GLOBAL", None)
+        os.environ["HOME"] = str(home)
+        try:
+            log = self._log()
+            started = time.monotonic()
+            completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log, timeout=8)
+            self.assertLess(time.monotonic() - started, 8)
+            self.assertIsNotNone(completed)
+            self.assertEqual(completed.returncode, 0)
+            commands = [item["command"] for item in log.commands if "log" in item["command"]]
+            self.assertTrue(commands)
+            for command in commands:
+                self.assertIn("core.attributesFile=/dev/null", command)
+        finally:
+            if saved_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved_home
+            if saved_global is None:
+                os.environ.pop("GIT_CONFIG_GLOBAL", None)
+            else:
+                os.environ["GIT_CONFIG_GLOBAL"] = saved_global
+
+    def _assert_git_attribute_skipped(self, detail):
+        log = self._log()
+        started = time.monotonic()
+        with mock.patch("cqa.security._run_process") as runner:
+            completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log, timeout=8)
+            runner.assert_not_called()
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertIsNone(completed)
+        self.assertEqual([item["outcome"] for item in log.commands], ["skipped"])
+        self.assertNotIn("started", [item["outcome"] for item in log.commands])
+        self.assertEqual(log.commands[0]["detail"], detail)
+
+    def test_git_read_refuses_a_symlink_info_attributes_file(self):
+        self._git_repository()
+        fifo = self.tmp / "info-attributes.fifo"
+        os.mkfifo(fifo)
+        info = self.repo / ".git" / "info"
+        info.mkdir(exist_ok=True)
+        attributes = info / "attributes"
+        if attributes.exists() or attributes.is_symlink():
+            attributes.unlink()
+        attributes.symlink_to(fifo)
+        self._assert_git_attribute_skipped(".git/info/attributes is a symlink; git was not run")
+
+    def test_git_read_refuses_a_symlink_gitattributes_file(self):
+        self._git_repository()
+        fifo = self.tmp / "gitattributes.fifo"
+        os.mkfifo(fifo)
+        attributes = self.repo / ".gitattributes"
+        attributes.unlink()
+        attributes.symlink_to(fifo)
+        self._assert_git_attribute_skipped(".gitattributes is a symlink; git was not run")
+
+    def test_git_read_refuses_a_non_regular_attributes_file(self):
+        self._git_repository()
+        info = self.repo / ".git" / "info"
+        info.mkdir(exist_ok=True)
+        attributes = info / "attributes"
+        if attributes.exists() or attributes.is_symlink():
+            attributes.unlink()
+        os.mkfifo(attributes)
+        self._assert_git_attribute_skipped(
+            ".git/info/attributes is not a regular file inside the audit root; git was not run"
+        )
+        attributes.unlink()
+        attributes.mkdir()
+        self._assert_git_attribute_skipped(
+            ".git/info/attributes is not a regular file inside the audit root; git was not run"
+        )
+
+    def test_git_read_runs_when_attribute_files_are_missing_or_regular(self):
+        self._git_repository()
+        info_attributes = self.repo / ".git" / "info" / "attributes"
+        info_attributes.parent.mkdir(exist_ok=True)
+        info_attributes.write_text("* -text\n", encoding="utf-8")
+        log = self._log()
+        completed = security.git_read(self.repo, ["rev-parse", "HEAD"], log)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(completed.stdout.strip())
+        self.assertIn("exit 0", [item["outcome"] for item in log.commands])
+
+        info_attributes.unlink()
+        (self.repo / ".gitattributes").unlink()
+        self.assertFalse(os.path.lexists(info_attributes))
+        self.assertFalse(os.path.lexists(self.repo / ".gitattributes"))
+        log = self._log()
+        completed = security.git_read(self.repo, ["rev-parse", "HEAD"], log)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(completed.stdout.strip())
+        self.assertIn("exit 0", [item["outcome"] for item in log.commands])
+
     def test_git_read_does_not_inherit_ld_preload(self):
         self._git_repository()
         preload = "/no/such/cqa-preload.so"
