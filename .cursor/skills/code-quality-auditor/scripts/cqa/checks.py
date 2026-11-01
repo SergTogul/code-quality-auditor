@@ -141,7 +141,7 @@ def run_syntax_static(ctx):
                     "Correct the syntax so the file parses.",
                 )
             )
-    clang_findings, clang_limits = _clang_syntax(ctx, analyses)
+    clang_findings, clang_limits, clang_refused = _clang_syntax(ctx, analyses)
     seen = {(item["file"], item["line"]) for item in findings}
     for item in clang_findings:
         key = (item["file"], item["line"])
@@ -149,26 +149,34 @@ def run_syntax_static(ctx):
             findings.append(item)
             seen.add(key)
     applicable = bool(analyses)
+    if findings or not clang_refused:
+        measurement = _measure(len(findings) if applicable else None, applicable, reason="" if applicable else "no supported source files")
+    else:
+        measurement = _measure(None, True, status="UNAVAILABLE", reason="the approved clang syntax check was refused by analyzer containment; built-in checks alone cannot pass C++ syntax")
     return _result(
         findings,
-        {"REL-004": _measure(len(findings) if applicable else None, applicable, reason="" if applicable else "no supported source files")},
+        {"REL-004": measurement},
         [limit for analysis in analyses for limit in analysis["limits"]] + clang_limits,
     )
 
 
 def _clang_syntax(ctx, analyses):
-    """Confirmed C++ parse errors from clang. Semantic and missing-include diagnostics are not syntax failures."""
+    """Confirmed C++ parse errors from clang. Semantic and missing-include diagnostics are not syntax failures.
+
+    Returns findings, limitations, and whether containment refused an approved, installed clang.
+    """
     log = getattr(ctx, "log", None)
     if log is None or not log.allow_tools:
-        return [], []
+        return [], [], False
     paths = [analysis["path"] for analysis in analyses if Path(analysis["path"]).suffix.lower() in {".cpp", ".cc", ".cxx"}]
     if not paths:
-        return [], []
+        return [], [], False
     clang = shutil.which("clang")
     if clang is None:
-        return [], ["clang syntax checking was approved but clang is not installed"]
+        return [], ["clang syntax checking was approved but clang is not installed"], False
     findings = []
     limitations = []
+    refused = False
     ignored = 0
     for relative in paths:
         try:
@@ -180,6 +188,7 @@ def _clang_syntax(ctx, analyses):
             )
         except PermissionError as exc:
             limitations.append(f"clang syntax checking was not run because analyzer containment is unavailable or refused the run: {exc}. Built-in syntax checks still apply.")
+            refused = True
             break
         except (OSError, subprocess.TimeoutExpired) as exc:
             limitations.append(f"clang syntax checking did not finish for {relative}: {exc}")
@@ -204,7 +213,7 @@ def _clang_syntax(ctx, analyses):
             )
     if ignored:
         limitations.append("clang reported diagnostics that are not confirmed syntax errors; those were not counted")
-    return findings, limitations
+    return findings, limitations, refused
 
 
 def run_symbol_index(ctx):

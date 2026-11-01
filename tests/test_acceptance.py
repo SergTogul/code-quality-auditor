@@ -1006,6 +1006,46 @@ class AcceptanceTests(unittest.TestCase):
         self.assertFalse(any(item["command"] and item["command"][0] == str(clang) for item in report["execution"]["commands"]))
         self.assertTrue(next(task for task in report["execution"]["tasks"] if task["task_id"] == "syntax_static")["ok"])
 
+    def test_refused_clang_leaves_clean_syntax_unavailable(self):
+        """Requirements: 4.4, 8.7."""
+        marker = self.tmp / "clang-ran"
+        clang = self.tmp / "host-bin" / "clang"
+        clang.parent.mkdir()
+        clang.write_text(f"#!/bin/sh\n: > {marker}\nexit 0\n", encoding="utf-8")
+        clang.chmod(0o755)
+        real_which = shutil.which
+
+        def which(name, *args, **kwargs):
+            return str(clang) if name == "clang" else real_which(name, *args, **kwargs)
+
+        repo = self.repo("clang-refused-clean")
+        _write(repo / "quality-auditor.yaml", """
+        version: 1
+        default_profile: syntax
+        profiles:
+          syntax:
+            include: [syntax_static]
+        """)
+        _write(repo / "valid.cpp", "int run() { return 1; }\n")
+        with mock.patch("cqa.checks.shutil.which", side_effect=which), mock.patch("cqa.security._trusted_sandbox", return_value=None):
+            unapproved = self.audit(repo, profile="syntax")
+            report = self.audit(repo, profile="syntax", allow_tools=True)
+        self.assertFalse(marker.exists())
+        unapproved_metrics = {item["metric_id"]: item for item in unapproved["metrics"]}
+        self.assertEqual(unapproved_metrics["REL-004"]["status"], "PASS")
+        self.assertEqual(unapproved["decision"], "PASS")
+        metrics = {item["metric_id"]: item for item in report["metrics"]}
+        self.assertEqual(metrics["REL-004"]["status"], "UNAVAILABLE")
+        self.assertIsNone(metrics["REL-004"]["measured_value"])
+        self.assertIn("clang", metrics["REL-004"]["reason"])
+        self.assertEqual(report["decision"], "INCOMPLETE")
+        self.assertFalse([item for item in report["findings"] if "REL-004" in item["metric_ids"]])
+        limits = [item for item in report["execution"]["limitations"] if "clang syntax checking was not run" in item]
+        self.assertEqual(len(limits), 1)
+        self.assertIn("containment", limits[0])
+        self.assertTrue(any(item["operation"] == "containment" for item in report["execution"]["denied"]))
+        self.assertFalse(any(item["command"] and item["command"][0] == str(clang) for item in report["execution"]["commands"]))
+
     def test_concurrency_primitives_need_a_concurrency_test(self):
         """Requirements: 8.3."""
         repo = self.repo("workers")
