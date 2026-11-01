@@ -743,6 +743,62 @@ class SandboxTrustTests(unittest.TestCase):
             for command in calls + launched:
                 self.assertEqual(command[0], str(trusted))
 
+    def test_git_read_ignores_repository_diff_and_textconv_helpers(self):
+        git = security._trusted_git(self.repo)
+        if git is None:
+            self.skipTest("no trusted git is installed at a fixed platform path")
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+
+        def run_git(*args):
+            subprocess.run([str(git), *args], cwd=self.repo, env=env, check=True, capture_output=True)
+
+        run_git("init", "-q")
+        run_git("config", "user.email", "cqa@example.invalid")
+        run_git("config", "user.name", "cqa")
+        (self.repo / ".gitattributes").write_text("*.txt diff=evil\n", encoding="utf-8")
+        (self.repo / "a.txt").write_text("one\n", encoding="utf-8")
+        run_git("add", ".")
+        run_git("commit", "-q", "-m", "one")
+        (self.repo / "a.txt").write_text("two\n", encoding="utf-8")
+        run_git("commit", "-q", "-am", "two")
+        external = self.tmp / "external-diff-ran"
+        textconv = self.tmp / "textconv-ran"
+        external_script = self.tmp / "external-diff"
+        textconv_script = self.tmp / "textconv"
+        _write_executable(external_script, f"#!/bin/sh\n: > {external}\n")
+        _write_executable(textconv_script, f'#!/bin/sh\n: > {textconv}\ncat "$1"\n')
+        run_git("config", "diff.external", str(external_script))
+        run_git("config", "diff.evil.textconv", str(textconv_script))
+        (self.repo / "a.txt").write_text("three\n", encoding="utf-8")
+        os.environ["GIT_EXTERNAL_DIFF"] = str(external_script)
+        log = self._log()
+        calls = {
+            "log": ["log", "--numstat", "--format=%H"],
+            "diff": ["diff", "--name-only"],
+            "show": ["show", "HEAD"],
+            "patch": ["diff", "HEAD~1", "HEAD"],
+        }
+        results = {name: security.git_read(self.repo, args, log) for name, args in calls.items()}
+        self.assertFalse(external.exists())
+        self.assertFalse(textconv.exists())
+        for name, completed in results.items():
+            self.assertIsNotNone(completed, name)
+        self.assertIn(b"a.txt", results["diff"].stdout)
+        self.assertIn(b"1\t1\ta.txt", results["log"].stdout)
+        log_command = next(item["command"] for item in log.commands if "log" in item["command"])
+        for flag in ("--no-pager", "--no-ext-diff", "--no-textconv"):
+            self.assertIn(flag, log_command)
+        self.assertLess(log_command.index("--no-pager"), log_command.index("log"))
+        self.assertEqual(log_command[log_command.index("log") + 1 : log_command.index("log") + 3], ["--no-ext-diff", "--no-textconv"])
+        for key in ("diff.external=", "core.sshCommand=", "core.pager=", "credential.helper="):
+            self.assertIn(key, log_command)
+        rev_log = self._log()
+        self.assertIsNotNone(security.git_read(self.repo, ["rev-parse", "HEAD"], rev_log))
+        rev_command = next(item["command"] for item in rev_log.commands if "rev-parse" in item["command"])
+        self.assertIn("--no-pager", rev_command)
+        self.assertNotIn("--no-ext-diff", rev_command)
+        self.assertNotIn("--no-textconv", rev_command)
+
     def test_trusted_git_needs_a_fixed_owner_writable_file_outside_the_repository(self):
         good = self.tmp / "good" / "git"
         good.parent.mkdir()

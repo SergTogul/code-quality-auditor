@@ -742,6 +742,8 @@ def run_tool(command, cwd, log, timeout=60):
 
 
 _GIT_CANDIDATES = ("/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git")
+_GIT_HELPER_KEYS = ("diff.external", "core.sshCommand", "core.pager", "credential.helper")
+_GIT_DIFF_COMMANDS = {"log", "diff", "show"}
 
 
 def _trusted_git(repo):
@@ -784,11 +786,18 @@ def git_read(repo, args, log, timeout=20, limit=_OUTPUT_LIMIT):
     if git is None:
         log.record(["git", *args], "skipped", "no trusted git was found at a fixed platform path; PATH is not consulted, so git was not run")
         return None
-    command = [str(git), "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=", "-c", "protocol.allow=never", "--no-optional-locks"]
+    command = [str(git), "--no-pager", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=", "-c", "protocol.allow=never", "--no-optional-locks"]
+    for key in _GIT_HELPER_KEYS:
+        command.extend(["-c", f"{key}="])
     for alias in GIT_ALIASES:
         command.extend(["-c", f"alias.{alias}="])
+    args = list(args)
+    if args and args[0] in _GIT_DIFF_COMMANDS:
+        # Repository config and .gitattributes can name external diff and textconv commands.
+        args[1:1] = ["--no-ext-diff", "--no-textconv"]
     command.extend(args)
     env = os.environ.copy()
+    env.pop("GIT_EXTERNAL_DIFF", None)
     env["GIT_CONFIG_GLOBAL"] = os.devnull
     env["GIT_CONFIG_SYSTEM"] = os.devnull
     env["GIT_TERMINAL_PROMPT"] = "0"
