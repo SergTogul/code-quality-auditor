@@ -2,13 +2,21 @@
 
 These tests exercise the execution policy directly. They are not a full external
 audit, and they do not mark requirements verified in the traceability checklist.
+They run on any POSIX host. A fake sandbox command stands in for sandbox-exec
+through a mocked `_trusted_sandbox()`, so they check the policy text, the probe
+decision logic, and the launch path. They do not show that seatbelt enforces
+the profile natively.
 """
 
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import re
+import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import textwrap
@@ -25,8 +33,17 @@ spec = importlib.util.spec_from_file_location("auditor", SKILL / "scripts" / "au
 auditor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(auditor)
 
+from cqa import security  # noqa: E402
 from cqa.project import discover_repository, init_repository  # noqa: E402
-from cqa.security import ExecutionLog, _profile, probe_sandbox, run_contained, run_tool  # noqa: E402
+from cqa.security import _SECRET_DIRS, ExecutionLog, _profile, _trusted_sandbox, probe_sandbox, run_contained, run_tool  # noqa: E402
+
+PASSTHROUGH = """#!/bin/sh
+[ "$1" = "-p" ] || exit 64
+shift 2
+[ "$1" = "--" ] || exit 64
+shift
+exec "$@"
+"""
 
 
 def _write_executable(path, text):
@@ -36,7 +53,8 @@ def _write_executable(path, text):
 
 class SandboxTrustTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="cqa-sandbox-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="cqa-sandbox-")).resolve()
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
         self.repo = self.tmp / "repo"
         self.repo.mkdir()
         self._saved = os.environ.copy()
@@ -51,6 +69,28 @@ class SandboxTrustTests(unittest.TestCase):
         defaults.update(kwargs)
         return ExecutionLog(**defaults)
 
+    def _fake_sandbox(self, name="sandbox-exec"):
+        path = self.tmp / "trusted-bin" / name
+        path.parent.mkdir(exist_ok=True)
+        _write_executable(path, PASSTHROUGH)
+        return path
+
+    def _patch(self, target, **kwargs):
+        patcher = mock.patch(target, **kwargs)
+        patched = patcher.start()
+        self.addCleanup(patcher.stop)
+        return patched
+
+    def _select_sandbox(self, path):
+        self._patch("cqa.security._trusted_sandbox", return_value=Path(path))
+
+    def _accept_fake_sandbox(self):
+        """A passthrough fake that the probe is told to accept. It checks the launch path, not enforcement."""
+        fake = self._fake_sandbox()
+        self._select_sandbox(fake)
+        self._patch("cqa.security.probe_sandbox", return_value=(True, str(fake)))
+        return fake
+
     def test_passthrough_custom_sandbox_is_rejected_before_the_command(self):
         wrapper = self.tmp / "passthrough"
         _write_executable(wrapper, "#!/bin/sh\nexec \"$@\"\n")
@@ -64,6 +104,29 @@ class SandboxTrustTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             run_contained([str(payload)], self.repo, self._log())
         self.assertFalse(marker.exists())
+
+    def test_custom_sandbox_differing_from_the_trusted_command_is_never_executed(self):
+        self._select_sandbox(self._fake_sandbox())
+        log_path = self.tmp / "custom.log"
+        wrapper = self.tmp / "custom-wrapper"
+        _write_executable(wrapper, f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log_path}\nexec \"$@\"\n")
+        marker = self.tmp / "ran"
+        payload = self.tmp / "payload"
+        _write_executable(payload, f"#!/bin/sh\n: > {marker}\n")
+        os.environ["CQA_SANDBOX_CMD"] = str(wrapper)
+        with mock.patch("cqa.security._run_process") as runner:
+            available, detail = probe_sandbox(self.repo)
+            self.assertFalse(available)
+            self.assertIn("allowlisted", detail)
+            log = self._log()
+            with self.assertRaises(PermissionError):
+                run_contained([str(payload)], self.repo, log)
+            with self.assertRaises(PermissionError):
+                run_tool([str(payload)], self.repo, log)
+            runner.assert_not_called()
+        self.assertFalse(marker.exists())
+        self.assertFalse(log_path.exists())
+        self.assertTrue(any(item["operation"] == "containment" for item in log.denied))
 
     def test_custom_sandbox_inside_the_repository_is_rejected(self):
         wrapper = self.repo / "sandbox-wrapper"
@@ -84,29 +147,48 @@ class SandboxTrustTests(unittest.TestCase):
                 run_contained(["/usr/bin/true"], self.repo, self._log())
 
     def test_sandbox_apply_failure_is_not_rerun(self):
-        import subprocess
-
-        from cqa import security
-
+        fake = self._accept_fake_sandbox()
         marker = self.tmp / "payload-ran"
         payload = self.tmp / "payload"
         _write_executable(payload, f"#!/bin/sh\n: > {marker}\n")
-        calls = []
-        real = security._run_process
+        failures = {
+            "status 71": (71, "", ""),
+            "sandbox_apply": (1, "", "sandbox-exec: sandbox_apply: Operation not permitted"),
+            "silent signal": (-6, "", ""),
+        }
+        launchers = {
+            "run_contained": lambda log: run_contained([str(payload)], self.repo, log, write_path=self.tmp),
+            "run_tool": lambda log: run_tool([str(payload)], self.repo, log),
+        }
+        for failure, (code, stdout, stderr) in failures.items():
+            for name, launch in launchers.items():
+                with self.subTest(failure=failure, launcher=name):
+                    calls = []
 
-        def wrapped(command, cwd, env, timeout):
-            calls.append(list(command))
-            if command and Path(command[0]).name == "sandbox-exec":
-                return subprocess.CompletedProcess(command, 71, "", "sandbox_apply failed")
-            return real(command, cwd, env, timeout)
+                    def fail(command, cwd, env, timeout):
+                        calls.append(list(command))
+                        return subprocess.CompletedProcess(command, code, stdout, stderr)
 
-        with mock.patch("cqa.security._run_process", side_effect=wrapped):
-            with self.assertRaises(PermissionError) as caught:
-                run_contained([str(payload)], self.repo, self._log())
-        self.assertIn("not rerun", str(caught.exception))
-        self.assertFalse(marker.exists())
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(Path(calls[0][0]).name, "sandbox-exec")
+                    log = self._log()
+                    with mock.patch("cqa.security._run_process", side_effect=fail):
+                        with self.assertRaises(PermissionError) as caught:
+                            launch(log)
+                    self.assertIn("not rerun", str(caught.exception))
+                    self.assertFalse(marker.exists())
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(calls[0][0], str(fake))
+                    self.assertEqual(calls[0][1], "-p")
+                    self.assertTrue(any(item["operation"] == "containment" for item in log.denied))
+
+    def test_ordinary_analyzer_failure_is_not_a_containment_failure(self):
+        self._accept_fake_sandbox()
+        for code, stdout, stderr in ((1, "", "broken.cpp:1:1: error: expected ';'"), (-11, "", "Segmentation fault")):
+            with self.subTest(code=code):
+                log = self._log()
+                with mock.patch("cqa.security._run_process", return_value=subprocess.CompletedProcess([], code, stdout, stderr)):
+                    completed = run_tool(["/usr/bin/true"], self.repo, log)
+                self.assertEqual(completed.returncode, code)
+                self.assertFalse(log.denied)
 
     def test_repository_executable_is_not_a_trusted_analyzer(self):
         marker = self.repo / "pwned"
@@ -117,6 +199,7 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertFalse(marker.exists())
 
     def test_tool_timeout_kills_the_grandchild(self):
+        fake = self._accept_fake_sandbox()
         pid_file = self.tmp / "grandchild"
         tool = self.tmp / "parent-tool"
         _write_executable(
@@ -127,15 +210,17 @@ class SandboxTrustTests(unittest.TestCase):
             wait
             """,
         )
+        log = self._log()
         started = time.monotonic()
-        with self.assertRaises(subprocess_timeout()):
-            run_tool([str(tool)], self.repo, self._log(), timeout=1)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            run_tool([str(tool)], self.repo, log, timeout=1)
         self.assertLess(time.monotonic() - started, 5)
         grandchild = int(pid_file.read_text(encoding="utf-8").strip())
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline and _alive(grandchild):
             time.sleep(0.05)
         self.assertFalse(_alive(grandchild))
+        self.assertTrue(any(item["outcome"] == "timeout" and item["command"][0] == str(fake) for item in log.commands))
 
     def test_analyzer_configuration_is_not_executed(self):
         marker = self.repo / "config-executed"
@@ -157,91 +242,138 @@ class SandboxTrustTests(unittest.TestCase):
             run_tool([str(self.repo / "eslint.config.js")], self.repo, self._log())
         self.assertFalse(marker.exists())
 
-    def test_tool_environment_drops_startup_hooks(self):
+    def test_tool_environment_drops_startup_hooks_and_uses_private_scratch(self):
+        fake = self._accept_fake_sandbox()
         os.environ["PYTHONSTARTUP"] = str(self.tmp / "startup.py")
         os.environ["LD_PRELOAD"] = str(self.tmp / "preload.so")
         os.environ["NODE_OPTIONS"] = "--require " + str(self.tmp / "hook.js")
-        completed = run_tool(["/usr/bin/env"], self.repo, self._log(), timeout=10)
-        self.assertEqual(completed.returncode, 0)
+        os.environ["TMPDIR"] = tempfile.gettempdir()
+        log = self._log()
+        completed = run_tool(["/usr/bin/env"], self.repo, log, timeout=10)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
         output = completed.stdout
         self.assertNotIn("PYTHONSTARTUP", output)
         self.assertNotIn("LD_PRELOAD", output)
         self.assertNotIn("NODE_OPTIONS", output)
+        values = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+        scratch = Path(values["TMPDIR"])
+        self.assertEqual(values["TMP"], str(scratch))
+        self.assertEqual(values["TEMP"], str(scratch))
+        self.assertNotEqual(scratch, Path(tempfile.gettempdir()).resolve())
+        self.assertTrue(scratch.name.startswith("cqa-tool-"))
+        self.assertFalse(scratch.exists())
+        wrapped = next(item["command"] for item in log.commands if item["outcome"] == "started")
+        self.assertEqual(wrapped[0], str(fake))
+        profile = wrapped[2]
+        writes = _write_roots(profile)
+        self.assertEqual(writes, [scratch])
+        self.assertTrue(_read_allowed(profile, scratch / "work.o"))
+        self.assertFalse(_allowed(profile, "file-write-data", Path(tempfile.gettempdir()) / "cqa-shared-file"))
+
+    def test_contained_temporary_variables_point_at_the_write_path(self):
+        self._accept_fake_sandbox()
+        work = self.tmp / "work"
+        work.mkdir()
+        os.environ["TMPDIR"] = tempfile.gettempdir()
+        completed = run_contained(["/usr/bin/env"], self.repo, self._log(), timeout=10, write_path=work, env={"TMPDIR": "/tmp", "EXTRA": "1"})
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        values = dict(line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line)
+        for key in ("TMPDIR", "TMP", "TEMP"):
+            self.assertEqual(values[key], str(work), key)
+        self.assertEqual(values["EXTRA"], "1")
 
     def test_profile_closes_reads_outside_the_command_allowlist(self):
-        repo = Path.home() / "cqa-allowlist-repo"
-        repo.mkdir(exist_ok=True)
-        self.addCleanup(lambda: __import__("shutil").rmtree(repo, ignore_errors=True))
+        home = self.tmp / "home"
+        repo = home / "cqa-allowlist-repo"
+        repo.mkdir(parents=True)
         repo_file = repo / "visible.txt"
         repo_file.write_text("visible", encoding="utf-8")
-        sibling = Path.home() / "cqa-allowlist-sibling.txt"
+        sibling = home / "cqa-allowlist-sibling.txt"
         sibling.write_text("outside", encoding="utf-8")
-        self.addCleanup(lambda: sibling.unlink(missing_ok=True))
-        profile = _profile([str(repo)], str(repo))
-        blanket = profile.index("(allow file-read*)")
-        closure = profile.index('(deny file-read* (subpath "/"))')
-        self.assertLess(blanket, closure)
+        with mock.patch.object(Path, "home", return_value=home):
+            profile = _profile([str(repo)], str(repo))
+        self.assertNotIn("(allow default)", profile)
+        self.assertEqual(_unfiltered_file_allows(profile), [])
         self.assertFalse(_read_allowed(profile, "/etc/passwd"))
         self.assertFalse(_read_allowed(profile, "/var/lib/cqa-not-allowed"))
         self.assertFalse(_read_allowed(profile, "/opt/cqa-not-allowed"))
+        self.assertFalse(_read_allowed(profile, "/Library/Keychains/login.keychain-db"))
         self.assertFalse(_read_allowed(profile, sibling))
+        self.assertFalse(_read_allowed(profile, home))
         self.assertTrue(_read_allowed(profile, repo_file))
-        self.assertTrue(_read_allowed(profile, Path("/usr/bin/true")))
-        secret = Path.home() / ".ssh" / "id_ed25519"
-        self.assertFalse(_read_allowed(profile, secret))
+        self.assertTrue(_read_allowed(profile, Path("/usr/bin/true").resolve()))
+        for name in _SECRET_DIRS:
+            self.assertFalse(_read_allowed(profile, home / name / "credentials"), name)
         self.assertNotIn('(allow file-read* (subpath "/"))', profile)
         self.assertNotIn('(allow file-read* (subpath "/etc"))', profile)
         self.assertNotIn('(allow file-read* (subpath "/opt"))', profile)
 
-    def test_contained_command_cannot_read_home_secrets(self):
-        secret_dir = Path.home() / ".ssh"
-        secret_dir.mkdir(exist_ok=True)
-        sentinel = secret_dir / "cqa-sandbox-sentinel"
-        repo_file = self.repo / "visible.txt"
-        repo_file.write_text("visible", encoding="utf-8")
-        reader = self.tmp / "reader.py"
-        reader.write_text(
-            textwrap.dedent(
-                f"""
-                try:
-                    open({str(sentinel)!r}, encoding="utf-8").read()
-                    print("SECRET_READ")
-                except OSError:
-                    print("SECRET_BLOCKED")
-                try:
-                    print("REPO", open({str(repo_file)!r}, encoding="utf-8").read())
-                except OSError:
-                    print("REPO_BLOCKED")
-                """
-            ).lstrip(),
-            encoding="utf-8",
-        )
-        sentinel.write_text("secret", encoding="utf-8")
-        private = Path.home() / "cqa-sandbox-private-note"
+    def test_profile_denies_home_secrets_even_when_they_are_requested(self):
+        home = self.tmp / "home"
+        (home / ".ssh").mkdir(parents=True)
+        (home / ".config" / "gh").mkdir(parents=True)
+        private = home / "private-note"
         private.write_text("private", encoding="utf-8")
-        self.addCleanup(lambda: sentinel.unlink(missing_ok=True))
-        self.addCleanup(lambda: private.unlink(missing_ok=True))
-        reader.write_text(
-            reader.read_text(encoding="utf-8")
-            + textwrap.dedent(
-                f"""
-                try:
-                    open({str(private)!r}, encoding="utf-8").read()
-                    print("PRIVATE_READ")
-                except OSError:
-                    print("PRIVATE_BLOCKED")
-                """
-            ),
-            encoding="utf-8",
-        )
-        os.environ.pop("CQA_SANDBOX_CMD", None)
-        completed = run_contained([sys.executable, str(reader)], self.repo, self._log(), timeout=20)
-        output = completed.stdout
-        self.assertIn("SECRET_BLOCKED", output, f"rc={completed.returncode} stderr={completed.stderr!r} stdout={output!r}")
-        self.assertIn("PRIVATE_BLOCKED", output)
-        self.assertIn("REPO visible", output)
-        self.assertNotIn("SECRET_READ", output)
-        self.assertNotIn("PRIVATE_READ", output)
+        with mock.patch.object(Path, "home", return_value=home):
+            profile = _profile([str(home), str(home / ".ssh"), str(home / ".config" / "gh")], str(home / ".ssh"))
+        self.assertFalse(_read_allowed(profile, private))
+        self.assertFalse(_read_allowed(profile, home / ".ssh" / "id_ed25519"))
+        self.assertFalse(_read_allowed(profile, home / ".config" / "gh" / "hosts.yml"))
+        self.assertFalse(_allowed(profile, "file-write-data", home / ".ssh" / "authorized_keys"))
+        for name in _SECRET_DIRS:
+            self.assertFalse(_read_allowed(profile, home / name / "x"), name)
+            self.assertFalse(_allowed(profile, "file-map-executable", home / name / "x"), name)
+
+    def test_profile_has_no_unfiltered_file_rules_and_scopes_writes(self):
+        work = self.tmp / "work"
+        work.mkdir()
+        profile = _profile([str(self.repo)], str(work))
+        self.assertEqual(_unfiltered_file_allows(profile), [])
+        self.assertEqual(_write_roots(profile), [work])
+        self.assertTrue(_allowed(profile, "file-write-data", work / "out.txt"))
+        self.assertTrue(_read_allowed(profile, work / "out.txt"))
+        self.assertFalse(_allowed(profile, "file-write-data", self.repo / "app.py"))
+        self.assertFalse(_allowed(profile, "file-write-data", self.tmp / "sibling.txt"))
+        self.assertFalse(_allowed(profile, "file-write-data", "/dev/null"))
+        no_write = _profile([str(self.repo)], None)
+        self.assertEqual(_write_roots(no_write), [])
+        self.assertEqual(_unfiltered_file_allows(no_write), [])
+
+    def test_profile_denies_network_and_limits_process_rules(self):
+        profile = _profile([str(self.repo)], str(self.repo))
+        lines = [line.strip() for line in profile.splitlines() if line.strip()]
+        self.assertIn("(deny network*)", lines)
+        self.assertFalse([line for line in lines if line.startswith("(allow network")])
+        self.assertFalse(_allowed(profile, "network-outbound", "/"))
+        self.assertNotIn("(allow process*)", lines)
+        self.assertFalse([line for line in lines if line.startswith("(allow signal")])
+        self.assertEqual(sorted(line for line in lines if line.startswith("(allow process")), ["(allow process-exec)", "(allow process-fork)"])
+        self.assertFalse([line for line in lines if line.startswith("(allow system-socket")])
+
+    def test_profile_uses_literal_device_rules_and_reviewed_roots(self):
+        self.assertEqual(security._SYSTEM_READ_ROOTS, ("/usr", "/bin", "/sbin", "/System", "/Library/Developer", "/opt/homebrew"))
+        profile = _profile([str(self.repo)], None)
+        for device in ("/dev/null", "/dev/random", "/dev/urandom"):
+            self.assertIn(f'(allow file-read* (literal "{device}"))', profile)
+            self.assertTrue(_read_allowed(profile, device))
+        self.assertNotIn('(subpath "/dev")', profile)
+        self.assertFalse(_read_allowed(profile, "/dev/disk0"))
+        self.assertFalse(_read_allowed(profile, "/dev/tty"))
+        self.assertNotIn('(subpath "/Library")', profile)
+        for root in ("/usr", "/bin", "/sbin"):
+            if Path(root).exists():
+                self.assertTrue(_read_allowed(profile, Path(root).resolve() / "cqa-tool"), root)
+
+    def test_profile_denies_shared_temporary_storage(self):
+        work = Path(tempfile.mkdtemp(prefix="cqa-scratch-")).resolve()
+        self.addCleanup(__import__("shutil").rmtree, work, True)
+        shared = Path(tempfile.gettempdir()).resolve()
+        profile = _profile([str(self.repo), str(shared), "/tmp", "/var/tmp"], str(work))
+        self.assertTrue(_read_allowed(profile, work / "scratch.txt"))
+        self.assertFalse(_read_allowed(profile, shared / "cqa-unrelated-file"))
+        for raw in ("/tmp/cqa-unrelated", "/private/tmp/cqa-unrelated", "/var/tmp/cqa-unrelated", "/private/var/folders/ab/T/cqa-unrelated"):
+            self.assertFalse(_read_allowed(profile, raw), raw)
+            self.assertFalse(_allowed(profile, "file-write-data", raw), raw)
 
     def test_tool_without_containment_does_not_run(self):
         marker = self.tmp / "side-effect"
@@ -250,6 +382,20 @@ class SandboxTrustTests(unittest.TestCase):
         with mock.patch("cqa.security.probe_sandbox", return_value=(False, "containment is unavailable")):
             with self.assertRaises(PermissionError):
                 run_tool([str(tool)], self.repo, self._log())
+        self.assertFalse(marker.exists())
+
+    def test_tool_never_falls_back_when_no_trusted_sandbox_exists(self):
+        marker = self.tmp / "side-effect"
+        tool = self.tmp / "host-tool"
+        _write_executable(tool, f"#!/bin/sh\n: > {marker}\n")
+        self._patch("cqa.security._trusted_sandbox", return_value=None)
+        with mock.patch("cqa.security._run_process") as runner:
+            for launch in (lambda log: run_tool([str(tool)], self.repo, log), lambda log: run_contained([str(tool)], self.repo, log)):
+                log = self._log()
+                with self.assertRaises(PermissionError):
+                    launch(log)
+                self.assertTrue(any(item["operation"] == "containment" for item in log.denied))
+            runner.assert_not_called()
         self.assertFalse(marker.exists())
 
     def test_wrapper_that_blocks_the_probe_but_allows_other_commands_is_not_trusted(self):
@@ -292,15 +438,17 @@ class SandboxTrustTests(unittest.TestCase):
             """,
         )
         os.environ["PATH"] = str(fake_dir) + os.pathsep + os.environ.get("PATH", "")
-        available, detail = probe_sandbox(self.repo)
-        self.assertTrue(available)
-        self.assertEqual(detail, "/usr/bin/sandbox-exec")
+        self.assertIn(_trusted_sandbox(), (None, Path("/usr/bin/sandbox-exec")))
+        with mock.patch.dict(security._PLATFORM_SANDBOX, {sys.platform: str(fake_dir / "sandbox-exec")}):
+            if os.geteuid() != 0:
+                self.assertIsNone(_trusted_sandbox())
+        fake = self._accept_fake_sandbox()
         log = self._log()
         completed = run_tool(["/usr/bin/true"], self.repo, log, timeout=10)
-        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertFalse(log_path.exists())
         self.assertFalse(marker.exists())
-        self.assertTrue(any(item["command"] and item["command"][0] == "/usr/bin/sandbox-exec" for item in log.commands))
+        self.assertTrue(any(item["command"] and item["command"][0] == str(fake) for item in log.commands))
 
     def test_interpreter_wrapper_is_rejected(self):
         shell = Path("/bin/bash")
@@ -312,32 +460,238 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertIn("interpreter or shell", detail)
 
 
-def _read_allowed(profile, path):
-    """Last matching file-read* rule wins, which is how seatbelt evaluates a profile."""
+class ProductionProbeTests(unittest.TestCase):
+    """probe_sandbox() must run the restrictive production profile on synthetic fixtures."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="cqa-probe-test-")).resolve()
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+        self._saved = os.environ.copy()
+        os.environ.pop("CQA_SANDBOX_CMD", None)
+        self.fake = self.tmp / "trusted-bin" / "sandbox-exec"
+        self.fake.parent.mkdir()
+        _write_executable(self.fake, PASSTHROUGH)
+        patcher = mock.patch("cqa.security._trusted_sandbox", return_value=self.fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.tokens = []
+
+        def token(_size):
+            value = f"cqa-synthetic-token-{len(self.tokens)}-{os.urandom(4).hex()}"
+            self.tokens.append(value)
+            return value
+
+        patcher = mock.patch("cqa.security.secrets.token_hex", side_effect=token)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.real_run = security._run_process
+        self.sandboxed = []
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._saved)
+
+    def _emulate(self, behave=None, baseline=None):
+        """Real unsandboxed baseline; the sandboxed run is replaced by an emulation of an enforcing sandbox."""
+
+        def run(command, cwd, env, timeout):
+            if command[0] != str(self.fake):
+                if baseline is not None:
+                    return baseline(command, cwd, env, timeout)
+                return self.real_run(command, cwd, env, timeout)
+            self.sandboxed.append({"command": list(command), "cwd": cwd, "env": dict(env)})
+            allowed = Path(command[-1])
+            context = {"allowed": allowed, "denied": allowed.parent / "denied", "port": int(env["CQA_PROBE_PORT"]), "command": command}
+            if behave is not None:
+                return behave(context)
+            (allowed / "output").write_bytes((allowed / "input").read_bytes())
+            return _reply(command, read_write=True, denied_read=False, denied_write=False, network=False)
+
+        return mock.patch("cqa.security._run_process", side_effect=run)
+
+    def _assert_unavailable(self, detail_part=None):
+        available, detail = probe_sandbox()
+        self.assertFalse(available, detail)
+        if detail_part:
+            self.assertIn(detail_part, detail)
+        for value in self.tokens:
+            self.assertNotIn(value, detail)
+        return detail
+
+    def test_probe_runs_the_production_profile_through_the_trusted_command(self):
+        with self._emulate():
+            available, detail = probe_sandbox()
+        self.assertTrue(available, detail)
+        self.assertEqual(detail, str(self.fake))
+        self.assertEqual(len(self.sandboxed), 1)
+        call = self.sandboxed[0]
+        command = call["command"]
+        self.assertEqual(command[:2], [str(self.fake), "-p"])
+        self.assertEqual(command[3], "--")
+        profile = command[2]
+        self.assertNotIn("(allow default)", profile)
+        self.assertEqual(_unfiltered_file_allows(profile), [])
+        self.assertIn("(deny network*)", profile)
+        allowed = Path(command[-1])
+        denied = allowed.parent / "denied"
+        self.assertTrue(allowed.name == "allowed" and allowed.parent.name.startswith("cqa-probe-"))
+        self.assertEqual(_write_roots(profile), [allowed])
+        self.assertTrue(_read_allowed(profile, allowed / "input"))
+        self.assertFalse(_read_allowed(profile, denied / "sentinel"))
+        self.assertFalse(_allowed(profile, "file-write-data", denied / "escape"))
+        self.assertEqual(call["env"]["TMPDIR"], str(allowed))
+        self.assertFalse(allowed.parent.exists())
+        home = Path.home().resolve()
+        for item in command[4:]:
+            if item.startswith("/") and Path(item).resolve() != Path(sys.executable).resolve():
+                self.assertNotIn(home, Path(item).resolve().parents)
+        for value in self.tokens:
+            self.assertNotIn(value, " ".join(command))
+            self.assertNotIn(value, json.dumps(call["env"]))
+
+    def test_probe_rejects_a_sandbox_that_does_not_enforce_the_profile(self):
+        self._assert_unavailable("containment is unavailable")
+
+    def test_probe_inconclusive_or_escaping_results_are_unavailable(self):
+        def reply(**values):
+            return lambda context: _reply(context["command"], **values)
+
+        def copy_then(**values):
+            def behave(context):
+                (context["allowed"] / "output").write_bytes((context["allowed"] / "input").read_bytes())
+                return _reply(context["command"], **values)
+
+            return behave
+
+        clean = {"read_write": True, "denied_read": False, "denied_write": False, "network": False}
+
+        def silent_write(context):
+            (context["denied"] / "escape").write_bytes(b"x")
+            return copy_then(**clean)(context)
+
+        def silent_network(context):
+            socket.create_connection(("127.0.0.1", context["port"]), timeout=2).close()
+            return copy_then(**clean)(context)
+
+        def leak(context):
+            secret = (context["denied"] / "sentinel").read_text(encoding="utf-8")
+            completed = copy_then(**clean)(context)
+            completed.stderr = secret
+            return completed
+
+        def wrong_content(context):
+            (context["allowed"] / "output").write_bytes(b"other")
+            return _reply(context["command"], **clean)
+
+        def timeout(context):
+            raise subprocess.TimeoutExpired(context["command"], 15)
+
+        cases = {
+            "malformed": lambda context: subprocess.CompletedProcess(context["command"], 0, "not json\n", ""),
+            "extra output": lambda context: subprocess.CompletedProcess(context["command"], 0, json.dumps(clean) + "\nmore\n", ""),
+            "incomplete": copy_then(read_write=True, denied_read=False, denied_write=False),
+            "extra key": copy_then(**clean, other=False),
+            "non-boolean": copy_then(read_write=True, denied_read="false", denied_write=False, network=False),
+            "status 71": lambda context: subprocess.CompletedProcess(context["command"], 71, "", "sandbox_apply: Operation not permitted"),
+            "nonzero exit": lambda context: subprocess.CompletedProcess(context["command"], 1, json.dumps(clean) + "\n", ""),
+            "timeout": timeout,
+            "denied read": copy_then(read_write=True, denied_read=True, denied_write=False, network=False),
+            "denied write": copy_then(read_write=True, denied_read=False, denied_write=True, network=False),
+            "network": copy_then(read_write=True, denied_read=False, denied_write=False, network=True),
+            "silent write escape": silent_write,
+            "silent network escape": silent_network,
+            "sentinel leak": leak,
+            "allowed write missing": reply(**clean),
+            "allowed write wrong": wrong_content,
+            "allowed read failed": copy_then(read_write=False, denied_read=False, denied_write=False, network=False),
+        }
+        for name, behave in cases.items():
+            with self.subTest(case=name):
+                self.tokens.clear()
+                with self._emulate(behave):
+                    self._assert_unavailable("containment is unavailable")
+
+    def test_probe_requires_a_viable_unsandboxed_baseline(self):
+        def no_network(command, cwd, env, timeout):
+            return subprocess.CompletedProcess(command, 0, json.dumps({"network": False}) + "\n", "")
+
+        def claims_network(command, cwd, env, timeout):
+            return subprocess.CompletedProcess(command, 0, json.dumps({"network": True}) + "\n", "")
+
+        def broken(command, cwd, env, timeout):
+            raise subprocess.TimeoutExpired(command, timeout)
+
+        for name, baseline in (("no network", no_network), ("unverified claim", claims_network), ("timeout", broken)):
+            with self.subTest(case=name):
+                self.sandboxed.clear()
+                with self._emulate(baseline=baseline):
+                    self._assert_unavailable("baseline")
+                self.assertEqual(self.sandboxed, [])
+
+    def test_probe_baseline_runs_unsandboxed_with_only_synthetic_inputs(self):
+        baselines = []
+
+        def record(command, cwd, env, timeout):
+            baselines.append({"command": list(command), "env": dict(env)})
+            return self.real_run(command, cwd, env, timeout)
+
+        with self._emulate(baseline=record):
+            available, detail = probe_sandbox()
+        self.assertTrue(available, detail)
+        self.assertEqual(len(baselines), 1)
+        command = baselines[0]["command"]
+        self.assertEqual(command[0], sys.executable)
+        self.assertEqual(baselines[0]["env"]["CQA_PROBE_MODE"], "baseline")
+        self.assertTrue(Path(command[-1]).parent.name.startswith("cqa-probe-"))
+
+
+def _reply(command, **values):
+    return subprocess.CompletedProcess(command, 0, json.dumps(values) + "\n", "")
+
+
+_RULE = re.compile(r'^\((allow|deny) ([\w*-]+)(?: \((subpath|literal) "(.*)"\))?\)$')
+
+
+def _rules(profile):
+    for raw in profile.splitlines():
+        match = _RULE.match(raw.strip())
+        if match:
+            yield match.groups()
+
+
+def _covers(rule, operation):
+    if rule == "default":
+        return True
+    if rule.endswith("*"):
+        return operation.startswith(rule[:-1])
+    return rule == operation
+
+
+def _allowed(profile, operation, path):
+    """Last matching rule wins over `(deny default)`, which is how seatbelt evaluates a profile."""
     decision = False
     target = Path(path)
-    for raw in profile.splitlines():
-        line = raw.strip()
-        if line == "(allow file-read*)":
-            decision = True
+    for verb, rule, kind, value in _rules(profile):
+        if not _covers(rule, operation):
             continue
-        if line == "(deny file-read*)":
-            decision = False
+        if kind == "subpath" and not (target == Path(value) or Path(value) in target.parents):
             continue
-        for verb, allowed in (("allow", True), ("deny", False)):
-            prefix = f'({verb} file-read* (subpath "'
-            if not line.startswith(prefix) or not line.endswith('"))'):
-                continue
-            root = Path(line[len(prefix):-3])
-            if target == root or root in target.parents:
-                decision = allowed
+        if kind == "literal" and target != Path(value):
+            continue
+        decision = verb == "allow"
     return decision
 
 
-def subprocess_timeout():
-    import subprocess
+def _read_allowed(profile, path):
+    return _allowed(profile, "file-read-data", path)
 
-    return subprocess.TimeoutExpired
+
+def _unfiltered_file_allows(profile):
+    return [f"(allow {rule})" for verb, rule, kind, _value in _rules(profile) if verb == "allow" and kind is None and (rule.startswith("file") or rule == "default")]
+
+
+def _write_roots(profile):
+    return [Path(value) for verb, rule, kind, value in _rules(profile) if verb == "allow" and rule.startswith("file-write")]
 
 
 def _alive(pid):

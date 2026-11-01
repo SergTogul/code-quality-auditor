@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import os
+import secrets
 import shutil
 import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -201,7 +204,7 @@ def _sandbox_command(profile, command):
 
 
 def probe_sandbox(cwd=None):
-    """Trust only the platform sandbox-exec binary. Probes cannot authorize another executable."""
+    """Trust only the platform sandbox-exec binary, and only when it enforces the production profile."""
     trusted = _trusted_sandbox()
     custom = os.environ.get("CQA_SANDBOX_CMD")
     if custom:
@@ -213,16 +216,149 @@ def probe_sandbox(cwd=None):
             return False, "custom containment command is not an allowlisted implementation"
     if trusted is None:
         return False, "no containment command is available"
-    probe = subprocess.run(
-        [str(trusted), "-p", "(version 1)(allow default)", "/usr/bin/true"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
-    if probe.returncode != 0:
-        detail = (probe.stderr or probe.stdout or "sandbox-exec failed").strip()
-        return False, f"containment is unavailable: {detail}"
+    try:
+        base = Path(tempfile.mkdtemp(prefix="cqa-probe-")).resolve()
+    except OSError:
+        return False, "containment is unavailable: the probe scratch directory could not be created"
+    try:
+        failure = _policy_probe(base)
+    except OSError:
+        failure = "the containment probe could not be prepared"
+    finally:
+        shutil.rmtree(base, ignore_errors=True)
+    if failure:
+        return False, f"containment is unavailable: {failure}"
     return True, str(trusted)
+
+
+_PROBE_SCRIPT = r"""
+import json, os, socket, sys
+allowed = sys.argv[1]
+denied = os.path.join(os.path.dirname(allowed), "denied")
+port = int(os.environ["CQA_PROBE_PORT"])
+result = {}
+
+def attempt(key, action):
+    try:
+        action()
+        result[key] = True
+    except OSError:
+        result[key] = False
+
+def read_write():
+    with open(os.path.join(allowed, "input"), "rb") as source:
+        data = source.read()
+    with open(os.path.join(allowed, "output"), "wb") as target:
+        target.write(data)
+
+def denied_read():
+    with open(os.path.join(denied, "sentinel"), "rb") as source:
+        source.read()
+
+def denied_write():
+    with open(os.path.join(denied, "escape"), "wb") as target:
+        target.write(b"x")
+
+def network():
+    with socket.create_connection(("127.0.0.1", port), timeout=2):
+        pass
+
+if os.environ.get("CQA_PROBE_MODE") == "baseline":
+    attempt("network", network)
+else:
+    attempt("read_write", read_write)
+    attempt("denied_read", denied_read)
+    attempt("denied_write", denied_write)
+    attempt("network", network)
+print(json.dumps(result))
+"""
+_PROBE_KEYS = ("read_write", "denied_read", "denied_write", "network")
+_PROBE_TIMEOUT = 15
+
+
+def _probe_result(completed, keys):
+    if completed.returncode != 0:
+        return None
+    lines = (completed.stdout or "").strip().splitlines()
+    if len(lines) != 1:
+        return None
+    try:
+        result = json.loads(lines[0])
+    except ValueError:
+        return None
+    if not isinstance(result, dict) or set(result) != set(keys):
+        return None
+    if not all(isinstance(result[key], bool) for key in keys):
+        return None
+    return result
+
+
+def _connection_waiting(listener):
+    listener.setblocking(False)
+    try:
+        connection, _address = listener.accept()
+    except (BlockingIOError, InterruptedError):
+        return False
+    connection.close()
+    return True
+
+
+def _policy_probe(base):
+    """Run the production profile on synthetic files. Returns a failure reason, or None when every check holds."""
+    allowed = base / "allowed"
+    denied = base / "denied"
+    allowed.mkdir()
+    denied.mkdir()
+    expected = secrets.token_hex(16).encode()
+    sentinel = secrets.token_hex(16).encode()
+    (allowed / "input").write_bytes(expected)
+    (denied / "sentinel").write_bytes(sentinel)
+    script = allowed / "probe.py"
+    script.write_text(_PROBE_SCRIPT, encoding="utf-8")
+    command = [sys.executable, "-I", str(script), str(allowed)]
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        listener.bind(("127.0.0.1", 0))
+        listener.listen(8)
+        port = str(listener.getsockname()[1])
+        try:
+            baseline = _run_process(command, str(allowed), _sanitize_env({"CQA_PROBE_PORT": port, "CQA_PROBE_MODE": "baseline"}), _PROBE_TIMEOUT)
+        except (OSError, subprocess.TimeoutExpired):
+            return "the unsandboxed probe baseline did not run"
+        result = _probe_result(baseline, ("network",))
+        listener.settimeout(2)
+        try:
+            connection, _address = listener.accept()
+            connection.close()
+            reached = True
+        except OSError:
+            reached = False
+        if result is None or not result["network"] or not reached:
+            return "the unsandboxed probe baseline could not reach loopback, so the network check is not conclusive"
+        scratch = str(allowed)
+        env = _sanitize_env({"CQA_PROBE_PORT": port, "TMPDIR": scratch, "TMP": scratch, "TEMP": scratch})
+        try:
+            completed = _run_process(_contained_command(command, scratch, scratch), scratch, env, _PROBE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            return "the containment probe timed out"
+        except OSError:
+            return "the containment probe did not start"
+        connected = _connection_waiting(listener)
+    output = (completed.stdout or "") + (completed.stderr or "")
+    if sentinel.decode() in output or expected.decode() in output:
+        return "the containment probe exposed a synthetic sentinel"
+    if sorted(os.listdir(denied)) != ["sentinel"] or (denied / "sentinel").read_bytes() != sentinel:
+        return "the containment probe wrote outside its scratch directory"
+    if connected:
+        return "the containment probe reached loopback network"
+    result = _probe_result(completed, _PROBE_KEYS)
+    if result is None:
+        return f"the containment probe returned an incomplete result (exit {completed.returncode})"
+    if result["denied_read"] or result["denied_write"] or result["network"]:
+        return "the containment probe escaped the production profile"
+    output_file = allowed / "output"
+    if not result["read_write"] or not output_file.is_file() or output_file.read_bytes() != expected:
+        return "the containment probe could not use its allowed scratch directory"
+    return None
 
 
 def _existing_reads(read_paths):
@@ -259,38 +395,24 @@ def _command_read_paths(cwd, command):
     return paths
 
 
-# Roots a macOS process needs after the startup allow is closed. /etc, /var, /opt,
-# /Users, and /home are intentionally absent.
+# Reviewed runtime roots. /etc, /var, /opt, /Library outside Developer, /dev,
+# shared temporary roots, /Users, and /home are intentionally absent.
 _SYSTEM_READ_ROOTS = (
     "/usr",
     "/bin",
     "/sbin",
     "/System",
-    "/Library",
-    "/dev",
+    "/Library/Developer",
     "/opt/homebrew",
-    "/private/tmp",
-    "/private/var/folders",
-    "/tmp",
-    "/var/tmp",
 )
+_DEVICE_FILES = ("/dev/null", "/dev/random", "/dev/urandom")
+_SHARED_TEMP_ROOTS = ("/tmp", "/private/tmp", "/var/tmp", "/private/var/tmp", "/var/folders", "/private/var/folders")
+_READ_OPERATIONS = ("file-read*", "file-read-metadata", "file-map-executable")
 
 
-def _read_rule(verb, path):
+def _rules(verb, operations, path, kind="subpath"):
     quoted = _quote_sb(path)
-    return (
-        f'({verb} file-read* (subpath "{quoted}"))\n'
-        f'({verb} file-read-metadata (subpath "{quoted}"))'
-    )
-
-
-def _allows_read(path):
-    quoted = _quote_sb(path)
-    return (
-        f'(allow file-read* (subpath "{quoted}"))\n'
-        f'(allow file-read-metadata (subpath "{quoted}"))\n'
-        f'(allow file-map-executable (subpath "{quoted}"))'
-    )
+    return "\n".join(f'({verb} {operation} ({kind} "{quoted}"))' for operation in operations)
 
 
 def _user_roots():
@@ -302,26 +424,40 @@ def _user_roots():
     return roots
 
 
-def _too_broad(path, user_roots):
-    """An allow of `/`, `/home`, or `/Users` would undo the read closure."""
+def _protected_roots():
+    """Roots whose contents are unrelated to any one command: user homes and shared temporary storage."""
+    roots = _user_roots()
+    roots.append(Path.home().resolve())
+    roots.append(Path(tempfile.gettempdir()).resolve())
+    for raw in _SHARED_TEMP_ROOTS:
+        path = Path(raw)
+        if path.exists():
+            roots.append(path.resolve())
+    return roots
+
+
+def _too_broad(path, protected):
+    """Allowing `/`, a home, a shared temporary root, or any ancestor of one would undo the read closure."""
     if path == Path("/"):
         return True
-    return any(path == root or path in root.parents for root in user_roots)
+    return any(path == root or path in root.parents for root in protected)
 
 
-def _profile(read_paths, write_path, allow_temp_writes=False):
-    """Start with a blanket read so seatbelt can launch, then close it.
+def _profile(read_paths, write_path):
+    """Deny by default and grant only scoped rules.
 
-    A profile made only of subpath allows aborts sandbox-exec. The blanket
-    `(allow file-read*)` stays first. The next rule denies `/`, and later rules
-    re-open system roots plus the command's own inputs. Credential directories
-    are denied last.
+    No file rule is unfiltered. Reads cover the reviewed system roots, the device
+    files, and the command's own inputs, including the write path. Writes cover
+    only the write path. User roots are denied before the command's inputs are
+    re-opened, and credential directories are denied last. If seatbelt cannot
+    launch under this profile, probe_sandbox reports containment unavailable.
     """
     user_roots = _user_roots()
+    protected = _protected_roots()
     required = []
-    for raw in _existing_reads(read_paths):
+    for raw in _existing_reads([*(read_paths or []), *([write_path] if write_path else [])]):
         path = Path(raw).resolve()
-        if _too_broad(path, user_roots):
+        if _too_broad(path, protected):
             continue
         required.append(path)
     system = []
@@ -330,33 +466,25 @@ def _profile(read_paths, write_path, allow_temp_writes=False):
         if not path.exists():
             continue
         resolved = path.resolve()
-        if _too_broad(resolved, user_roots):
+        if resolved in system or _too_broad(resolved, protected):
             continue
         system.append(resolved)
-    system_allows = "\n".join(_allows_read(path) for path in system)
-    required_allows = "\n".join(_allows_read(path) for path in required)
-    user_denies = "\n".join(_read_rule("deny", root) for root in user_roots)
+    devices = "\n".join(_rules("allow", ("file-read*", "file-read-metadata", "file-ioctl"), device, "literal") for device in _DEVICE_FILES)
+    system_allows = "\n".join(_rules("allow", _READ_OPERATIONS, path) for path in system)
+    required_allows = "\n".join(_rules("allow", _READ_OPERATIONS, path) for path in required)
+    user_denies = "\n".join(_rules("deny", _READ_OPERATIONS, root) for root in user_roots)
     home = Path.home().resolve()
-    secret_denies = "\n".join(_read_rule("deny", home / name) for name in _SECRET_DIRS)
-    write = f'(allow file-write* (subpath "{_quote_sb(write_path)}"))' if write_path else ""
-    if allow_temp_writes:
-        temp = _quote_sb(Path(tempfile.gettempdir()).resolve())
-        write = f'{write}\n(allow file-write* (subpath "{temp}"))'
+    secret_denies = "\n".join(_rules("deny", (*_READ_OPERATIONS, "file-write*"), home / name) for name in _SECRET_DIRS)
+    write = _rules("allow", ("file-write*",), Path(write_path).resolve()) if write_path else ""
     return f"""(version 1)
 (deny default)
 (deny network*)
-(allow process*)
-(allow signal)
+(allow process-exec)
+(allow process-fork)
 (allow sysctl-read)
-(allow file-ioctl)
-(allow file-read*)
-(allow file-read-metadata)
-(allow file-map-executable)
-(deny file-read* (subpath "/"))
-(deny file-read-metadata (subpath "/"))
 (allow mach-lookup)
 (allow ipc-posix*)
-(allow system-socket)
+{devices}
 {system_allows}
 {user_denies}
 {required_allows}
@@ -375,6 +503,41 @@ def _contained_command(command, cwd, write_path):
     return _sandbox_command(profile, command)
 
 
+def _containment_failed(completed):
+    """Seatbelt reports a profile it cannot apply as status 71, a sandbox_apply diagnostic, or a silent signal death."""
+    stdout = completed.stdout or ""
+    stderr = completed.stderr or ""
+    if completed.returncode == 71 or "sandbox_apply" in stderr:
+        return True
+    return completed.returncode < 0 and not stdout.strip() and not stderr.strip()
+
+
+def _run_sandboxed(command, cwd, log, timeout, write_path, env=None):
+    """The only launch path for host analyzers and repository code. A containment failure is never retried unsandboxed."""
+    ok, detail = probe_sandbox(cwd)
+    if not ok:
+        log.deny("containment", detail)
+        raise PermissionError(detail)
+    run_env = _sanitize_env(env)
+    for key in ("TMPDIR", "TMP", "TEMP"):
+        run_env.pop(key, None)
+    if write_path:
+        scratch = str(Path(write_path).resolve())
+        run_env.update({"TMPDIR": scratch, "TMP": scratch, "TEMP": scratch})
+    wrapped = _contained_command(command, cwd, write_path)
+    log.record(wrapped, "started")
+    try:
+        completed = _run_process(wrapped, cwd, run_env, timeout)
+    except subprocess.TimeoutExpired as exc:
+        log.record(wrapped, "timeout", str(exc))
+        raise
+    if _containment_failed(completed):
+        log.deny("containment", (completed.stderr or "").strip() or f"sandbox launch failed with exit {completed.returncode}")
+        raise PermissionError("containment failed; the command was not rerun outside the sandbox")
+    log.record(wrapped, f"exit {completed.returncode}")
+    return completed
+
+
 def run_contained(command, cwd, log, timeout=30, write_path=None, env=None):
     """Run a command only when repository execution is approved and containment actually applies."""
     if not log.allow_repo_execution:
@@ -383,23 +546,7 @@ def run_contained(command, cwd, log, timeout=30, write_path=None, env=None):
     if not log.sandbox_confirmed:
         log.deny("sandbox-confirmation", "sandbox confirmation was not given")
         raise PermissionError("sandbox confirmation was not given")
-    ok, detail = probe_sandbox(cwd)
-    if not ok:
-        log.deny("containment", detail)
-        raise PermissionError(detail)
-    wrapped = _contained_command(command, cwd, write_path)
-    log.record(wrapped, "started")
-    run_env = _sanitize_env(env)
-    try:
-        completed = _run_process(wrapped, cwd, run_env, timeout)
-    except subprocess.TimeoutExpired as exc:
-        log.record(wrapped, "timeout", str(exc))
-        raise
-    if completed.returncode == 71 or "sandbox_apply" in (completed.stderr or ""):
-        log.deny("containment", completed.stderr.strip() or "sandbox_apply failed")
-        raise PermissionError("containment failed; the command was not rerun outside the sandbox")
-    log.record(wrapped, f"exit {completed.returncode}")
-    return completed
+    return _run_sandboxed(command, cwd, log, timeout, write_path, env)
 
 
 def run_tool(command, cwd, log, timeout=60):
@@ -415,15 +562,11 @@ def run_tool(command, cwd, log, timeout=60):
         log.deny("external-tool", "repository-controlled executable was not run")
         raise PermissionError("repository-controlled executable was not run")
     command = [str(executable), *list(command)[1:]]
-    ok, detail = probe_sandbox(cwd)
-    if not ok:
-        log.deny("containment", detail)
-        raise PermissionError(detail)
-    wrapped = _sandbox_command(_profile(_command_read_paths(cwd, command), None, allow_temp_writes=True), command)
-    log.record(wrapped, "started")
-    completed = _run_process(wrapped, cwd, _sanitize_env(), timeout)
-    log.record(wrapped, f"exit {completed.returncode}")
-    return completed
+    scratch = tempfile.mkdtemp(prefix="cqa-tool-")
+    try:
+        return _run_sandboxed(command, cwd, log, timeout, scratch)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
 
 
 def git_read(repo, args, log, timeout=20):
