@@ -9,5 +9,7 @@ The engine only inspects files by default. External analyzers need `--allow-tool
 
 Approved analyzers and repository code both run only under containment, because analyzers read repository-controlled content. The only supported containment is the root-owned `/usr/bin/sandbox-exec` on macOS. Its profile denies by default and allows scoped reads, writes to one scratch directory, and no network. A probe must show that the profile blocks sibling files and loopback network before anything runs. On Linux and Windows containment is unavailable, so external analyzers and repository execution are reported unavailable while built-in static checks continue. `CQA_SANDBOX_CMD` and other custom wrappers cannot authorize containment, and a containment failure is never retried unsandboxed.
 
+The profile still allows `sysctl-read`, `mach-lookup`, and `ipc-posix*` without filters. These are compatibility exceptions so that macOS processes can start, not least privilege, and `mach-lookup` in particular reaches system services outside the file and network rules. Native enforcement of the profile has not been verified yet; that is tracked in issue #10.
+
 ## Local verification
 `.venv/bin/python -m unittest discover -s tests -v`

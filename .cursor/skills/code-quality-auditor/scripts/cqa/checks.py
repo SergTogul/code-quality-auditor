@@ -179,7 +179,7 @@ def _clang_syntax(ctx, analyses):
                 timeout=20,
             )
         except PermissionError as exc:
-            limitations.append(f"clang syntax checking was not run because analyzer containment is unavailable: {exc}. Built-in syntax checks still apply.")
+            limitations.append(f"clang syntax checking was not run because analyzer containment is unavailable or refused the run: {exc}. Built-in syntax checks still apply.")
             break
         except (OSError, subprocess.TimeoutExpired) as exc:
             limitations.append(f"clang syntax checking did not finish for {relative}: {exc}")

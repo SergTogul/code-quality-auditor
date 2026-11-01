@@ -450,6 +450,213 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertTrue(any(item["command"] and item["command"][0] == str(fake) for item in log.commands))
 
+    def _chdir(self, path):
+        previous = os.getcwd()
+        os.chdir(path)
+        self.addCleanup(os.chdir, previous)
+
+    def _wrapped_profile(self, command, write_path=None):
+        self._select_sandbox(self._fake_sandbox())
+        wrapped = security._contained_command(command, self.repo, write_path)
+        self.assertEqual(wrapped[1], "-p")
+        return wrapped[2]
+
+    def test_command_arguments_do_not_widen_reads(self):
+        elsewhere = self.tmp / "elsewhere"
+        (elsewhere / "leak").mkdir(parents=True)
+        (elsewhere / "leak" / "secret.txt").write_text("outside", encoding="utf-8")
+        self._chdir(elsewhere)
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("outside", encoding="utf-8")
+        (self.repo / "link.txt").symlink_to(outside / "secret.txt")
+        (self.repo / "dirlink").symlink_to(outside, target_is_directory=True)
+        (self.repo / "visible.txt").write_text("visible", encoding="utf-8")
+        command = [
+            "/usr/bin/true",
+            "leak/secret.txt",
+            "leak",
+            "/etc/passwd",
+            "/etc",
+            str(self.repo / "link.txt"),
+            "dirlink",
+            str(Path.home()),
+            tempfile.gettempdir(),
+        ]
+        profile = self._wrapped_profile(command)
+        self.assertTrue(_read_allowed(profile, self.repo / "visible.txt"))
+        for denied in (elsewhere / "leak" / "secret.txt", elsewhere / "other", Path("/etc/passwd"), Path("/etc/hosts"), outside / "secret.txt", outside / "other", Path(tempfile.gettempdir()).resolve() / "cqa-unrelated"):
+            self.assertFalse(_read_allowed(profile, denied), denied)
+        for root in (elsewhere, elsewhere / "leak", Path("/etc"), outside, Path.home().resolve(), Path(tempfile.gettempdir()).resolve()):
+            self.assertNotIn(f'(subpath "{root}")', profile.replace(f'(subpath "{self.repo}")', ""), root)
+
+    def test_relative_command_is_resolved_against_the_audit_root(self):
+        self._select_sandbox(self._fake_sandbox())
+        elsewhere = self.tmp / "elsewhere"
+        (elsewhere / "bin").mkdir(parents=True)
+        _write_executable(elsewhere / "bin" / "tool", "#!/bin/sh\nexit 0\n")
+        (self.repo / "bin").mkdir()
+        _write_executable(self.repo / "bin" / "tool", "#!/bin/sh\nexit 0\n")
+        self._chdir(elsewhere)
+        wrapped = security._contained_command(["bin/tool"], self.repo, None)
+        self.assertEqual(wrapped[4], str((self.repo / "bin" / "tool").resolve()))
+
+    def test_containment_denial_does_not_store_child_output(self):
+        self._accept_fake_sandbox()
+        secret = "cqa-child-secret-" + os.urandom(6).hex()
+        cases = (
+            (1, f"{secret} out", f"{secret} sandbox_apply: Operation not permitted"),
+            (71, f"{secret} out", f"{secret}"),
+        )
+        for code, stdout, stderr in cases:
+            with self.subTest(code=code):
+                log = self._log()
+                with mock.patch("cqa.security._run_process", return_value=subprocess.CompletedProcess([], code, stdout, stderr)):
+                    with self.assertRaises(PermissionError) as caught:
+                        run_tool(["/usr/bin/true"], self.repo, log)
+                self.assertNotIn(secret, str(caught.exception))
+                self.assertNotIn(secret, json.dumps({"denied": log.denied, "commands": log.commands}))
+                denial = next(item for item in log.denied if item["operation"] == "containment")
+                self.assertIn(f"exit {code}", denial["detail"])
+
+    def test_timeout_record_does_not_store_child_output(self):
+        self._accept_fake_sandbox()
+        secret = "cqa-child-secret-" + os.urandom(6).hex()
+        tool = self.tmp / "chatty-tool"
+        _write_executable(tool, f"#!/bin/sh\necho {secret}\necho {secret} >&2\nsleep 30\n")
+        log = self._log()
+        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+            run_tool([str(tool)], self.repo, log, timeout=1)
+        self.assertIsNone(caught.exception.output)
+        self.assertIsNone(caught.exception.stderr)
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertNotIn(secret, json.dumps({"denied": log.denied, "commands": log.commands}))
+        self.assertTrue(any(item["outcome"] == "timeout" for item in log.commands))
+
+    def test_run_process_caps_each_output_stream(self):
+        self.assertEqual(security._OUTPUT_LIMIT, 8 * 1024 * 1024)
+        for stream in ("stdout", "stderr"):
+            with self.subTest(stream=stream):
+                pid_file = self.tmp / f"{stream}.pid"
+                script = textwrap.dedent(
+                    f"""
+                    import os, sys, time
+                    open({str(pid_file)!r}, "w").write(str(os.getpid()))
+                    sys.{stream}.write("P" * 200000)
+                    sys.{stream}.flush()
+                    time.sleep(30)
+                    """
+                )
+                started = time.monotonic()
+                with self.assertRaises(security.OutputLimitExceeded) as caught:
+                    security._run_process([sys.executable, "-c", script], str(self.tmp), dict(os.environ), 20, limit=4096)
+                self.assertLess(time.monotonic() - started, 10)
+                self.assertNotIn("PPPP", str(caught.exception))
+                self.assertFalse(_alive(int(pid_file.read_text(encoding="utf-8"))))
+        completed = security._run_process([sys.executable, "-c", "print('x' * 1000)"], str(self.tmp), dict(os.environ), 20, limit=4096)
+        self.assertEqual(completed.stdout, "x" * 1000 + "\n")
+
+    def test_output_overflow_is_a_denial_not_a_result(self):
+        self._accept_fake_sandbox()
+        log = self._log()
+        with mock.patch("cqa.security._run_process", side_effect=security.OutputLimitExceeded("output exceeded 8 bytes on one stream")):
+            with self.assertRaises(PermissionError):
+                run_tool(["/usr/bin/true"], self.repo, log)
+        self.assertTrue(any(item["operation"] == "output-limit" for item in log.denied))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the /proc descendant sweep is Linux only")
+    def test_timeout_kills_descendants_that_left_the_session(self):
+        pid_file = self.tmp / "detached.pid"
+        script = textwrap.dedent(
+            f"""
+            import os, time
+            if os.fork() == 0:
+                os.setsid()
+                open({str(pid_file)!r} + ".tmp", "w").write(str(os.getpid()))
+                os.replace({str(pid_file)!r} + ".tmp", {str(pid_file)!r})
+                time.sleep(30)
+                os._exit(0)
+            time.sleep(30)
+            """
+        )
+        with self.assertRaises(subprocess.TimeoutExpired):
+            security._run_process([sys.executable, "-c", script], str(self.tmp), dict(os.environ), 2)
+        detached = int(pid_file.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and _running(detached):
+            time.sleep(0.05)
+        self.assertFalse(_running(detached))
+
+    def test_broad_or_missing_write_path_is_refused_before_launch(self):
+        self._accept_fake_sandbox()
+        for write_path in ("/", str(Path.home()), tempfile.gettempdir(), str(self.tmp / "missing")):
+            with self.subTest(write_path=write_path):
+                log = self._log()
+                with mock.patch("cqa.security._run_process") as runner:
+                    with self.assertRaises(PermissionError):
+                        run_contained(["/usr/bin/true"], self.repo, log, write_path=write_path)
+                    runner.assert_not_called()
+                self.assertTrue(any(item["operation"] == "containment" and "write path" in item["detail"] for item in log.denied))
+                self.assertEqual(_write_roots(_profile([str(self.repo)], write_path)), [])
+        child = Path(tempfile.mkdtemp(prefix="cqa-tool-")).resolve()
+        self.addCleanup(__import__("shutil").rmtree, child, True)
+        self.assertEqual(_write_roots(_profile([str(self.repo)], str(child))), [child])
+
+    def test_repository_symlink_to_a_host_binary_is_not_a_host_analyzer(self):
+        self._accept_fake_sandbox()
+        host = Path("/usr/bin/true").resolve()
+        (self.repo / "tool").symlink_to(host)
+        (self.repo / "bin").symlink_to(host.parent, target_is_directory=True)
+        for supplied in (str(self.repo / "tool"), "./tool", str(self.repo / "bin" / host.name), f"bin/{host.name}"):
+            with self.subTest(supplied=supplied):
+                log = self._log()
+                with mock.patch("cqa.security._run_process") as runner:
+                    with self.assertRaises(PermissionError):
+                        run_tool([supplied], self.repo, log)
+                    runner.assert_not_called()
+                self.assertTrue(any(item["operation"] == "external-tool" for item in log.denied))
+
+    def test_relative_file_in_the_process_cwd_does_not_override_path(self):
+        self._accept_fake_sandbox()
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        marker = self.tmp / "cwd-tool-ran"
+        _write_executable(elsewhere / "true", f"#!/bin/sh\n: > {marker}\n")
+        self._chdir(elsewhere)
+        calls = []
+
+        def record(command, cwd, env, timeout):
+            calls.append(list(command))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch("cqa.security._run_process", side_effect=record):
+            run_tool(["true"], self.repo, self._log())
+            with self.assertRaises(PermissionError):
+                run_tool(["./true"], self.repo, self._log())
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][4], str(Path(__import__("shutil").which("true")).resolve()))
+        self.assertNotEqual(calls[0][4], str(elsewhere / "true"))
+        self.assertFalse(marker.exists())
+
+    def test_discover_skips_symlinks_that_leave_the_repository(self):
+        sentinel = "cqa-outside-sentinel-" + os.urandom(6).hex()
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "secret.py").write_text(f'AWS_SECRET_ACCESS_KEY = "{sentinel}"\n', encoding="utf-8")
+        (self.repo / "inside.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+        (self.repo / "alias.py").symlink_to(self.repo / "inside.py")
+        (self.repo / "link.py").symlink_to(outside / "secret.py")
+        files, _counts = auditor.discover(self.repo)
+        self.assertEqual(sorted(path.name for path in files), ["alias.py", "inside.py"])
+        out = self.tmp / "out"
+        out.mkdir()
+        report = auditor.audit(self.repo, skill_root=SKILL, output_dir=out, profile="security")
+        self.assertNotIn(sentinel, json.dumps(report, default=str))
+        for path in out.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(sentinel, path.read_text(encoding="utf-8", errors="replace"), path)
+        self.assertFalse(any(item.get("file") == "link.py" for item in report["findings"]))
+
     def test_interpreter_wrapper_is_rejected(self):
         shell = Path("/bin/bash")
         if not shell.is_file():
@@ -700,3 +907,12 @@ def _alive(pid):
     except OSError:
         return False
     return True
+
+
+def _running(pid):
+    """Alive and not a zombie waiting for its new parent to reap it."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] not in {"Z", "X"}

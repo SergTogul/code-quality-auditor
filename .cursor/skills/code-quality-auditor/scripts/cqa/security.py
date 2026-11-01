@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import hashlib
 import json
+import locale
 import os
 import secrets
+import selectors
 import shutil
 import signal
 import socket
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 from cqa import ENGINE_VERSION
@@ -141,41 +144,172 @@ def _inside(root, path):
     return path == root or root in path.parents
 
 
-def _resolve_executable(command):
-    candidate = Path(command)
-    if candidate.is_file():
-        return candidate.resolve()
-    found = shutil.which(command)
-    if not found:
+def _lexically_inside(root, path):
+    path = Path(os.path.abspath(path))
+    for base in {Path(os.path.abspath(root)), Path(root).resolve()}:
+        if path == base or base in path.parents:
+            return True
+    return False
+
+
+def _locate_executable(command, cwd):
+    """A bare name is a PATH lookup. A path is taken relative to the audit root, never the auditor's cwd."""
+    raw = str(command)
+    if os.sep not in raw and (os.altsep is None or os.altsep not in raw):
+        found = shutil.which(raw)
+        if not found:
+            raise PermissionError(f"executable was not found: {command}")
+        return Path(os.path.abspath(found))
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        candidate = Path(cwd) / candidate
+    if not candidate.is_file():
         raise PermissionError(f"executable was not found: {command}")
-    return Path(found).resolve()
+    return Path(os.path.abspath(candidate))
 
 
-def _run_process(command, cwd, env, timeout):
-    """Run a command in its own session and kill the whole group on timeout."""
+_OUTPUT_LIMIT = 8 * 1024 * 1024
+_SWEEP_SECONDS = 2
+_SWEEP_DEPTH = 64
+
+
+class OutputLimitExceeded(Exception):
+    """A child wrote more than the per-stream limit. The output was discarded."""
+
+
+def _proc_children():
+    children = {}
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", "rb") as handle:
+                stat = handle.read().decode("ascii", "replace")
+            ppid = int(stat.rsplit(")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(int(entry))
+    return children
+
+
+def _stop_descendants(root):
+    """Linux only. Stop every transitive child of root, including ones that left its process group, and return them."""
+    if not sys.platform.startswith("linux"):
+        return []
+    deadline = time.monotonic() + _SWEEP_SECONDS
+    stopped = []
+    seen = {root}
+    while time.monotonic() < deadline:
+        try:
+            children = _proc_children()
+        except OSError:
+            break
+        found = []
+        frontier = [(root, 0)]
+        visited = {root}
+        while frontier:
+            pid, depth = frontier.pop()
+            if depth >= _SWEEP_DEPTH:
+                continue
+            for child in children.get(pid, ()):
+                if child in visited:
+                    continue
+                visited.add(child)
+                frontier.append((child, depth + 1))
+                if child not in seen:
+                    seen.add(child)
+                    found.append(child)
+        if not found:
+            break
+        for pid in found:
+            try:
+                os.kill(pid, signal.SIGSTOP)
+            except OSError:
+                continue
+            stopped.append(pid)
+    return stopped
+
+
+def _kill_tree(process):
+    try:
+        os.kill(process.pid, signal.SIGSTOP)
+    except OSError:
+        pass
+    descendants = _stop_descendants(process.pid)
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    for pid in descendants:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    try:
+        process.kill()
+    except OSError:
+        pass
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        pass
+
+
+def _decode(chunks):
+    text = b"".join(chunks).decode(locale.getpreferredencoding(False), errors="replace")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _run_process(command, cwd, env, timeout, limit=_OUTPUT_LIMIT):
+    """Run a command in its own session with bounded output. Timeout or overflow kills the whole tree.
+
+    Neither exception carries the child's output.
+    """
     process = subprocess.Popen(
         command,
         cwd=cwd,
         env=env,
+        stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
-        text=True,
         start_new_session=True,
     )
-    try:
-        stdout, stderr = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired as exc:
+    deadline = time.monotonic() + timeout
+    streams = {process.stdout: [], process.stderr: []}
+    sizes = {process.stdout: 0, process.stderr: 0}
+    failure = None
+    with selectors.DefaultSelector() as selector:
+        for stream in streams:
+            selector.register(stream, selectors.EVENT_READ)
+        while selector.get_map() and failure is None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                failure = "timeout"
+                break
+            for key, _events in selector.select(remaining):
+                chunk = os.read(key.fd, 65536)
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                sizes[key.fileobj] += len(chunk)
+                if sizes[key.fileobj] > limit:
+                    failure = "overflow"
+                    break
+                streams[key.fileobj].append(chunk)
+    if failure is None:
         try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        try:
-            process.communicate(timeout=2)
+            process.wait(timeout=max(deadline - time.monotonic(), 0))
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=1)
-        raise exc
-    return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            failure = "timeout"
+    if failure is not None:
+        _kill_tree(process)
+    for stream in streams:
+        stream.close()
+    if failure == "timeout":
+        raise subprocess.TimeoutExpired(command, timeout)
+    if failure == "overflow":
+        raise OutputLimitExceeded(f"output exceeded {limit} bytes on one stream; the process was killed and its output discarded")
+    return subprocess.CompletedProcess(command, process.returncode, _decode(streams[process.stdout]), _decode(streams[process.stderr]))
 
 
 _PLATFORM_SANDBOX = {"darwin": "/usr/bin/sandbox-exec"}
@@ -322,7 +456,7 @@ def _policy_probe(base):
         port = str(listener.getsockname()[1])
         try:
             baseline = _run_process(command, str(allowed), _sanitize_env({"CQA_PROBE_PORT": port, "CQA_PROBE_MODE": "baseline"}), _PROBE_TIMEOUT)
-        except (OSError, subprocess.TimeoutExpired):
+        except (OSError, subprocess.TimeoutExpired, OutputLimitExceeded):
             return "the unsandboxed probe baseline did not run"
         result = _probe_result(baseline, ("network",))
         listener.settimeout(2)
@@ -340,6 +474,8 @@ def _policy_probe(base):
             completed = _run_process(_contained_command(command, scratch, scratch), scratch, env, _PROBE_TIMEOUT)
         except subprocess.TimeoutExpired:
             return "the containment probe timed out"
+        except OutputLimitExceeded:
+            return "the containment probe exceeded the output limit"
         except OSError:
             return "the containment probe did not start"
         connected = _connection_waiting(listener)
@@ -382,17 +518,9 @@ def _existing_reads(read_paths):
 
 
 def _command_read_paths(cwd, command):
-    paths = []
+    """Arguments never widen reads. Only the audit root is granted; anything inside it is already covered."""
     root = Path(cwd).resolve()
-    if root.exists():
-        paths.append(str(root))
-    for item in command:
-        candidate = Path(item)
-        if not candidate.exists():
-            continue
-        resolved = candidate.resolve()
-        paths.append(str(resolved if resolved.is_dir() else resolved.parent))
-    return paths
+    return [str(root)] if root.is_dir() else []
 
 
 # Reviewed runtime roots. /etc, /var, /opt, /Library outside Developer, /dev,
@@ -443,6 +571,11 @@ def _too_broad(path, protected):
     return any(path == root or path in root.parents for root in protected)
 
 
+def _writable_scratch(write_path):
+    path = Path(write_path).resolve()
+    return path.is_dir() and not _too_broad(path, _protected_roots())
+
+
 def _profile(read_paths, write_path):
     """Deny by default and grant only scoped rules.
 
@@ -475,7 +608,7 @@ def _profile(read_paths, write_path):
     user_denies = "\n".join(_rules("deny", _READ_OPERATIONS, root) for root in user_roots)
     home = Path.home().resolve()
     secret_denies = "\n".join(_rules("deny", (*_READ_OPERATIONS, "file-write*"), home / name) for name in _SECRET_DIRS)
-    write = _rules("allow", ("file-write*",), Path(write_path).resolve()) if write_path else ""
+    write = _rules("allow", ("file-write*",), Path(write_path).resolve()) if write_path and _writable_scratch(write_path) else ""
     return f"""(version 1)
 (deny default)
 (deny network*)
@@ -496,8 +629,11 @@ def _profile(read_paths, write_path):
 def _contained_command(command, cwd, write_path):
     command = list(command)
     executable = Path(command[0])
-    if executable.is_file():
-        command[0] = str(executable.resolve())
+    if os.sep in str(command[0]):
+        if not executable.is_absolute():
+            executable = Path(cwd) / executable
+        if executable.is_file():
+            command[0] = str(executable.resolve())
     resolved_write = str(Path(write_path).resolve()) if write_path else None
     profile = _profile(_command_read_paths(cwd, command), resolved_write)
     return _sandbox_command(profile, command)
@@ -518,6 +654,10 @@ def _run_sandboxed(command, cwd, log, timeout, write_path, env=None):
     if not ok:
         log.deny("containment", detail)
         raise PermissionError(detail)
+    if write_path and not _writable_scratch(write_path):
+        detail = "the write path is missing or too broad; the command was not run"
+        log.deny("containment", detail)
+        raise PermissionError(detail)
     run_env = _sanitize_env(env)
     for key in ("TMPDIR", "TMP", "TEMP"):
         run_env.pop(key, None)
@@ -528,11 +668,14 @@ def _run_sandboxed(command, cwd, log, timeout, write_path, env=None):
     log.record(wrapped, "started")
     try:
         completed = _run_process(wrapped, cwd, run_env, timeout)
-    except subprocess.TimeoutExpired as exc:
-        log.record(wrapped, "timeout", str(exc))
+    except subprocess.TimeoutExpired:
+        log.record(wrapped, "timeout", f"timed out after {timeout} seconds; output was discarded")
         raise
+    except OutputLimitExceeded as exc:
+        log.deny("output-limit", "the command exceeded the output limit and was killed; output was discarded")
+        raise PermissionError(str(exc)) from None
     if _containment_failed(completed):
-        log.deny("containment", (completed.stderr or "").strip() or f"sandbox launch failed with exit {completed.returncode}")
+        log.deny("containment", f"containment failed with exit {completed.returncode}; the command was not rerun outside the sandbox")
         raise PermissionError("containment failed; the command was not rerun outside the sandbox")
     log.record(wrapped, f"exit {completed.returncode}")
     return completed
@@ -554,11 +697,12 @@ def run_tool(command, cwd, log, timeout=60):
         log.deny("external-tool", "tool execution was not approved")
         raise PermissionError("tool execution was not approved")
     try:
-        executable = _resolve_executable(command[0])
+        located = _locate_executable(command[0], cwd)
     except PermissionError as exc:
         log.deny("external-tool", str(exc))
         raise
-    if _inside(cwd, executable):
+    executable = located.resolve()
+    if _lexically_inside(cwd, located) or _inside(cwd, executable):
         log.deny("external-tool", "repository-controlled executable was not run")
         raise PermissionError("repository-controlled executable was not run")
     command = [str(executable), *list(command)[1:]]
