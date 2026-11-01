@@ -931,7 +931,11 @@ class AcceptanceTests(unittest.TestCase):
         self.assertIsNotNone(shutil.which("clang"))
         approved = self.audit(repo, profile="syntax", allow_tools=True)
         approved_metrics = {item["metric_id"]: item for item in approved["metrics"]}
-        self.assertEqual(approved_metrics["REL-004"]["measured_value"], 1)
+        self.assertEqual(
+            approved_metrics["REL-004"]["measured_value"],
+            1,
+            approved["execution"]["limitations"],
+        )
         self.assertEqual(approved_metrics["REL-004"]["status"], "FAIL")
         self.assertEqual(approved["decision"], "FAIL")
         self.assertTrue(any("clang:" in item["observation"] for item in approved["findings"]))

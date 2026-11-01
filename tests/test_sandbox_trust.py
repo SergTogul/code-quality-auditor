@@ -28,6 +28,7 @@ spec.loader.exec_module(auditor)
 from cqa.project import discover_repository, init_repository  # noqa: E402
 from cqa.security import (  # noqa: E402
     ExecutionLog,
+    _compile_toolchain_grants,
     _profile,
     _seatbelt_aliases,
     probe_sandbox,
@@ -273,6 +274,30 @@ class SandboxTrustTests(unittest.TestCase):
             for path in closed:
                 with self.subTest(operation=operation, path=str(path)):
                     self.assertFalse(_read_allowed(profile, path, operation))
+
+    def test_clang_toolchain_grant_does_not_open_var_db_or_applications(self):
+        link = Path("/var/db/xcode_select_link")
+        target = Path("/Applications/Xcode.app/Contents/Developer")
+        reads, metadata = _compile_toolchain_grants(link, target)
+        self.assertEqual(reads, [link, Path("/Applications/Xcode.app")])
+        self.assertIn(Path("/var/db"), metadata)
+        self.assertIn(Path("/private/var/db"), metadata)
+        self.assertNotIn(Path("/var"), metadata)
+        self.assertNotIn(Path("/Applications"), reads)
+        profile = _profile([], None, extra_reads=reads, metadata_literals=metadata)
+        self.assertIn('(allow file-read* (subpath "/Applications/Xcode.app"))', profile)
+        self.assertIn('(allow file-read* (subpath "/var/db/xcode_select_link"))', profile)
+        self.assertIn('(allow file-read-metadata (literal "/var/db"))', profile)
+        self.assertNotIn('(allow file-read* (subpath "/Applications"))', profile)
+        self.assertNotIn('(allow file-read* (subpath "/var/db"))', profile)
+        self.assertNotIn('(allow file-read-metadata (subpath "/var/db"))', profile)
+        for operation in ("file-read*", "file-read-metadata"):
+            self.assertFalse(_read_allowed(profile, "/var/db/sudo", operation))
+            self.assertFalse(_read_allowed(profile, "/etc/passwd", operation))
+            self.assertFalse(_read_allowed(profile, "/Applications/Other.app/Contents/Info.plist", operation))
+        self.assertTrue(_read_allowed(profile, "/Applications/Xcode.app/Contents/Developer/usr/bin/clang"))
+        self.assertTrue(_read_allowed(profile, "/var/db", "file-read-metadata"))
+        self.assertFalse(_read_allowed(profile, "/var/db", "file-read*"))
 
     @requires_macos_sandbox
     def test_contained_command_cannot_read_home_secrets(self):

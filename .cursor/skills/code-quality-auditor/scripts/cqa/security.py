@@ -369,7 +369,54 @@ def _too_broad(path, user_roots):
     return any(path == root or path in root.parents for root in user_roots)
 
 
-def _profile(read_paths, write_path, allow_temp_writes=False):
+def _compile_toolchain_grants(link, target):
+    """Read grants for one xcode-select link and its developer directory.
+
+    The link file and the enclosing ``.app`` (or the target itself) are readable.
+    ``/var/db`` is metadata-only so path lookup can reach the link; its other
+    entries stay unreadable. ``/Applications`` is not opened as a tree.
+    """
+    link = Path(link)
+    target = Path(target)
+    bundle = target
+    for parent in (target, *target.parents):
+        if parent.suffix == ".app":
+            bundle = parent
+            break
+    metadata = []
+    for alias in _seatbelt_aliases(link.parent):
+        if alias not in metadata and not _too_broad(alias, _user_roots()):
+            metadata.append(alias)
+    return [link, bundle], metadata
+
+
+def _xcode_select_grants():
+    """Paths a sandboxed clang/xcrun needs in order to honor xcode-select."""
+    if sys.platform != "darwin":
+        return [], []
+    reads = []
+    metadata = []
+    for raw in ("/var/db/xcode_select_link", "/private/var/db/xcode_select_link"):
+        link = Path(raw)
+        if not (link.is_symlink() or link.exists()):
+            continue
+        try:
+            target = Path(os.path.realpath(link))
+        except OSError:
+            continue
+        if not target.exists():
+            continue
+        extra_reads, extra_meta = _compile_toolchain_grants(link, target)
+        for path in extra_reads:
+            if path not in reads:
+                reads.append(path)
+        for path in extra_meta:
+            if path not in metadata:
+                metadata.append(path)
+    return reads, metadata
+
+
+def _profile(read_paths, write_path, allow_temp_writes=False, extra_reads=(), metadata_literals=()):
     """Start with a blanket read so seatbelt can launch, then close it.
 
     A profile made only of subpath allows aborts sandbox-exec. The blanket
@@ -389,7 +436,7 @@ def _profile(read_paths, write_path, allow_temp_writes=False):
     it; that does not open anything beneath the node.
     """
     user_roots = _user_roots()
-    required = _allowed_aliases(_existing_reads(read_paths), user_roots)
+    required = _allowed_aliases([*_existing_reads(read_paths), *extra_reads], user_roots)
     system = _allowed_aliases(
         [raw for raw in _SYSTEM_READ_ROOTS if Path(raw).exists()], user_roots
     )
@@ -399,9 +446,13 @@ def _profile(read_paths, write_path, allow_temp_writes=False):
     if allow_temp_writes:
         writes.append(tempfile.gettempdir())
     writable = _allowed_aliases(writes, user_roots)
+    metadata_nodes = list(_symlink_nodes([*system, *required, *writable]))
+    for node in metadata_literals:
+        for alias in _seatbelt_aliases(node):
+            if alias not in metadata_nodes and not _too_broad(alias, user_roots):
+                metadata_nodes.append(alias)
     link_allows = "\n".join(
-        f'(allow file-read-metadata (literal "{_quote_sb(node)}"))'
-        for node in _symlink_nodes([*system, *required, *writable])
+        f'(allow file-read-metadata (literal "{_quote_sb(node)}"))' for node in metadata_nodes
     )
     system_allows = "\n".join(_allows_read(path) for path in system)
     required_allows = "\n".join(_allows_read(path) for path in required)
@@ -491,7 +542,15 @@ def run_tool(command, cwd, log, timeout=60):
     if not ok:
         log.deny("containment", detail)
         raise PermissionError(detail)
-    wrapped = _sandbox_command(_profile(_command_read_paths(cwd, command), None, allow_temp_writes=True), command)
+    reads = _command_read_paths(cwd, command)
+    extra_reads = ()
+    metadata = ()
+    if Path(command[0]).name in {"clang", "clang++", "xcrun"}:
+        extra_reads, metadata = _xcode_select_grants()
+    wrapped = _sandbox_command(
+        _profile(reads, None, allow_temp_writes=True, extra_reads=extra_reads, metadata_literals=metadata),
+        command,
+    )
     log.record(wrapped, "started")
     completed = _run_process(wrapped, cwd, _sanitize_env(), timeout)
     log.record(wrapped, f"exit {completed.returncode}")

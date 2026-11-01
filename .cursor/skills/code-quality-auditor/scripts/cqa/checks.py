@@ -199,6 +199,12 @@ def _clang_syntax(ctx, analyses):
                     "Correct the syntax so the file parses.",
                 )
             )
+        if not any(item["file"] == relative for item in findings):
+            snippet = " | ".join((completed.stderr or completed.stdout or "").strip().splitlines()[:4])[:300]
+            if snippet:
+                limitations.append(
+                    f"clang syntax checking produced no confirmed syntax error for {relative}: {snippet}"
+                )
     if ignored:
         limitations.append("clang reported diagnostics that are not confirmed syntax errors; those were not counted")
     return findings, limitations
