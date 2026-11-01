@@ -13,6 +13,7 @@ from __future__ import annotations
 import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import re
@@ -767,6 +768,108 @@ class SandboxTrustTests(unittest.TestCase):
                 refused(private)
         self.assertEqual(_write_roots(_profile([str(self.repo)], str(private), self.repo)), [private])
 
+    def test_trace_coverage_does_not_follow_scratch_symlinks(self):
+        secret = "cqa-cover-sentinel-" + os.urandom(8).hex()
+        sentinel = self._outside_sentinel("cover-sentinel.txt", secret + "\n")
+        identity = (sentinel.stat().st_dev, sentinel.stat().st_ino)
+        opened = []
+        real_os_open = os.open
+        real_io_open = io.open
+
+        def record(fd):
+            try:
+                info = os.fstat(fd)
+            except OSError:
+                return
+            if (info.st_dev, info.st_ino) == identity:
+                opened.append((info.st_dev, info.st_ino))
+
+        def spy_os_open(path, flags, *args, **kwargs):
+            fd = real_os_open(path, flags, *args, **kwargs)
+            record(fd)
+            return fd
+
+        def spy_io_open(file, *args, **kwargs):
+            # Path.read_text calls io.open, which does not go through Python's os.open.
+            handle = real_io_open(file, *args, **kwargs)
+            try:
+                record(handle.fileno())
+            except (OSError, AttributeError, ValueError):
+                pass
+            return handle
+
+        probe = spy_os_open(sentinel, os.O_RDONLY | os.O_CLOEXEC)
+        self.assertEqual(opened, [identity])
+        os.close(probe)
+        opened.clear()
+
+        created = {}
+
+        def fake_run(*args, **kwargs):
+            link = Path(kwargs["write_path"]) / "x.cover"
+            link.symlink_to(sentinel)
+            created["symlink"] = link.is_symlink()
+            created["target"] = os.readlink(link)
+            return subprocess.CompletedProcess(args[0], 0, "", "")
+
+        ctx = SimpleNamespace(root=self.repo, analyses=[], texts={}, log=self._log())
+        started = time.monotonic()
+        with mock.patch("os.open", side_effect=spy_os_open), mock.patch("io.open", side_effect=spy_io_open), mock.patch(
+            "cqa.checks.run_contained", side_effect=fake_run
+        ):
+            value, evidence, error = checks._trace_line_coverage(ctx)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 5)
+        self.assertTrue(created["symlink"])
+        self.assertEqual(created["target"], str(sentinel))
+        self.assertEqual(opened, [])
+        self.assertIsNone(value)
+        self.assertEqual(evidence, [])
+        self.assertEqual(error, "unittest discover produced no production coverage")
+        rendered = json.dumps({"value": value, "evidence": evidence, "reason": error})
+        self.assertNotIn(secret, rendered)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), secret + "\n")
+
+    def test_read_contained_output_reads_regular_scratch_and_refuses_oversize(self):
+        scratch = Path(tempfile.mkdtemp(prefix="cqa-cover-")).resolve()
+        self.addCleanup(__import__("shutil").rmtree, scratch, True)
+        text = "     1: def add(left, right):\n>>>>>>     return left + right\n"
+        regular = scratch / "app.cover"
+        regular.write_text(text, encoding="utf-8")
+        self.assertEqual(security.read_contained_output(regular), text)
+        self.assertLessEqual(regular.stat().st_size, security._OUTPUT_LIMIT)
+
+        limit = 64
+        exact = scratch / "exact.cover"
+        exact.write_bytes(b"a" * limit)
+        self.assertEqual(security.read_contained_output(exact, limit=limit), "a" * limit)
+        sentinel = self._outside_sentinel("not-a-cover.txt", "outside-sentinel\n")
+        link = scratch / "linked.cover"
+        link.symlink_to(sentinel)
+        fifo = scratch / "fifo.cover"
+        os.mkfifo(fifo)
+        directory = scratch / "dir.cover"
+        directory.mkdir()
+        started = time.monotonic()
+        for path in (link, fifo, directory):
+            self.assertIsNone(security.read_contained_output(path, limit=limit))
+        self.assertLess(time.monotonic() - started, 2)
+
+        huge = scratch / "huge.cover"
+        payload = b"z" * 20000
+        huge.write_bytes(payload)
+        reads = []
+        real_read = os.read
+
+        def spy_read(fd, size):
+            reads.append(size)
+            return real_read(fd, size)
+
+        with mock.patch("cqa.security.os.read", side_effect=spy_read):
+            self.assertIsNone(security.read_contained_output(huge, limit=limit))
+        self.assertLessEqual(sum(reads), limit + 1)
+        self.assertLess(sum(reads), len(payload))
+
     def test_git_read_bounds_output_and_logs_no_child_output(self):
         sentinel = "cqa-git-sentinel-" + os.urandom(6).hex()
         fake_dir = self.tmp / "git-bin"
@@ -1095,6 +1198,62 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertEqual(recorded[recorded.index("--work-tree") + 1], resolved)
         self.assertIn(f"core.worktree={resolved}", recorded)
         self.assertNotIn(str(outside.resolve()), recorded)
+
+    def test_git_read_does_not_open_an_outside_mailmap(self):
+        run_git = self._git_repository()
+        fifo = self.tmp / "mailmap.fifo"
+        os.mkfifo(fifo)
+        run_git("config", "log.mailmap", "true")
+        run_git("config", "mailmap.file", str(fifo))
+        log = self._log()
+        started = time.monotonic()
+        completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log, timeout=8)
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.returncode, 0)
+        commands = [item["command"] for item in log.commands if "log" in item["command"]]
+        self.assertTrue(commands)
+        for command in commands:
+            self.assertIn("log.mailmap=false", command)
+            self.assertIn("mailmap.file=", command)
+            self.assertIn("mailmap.blob=", command)
+
+    def test_git_read_does_not_inherit_ld_preload(self):
+        self._git_repository()
+        preload = "/no/such/cqa-preload.so"
+        os.environ["LD_PRELOAD"] = preload
+        try:
+            log = self._log()
+            completed = security.git_read(self.repo, ["rev-parse", "HEAD"], log)
+        finally:
+            os.environ.pop("LD_PRELOAD", None)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.returncode, 0)
+        self.assertNotIn(preload.encode(), completed.stderr or b"")
+        self.assertNotIn(b"LD_PRELOAD", completed.stderr or b"")
+
+    def test_git_read_does_not_inherit_git_config_environment(self):
+        self._git_repository()
+        fifo = self.tmp / "env-mailmap.fifo"
+        os.mkfifo(fifo)
+        keys = ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0")
+        saved = {key: os.environ.get(key) for key in keys}
+        os.environ["GIT_CONFIG_COUNT"] = "1"
+        os.environ["GIT_CONFIG_KEY_0"] = "mailmap.file"
+        os.environ["GIT_CONFIG_VALUE_0"] = str(fifo)
+        try:
+            log = self._log()
+            started = time.monotonic()
+            completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log, timeout=8)
+            self.assertLess(time.monotonic() - started, 8)
+            self.assertIsNotNone(completed)
+            self.assertEqual(completed.returncode, 0)
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
 
     def _sentinel_yaml(self):
         sentinel = self.tmp / "sentinel.yaml"

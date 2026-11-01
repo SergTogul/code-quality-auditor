@@ -20,7 +20,7 @@ from xml.etree import ElementTree as ET
 
 from cqa import ENGINE_VERSION
 from cqa.adapters import _scan_tokens, analyze_path
-from cqa.security import contained_file, run_contained, run_tool
+from cqa.security import contained_file, read_contained_output, run_contained, run_tool
 from cqa.duplication import apply_justifications, exact_duplicates, semantic_candidates, structural_duplicates, token_duplicates
 from cqa.graph import build_graph
 
@@ -2368,7 +2368,9 @@ def _trace_line_coverage(ctx):
         hits = missing = 0
         evidence = []
         for cover_file in cover.glob("*.cover"):
-            body = cover_file.read_text(encoding="utf-8", errors="replace")
+            body = read_contained_output(cover_file)
+            if body is None:
+                continue
             reconstructed = _reconstruct_cover(body)
             if reconstructed not in production.values():
                 continue

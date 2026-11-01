@@ -779,6 +779,10 @@ _GIT_FORCED_CONFIG = (
     ("log.showSignature", "false"),
     ("diff.submodule", "short"),
     ("submodule.recurse", "false"),
+    ("log.mailmap", "false"),
+    # An empty value blanks the path. It does not name a file git can open.
+    ("mailmap.file", ""),
+    ("mailmap.blob", ""),
 )
 _GIT_DIFF_COMMANDS = {"log", "diff", "show"}
 
@@ -816,6 +820,46 @@ def contained_file(root, path):
     except OSError:
         return None
     return resolved
+
+
+def read_contained_output(path, limit=_OUTPUT_LIMIT):
+    """Read one scratch file without following a symlink or opening a fifo.
+
+    The path is opened as given, not resolved. Symlinks, fifos, directories,
+    and files larger than ``limit`` bytes are refused. Returns the text, or
+    None when the file must be skipped.
+    """
+    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "O_CLOEXEC"):
+        return None
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC
+    if hasattr(os, "O_NONBLOCK"):
+        # A fifo would otherwise block the unsandboxed parent inside open.
+        flags |= os.O_NONBLOCK
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            return None
+        chunks = []
+        remaining = limit + 1
+        while remaining > 0:
+            try:
+                block = os.read(fd, remaining)
+            except OSError:
+                return None
+            if not block:
+                break
+            chunks.append(block)
+            remaining -= len(block)
+        data = b"".join(chunks)
+        if len(data) > limit:
+            return None
+    finally:
+        os.close(fd)
+    return data.decode("utf-8", "replace")
 
 
 _GIT_CONFIG_LIMIT = 1024 * 1024
@@ -1027,14 +1071,16 @@ def git_read(repo, args, log, timeout=20, limit=_OUTPUT_LIMIT):
         args[1:1] = ["--no-ext-diff", "--no-textconv"]
     command.extend(["--work-tree", str(resolved_repo)])
     command.extend(args)
-    env = os.environ.copy()
-    for key in ("GIT_EXTERNAL_DIFF", "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
-        env.pop(key, None)
     # Only the repository's own .git was classified; never let discovery climb to a parent repository.
-    env["GIT_CEILING_DIRECTORIES"] = str(resolved_repo.parent)
-    env["GIT_CONFIG_GLOBAL"] = os.devnull
-    env["GIT_CONFIG_SYSTEM"] = os.devnull
-    env["GIT_TERMINAL_PROMPT"] = "0"
+    # _sanitize_env keeps PATH, HOME, and locale. It does not copy loader variables or GIT_CONFIG_*.
+    env = _sanitize_env(
+        {
+            "GIT_CEILING_DIRECTORIES": str(resolved_repo.parent),
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_SYSTEM": os.devnull,
+            "GIT_TERMINAL_PROMPT": "0",
+        }
+    )
     log.record(command, "started")
     try:
         completed = _run_process(command, repo, env, timeout, limit=limit, text=False)
