@@ -1,0 +1,162 @@
+name: Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: unittest (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # macOS is intentionally absent. See "Known limitations" in the README.
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: ubuntu-latest
+            python-version: "3.14"
+    defaults:
+      run:
+        shell: bash
+    env:
+      RESULTS_DIR: build/test-results
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install pinned test dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-ci.txt
+
+      - name: Record platform facilities
+        run: |
+          mkdir -p "$RESULTS_DIR"
+          python - <<'EOF'
+          import json
+          import os
+          import platform
+          import sys
+          from pathlib import Path
+
+          data = {
+              "python_version": platform.python_version(),
+              "python_implementation": platform.python_implementation(),
+              "sys_platform": sys.platform,
+              "os": platform.platform(),
+              "runner_os": os.environ.get("RUNNER_OS"),
+              "os_fork": hasattr(os, "fork"),
+              "os_setsid": hasattr(os, "setsid"),
+              "sandbox_exec_is_file": Path("/usr/bin/sandbox-exec").is_file(),
+          }
+          path = Path(os.environ["RESULTS_DIR"]) / "platform.json"
+          path.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+          print(path.read_text(encoding="utf-8"))
+          EOF
+
+      - name: Verify a failing test fails the runner
+        run: |
+          selfcheck="$RUNNER_TEMP/cqa-ci-selfcheck"
+          mkdir -p "$selfcheck"
+          cat > "$selfcheck/test_ci_selfcheck.py" <<'EOF'
+          import unittest
+
+
+          class SelfCheck(unittest.TestCase):
+              def test_deliberate_failure(self):
+                  self.assertEqual(1, 2)
+          EOF
+          set +e
+          python scripts/ci/run_unittest.py --start-directory "$selfcheck" --result-json "$RESULTS_DIR/selfcheck.json"
+          status=$?
+          set -e
+          if [ "$status" -eq 0 ]; then
+            echo "::error::run_unittest.py exited 0 for a deliberately failing test"
+            exit 1
+          fi
+          python - <<'EOF'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          data = json.loads((Path(os.environ["RESULTS_DIR"]) / "selfcheck.json").read_text(encoding="utf-8"))
+          if data["success"] is not False or data["tests_run"] != 1 or data["failures"] != 1 or data["errors"] != 0:
+              sys.exit(f"self-check result JSON is wrong: {data}")
+          print("self-check: runner exit was nonzero and JSON recorded one failure")
+          EOF
+
+      - name: Run test suite
+        run: python scripts/ci/run_unittest.py --start-directory tests --result-json "$RESULTS_DIR/unittest.json" --verbosity 2
+
+      - name: Summarize test results
+        if: always()
+        run: |
+          python - <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          import os
+          from pathlib import Path
+
+          path = Path(os.environ["RESULTS_DIR"]) / "unittest.json"
+          print(f"### unittest ({os.environ['RUNNER_OS']}, Python {os.environ['PYTHON_LABEL']})")
+          if not path.is_file():
+              print("No result file was written.")
+              raise SystemExit(1)
+          data = json.loads(path.read_text(encoding="utf-8"))
+          print(
+              f"success={data['success']} run={data['tests_run']} failures={data['failures']} "
+              f"errors={data['errors']} skipped={data['skipped']}"
+          )
+          for kind in ("failure_details", "error_details"):
+              for item in data[kind]:
+                  print(f"- {kind.split('_')[0]}: `{item['id']}`")
+          for item in data["skipped_details"]:
+              print(f"- skipped (not counted as coverage): `{item['id']}`: {item['reason']}")
+          EOF
+        env:
+          PYTHON_LABEL: ${{ matrix.python-version }}
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: test-results-${{ matrix.os }}-py${{ matrix.python-version }}
+          path: ${{ env.RESULTS_DIR }}/
+          if-no-files-found: error
+          retention-days: 14
+
+  required:
+    name: Required tests
+    needs: test
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require every matrix job to pass
+        env:
+          MATRIX_RESULT: ${{ needs.test.result }}
+        run: |
+          echo "test matrix result: $MATRIX_RESULT"
+          if [ "$MATRIX_RESULT" != "success" ]; then
+            echo "::error::test matrix result is $MATRIX_RESULT"
+            exit 1
+          fi
