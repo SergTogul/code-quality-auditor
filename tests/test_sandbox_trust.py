@@ -26,7 +26,14 @@ auditor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(auditor)
 
 from cqa.project import discover_repository, init_repository  # noqa: E402
-from cqa.security import ExecutionLog, _profile, probe_sandbox, run_contained, run_tool  # noqa: E402
+from cqa.security import (  # noqa: E402
+    ExecutionLog,
+    _profile,
+    _seatbelt_aliases,
+    probe_sandbox,
+    run_contained,
+    run_tool,
+)
 
 requires_macos_sandbox = unittest.skipUnless(
     sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").is_file(),
@@ -215,6 +222,56 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertNotIn('(allow file-read-metadata (subpath "/"))', profile)
         self.assertNotIn('(allow file-read* (subpath "/etc"))', profile)
         self.assertNotIn('(allow file-read* (subpath "/opt"))', profile)
+
+    def test_profile_covers_both_spellings_of_macos_symlinked_paths(self):
+        folders = _seatbelt_aliases(Path("/var/folders/ab/T/cqa"))
+        self.assertIn(Path("/var/folders/ab/T/cqa"), folders)
+        self.assertIn(Path("/private/var/folders/ab/T/cqa"), folders)
+        self.assertNotIn(Path("/var"), folders)
+        self.assertNotIn(Path("/private/var"), folders)
+        work_dir = _seatbelt_aliases(Path("/tmp/cqa-work"))
+        self.assertIn(Path("/tmp/cqa-work"), work_dir)
+        self.assertIn(Path("/private/tmp/cqa-work"), work_dir)
+        self.assertNotIn(Path("/tmp"), work_dir)
+        self.assertNotIn(Path("/private/tmp"), work_dir)
+
+        work = Path(tempfile.mkdtemp(prefix="cqa-alias-"))
+        self.addCleanup(lambda: __import__("shutil").rmtree(work, ignore_errors=True))
+        os.environ["HOME"] = str(work / "home")
+        profile = _profile([str(work)], str(work), allow_temp_writes=True)
+        work_aliases = _seatbelt_aliases(work)
+        self.assertGreaterEqual(len(work_aliases), 2)
+        for alias in work_aliases:
+            self.assertIn(f'(allow file-read* (subpath "{alias}"))', profile)
+            self.assertIn(f'(allow file-write* (subpath "{alias}"))', profile)
+        for alias in _seatbelt_aliases(tempfile.gettempdir()):
+            self.assertIn(f'(allow file-write* (subpath "{alias}"))', profile)
+        for broad in ("/var", "/private/var"):
+            for operation in ("file-read*", "file-read-metadata", "file-write*"):
+                self.assertNotIn(f'(allow {operation} (subpath "{broad}"))', profile)
+        self.assertNotIn('(allow file-read* (subpath "/"))', profile)
+        self.assertNotIn('(allow file-read-metadata (subpath "/"))', profile)
+        self.assertNotIn('(allow file-read* (literal "/tmp"))', profile)
+        self.assertIn('(allow file-read-metadata (literal "/tmp"))', profile)
+
+        visible = [alias / "visible.txt" for alias in work_aliases]
+        secrets = _seatbelt_aliases(work / "home" / ".ssh" / "id_ed25519")
+        self.assertGreaterEqual(len(secrets), 2)
+        closed = [
+            *secrets,
+            "/etc/passwd",
+            "/private/etc/passwd",
+            "/var/lib/cqa-not-allowed",
+            "/private/var/lib/cqa-not-allowed",
+            "/opt/cqa-not-allowed",
+        ]
+        for operation in ("file-read*", "file-read-metadata"):
+            for path in visible:
+                with self.subTest(operation=operation, path=str(path)):
+                    self.assertTrue(_read_allowed(profile, path, operation))
+            for path in closed:
+                with self.subTest(operation=operation, path=str(path)):
+                    self.assertFalse(_read_allowed(profile, path, operation))
 
     @requires_macos_sandbox
     def test_contained_command_cannot_read_home_secrets(self):

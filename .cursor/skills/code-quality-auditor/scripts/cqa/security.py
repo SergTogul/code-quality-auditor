@@ -276,6 +276,66 @@ _SYSTEM_READ_ROOTS = (
 )
 
 
+# macOS top-level symlinks and their targets. Seatbelt can see either spelling.
+_SYMLINK_TWINS = (
+    ("/private/var", "/var"),
+    ("/private/tmp", "/tmp"),
+    ("/private/etc", "/etc"),
+)
+
+
+def _symlink_twin(path):
+    for private, link in _SYMLINK_TWINS:
+        for source, target in ((Path(private), Path(link)), (Path(link), Path(private))):
+            if path == source or source in path.parents:
+                return target / path.relative_to(source)
+    return None
+
+
+def _seatbelt_aliases(path):
+    """Spellings of one path: as given, its realpath, and each one's /private twin.
+
+    Only the matching prefix is swapped, so `/var/folders/ab` maps to
+    `/private/var/folders/ab` and never to `/var` or `/private/var`.
+    """
+    absolute = Path(os.path.abspath(path))
+    aliases = []
+    for form in (absolute, Path(os.path.realpath(absolute))):
+        for candidate in (form, _symlink_twin(form)):
+            if candidate is not None and candidate not in aliases:
+                aliases.append(candidate)
+    return aliases
+
+
+def _allowed_aliases(paths, user_roots):
+    allowed = []
+    for path in paths:
+        for alias in _seatbelt_aliases(path):
+            if alias not in allowed and not _too_broad(alias, user_roots):
+                allowed.append(alias)
+    return allowed
+
+
+def _denied_aliases(paths):
+    denied = []
+    for path in paths:
+        for alias in _seatbelt_aliases(path):
+            if alias not in denied:
+                denied.append(alias)
+    return denied
+
+
+def _symlink_nodes(paths):
+    """Top-level symlinks that lookups of `paths` traverse."""
+    nodes = []
+    for path in paths:
+        for _private, link in _SYMLINK_TWINS:
+            link = Path(link)
+            if (path == link or link in path.parents) and link not in nodes:
+                nodes.append(link)
+    return nodes
+
+
 def _read_rule(verb, path):
     quoted = _quote_sb(path)
     return (
@@ -321,32 +381,36 @@ def _profile(read_paths, write_path, allow_temp_writes=False):
     so denying `subpath "/"` without re-allowing `literal "/"` makes
     sandbox-exec SIGABRT before the command runs. The literal allow matches
     only the root node itself and does not re-open reads of any subtree.
+
+    Every allow and deny is emitted for each spelling from `_seatbelt_aliases`,
+    because macOS reaches `/private/var` through `/var` (and likewise `/tmp`
+    and `/etc`). Allowed paths behind one of those symlinks also get a
+    metadata-only `literal` allow of the symlink node so path lookup can follow
+    it; that does not open anything beneath the node.
     """
     user_roots = _user_roots()
-    required = []
-    for raw in _existing_reads(read_paths):
-        path = Path(raw).resolve()
-        if _too_broad(path, user_roots):
-            continue
-        required.append(path)
-    system = []
-    for raw in _SYSTEM_READ_ROOTS:
-        path = Path(raw)
-        if not path.exists():
-            continue
-        resolved = path.resolve()
-        if _too_broad(resolved, user_roots):
-            continue
-        system.append(resolved)
+    required = _allowed_aliases(_existing_reads(read_paths), user_roots)
+    system = _allowed_aliases(
+        [raw for raw in _SYSTEM_READ_ROOTS if Path(raw).exists()], user_roots
+    )
+    writes = []
+    if write_path:
+        writes.append(write_path)
+    if allow_temp_writes:
+        writes.append(tempfile.gettempdir())
+    writable = _allowed_aliases(writes, user_roots)
+    link_allows = "\n".join(
+        f'(allow file-read-metadata (literal "{_quote_sb(node)}"))'
+        for node in _symlink_nodes([*system, *required, *writable])
+    )
     system_allows = "\n".join(_allows_read(path) for path in system)
     required_allows = "\n".join(_allows_read(path) for path in required)
-    user_denies = "\n".join(_read_rule("deny", root) for root in user_roots)
+    user_denies = "\n".join(_read_rule("deny", root) for root in _denied_aliases(user_roots))
     home = Path.home().resolve()
-    secret_denies = "\n".join(_read_rule("deny", home / name) for name in _SECRET_DIRS)
-    write = f'(allow file-write* (subpath "{_quote_sb(write_path)}"))' if write_path else ""
-    if allow_temp_writes:
-        temp = _quote_sb(Path(tempfile.gettempdir()).resolve())
-        write = f'{write}\n(allow file-write* (subpath "{temp}"))'
+    secret_denies = "\n".join(
+        _read_rule("deny", path) for path in _denied_aliases(home / name for name in _SECRET_DIRS)
+    )
+    write = "\n".join(f'(allow file-write* (subpath "{_quote_sb(path)}"))' for path in writable)
     return f"""(version 1)
 (deny default)
 (deny network*)
@@ -364,6 +428,7 @@ def _profile(read_paths, write_path, allow_temp_writes=False):
 (allow mach-lookup)
 (allow ipc-posix*)
 (allow system-socket)
+{link_allows}
 {system_allows}
 {user_denies}
 {required_allows}
