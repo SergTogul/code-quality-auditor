@@ -152,7 +152,7 @@ class SandboxTrustTests(unittest.TestCase):
         payload = self.tmp / "payload"
         _write_executable(payload, f"#!/bin/sh\n: > {marker}\n")
         work = self.tmp / "work"
-        work.mkdir()
+        work.mkdir(mode=0o700)
         failures = {
             "status 71": (71, "", ""),
             "sandbox_apply": (1, "", "sandbox-exec: sandbox_apply: Operation not permitted"),
@@ -275,7 +275,7 @@ class SandboxTrustTests(unittest.TestCase):
     def test_contained_temporary_variables_point_at_the_write_path(self):
         self._accept_fake_sandbox()
         work = self.tmp / "work"
-        work.mkdir()
+        work.mkdir(mode=0o700)
         os.environ["TMPDIR"] = tempfile.gettempdir()
         completed = run_contained(["/usr/bin/env"], self.repo, self._log(), timeout=10, write_path=work, env={"TMPDIR": "/tmp", "EXTRA": "1"})
         self.assertEqual(completed.returncode, 0, completed.stderr)
@@ -328,7 +328,7 @@ class SandboxTrustTests(unittest.TestCase):
 
     def test_profile_has_no_unfiltered_file_rules_and_scopes_writes(self):
         work = self.tmp / "work"
-        work.mkdir()
+        work.mkdir(mode=0o700)
         profile = _profile([str(self.repo)], str(work), self.repo)
         self.assertEqual(_unfiltered_file_allows(profile), [])
         self.assertEqual(_write_roots(profile), [work])
@@ -620,6 +620,38 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertTrue(security._writable_scratch(child, self.repo))
         nested = Path(tempfile.mkdtemp(prefix="cqa-runner-", dir=self.repo)).resolve()
         self.assertFalse(security._writable_scratch(nested, self.repo))
+
+    def test_shared_or_foreign_scratch_is_refused_before_launch(self):
+        self._accept_fake_sandbox()
+
+        def refused(write_path):
+            log = self._log()
+            calls = []
+            with mock.patch("cqa.security._run_process", side_effect=lambda *args, **kwargs: calls.append(args)):
+                with self.assertRaises(PermissionError):
+                    run_contained(["/usr/bin/env"], self.repo, log, write_path=write_path)
+            self.assertEqual(calls, [])
+            self.assertFalse(any(item["outcome"] == "started" for item in log.commands))
+            self.assertTrue(any(item["operation"] == "containment" and "write path" in item["detail"] for item in log.denied))
+            self.assertEqual(_write_roots(_profile([str(self.repo)], str(write_path), self.repo)), [])
+            self.assertEqual(_write_roots(security._contained_command(["/usr/bin/true"], self.repo, str(write_path))[2]), [])
+
+        for mode in (0o755, 0o777, 0o750, 0o701):
+            with self.subTest(mode=oct(mode)):
+                shared = Path(tempfile.mkdtemp(prefix="cqa-shared-")).resolve()
+                self.addCleanup(__import__("shutil").rmtree, shared, True)
+                shared.chmod(mode)
+                self.assertFalse(security._writable_scratch(shared, self.repo))
+                refused(shared)
+        private = Path(tempfile.mkdtemp(prefix="cqa-private-")).resolve()
+        self.addCleanup(__import__("shutil").rmtree, private, True)
+        self.assertEqual(private.stat().st_mode & 0o777, 0o700)
+        self.assertTrue(security._writable_scratch(private, self.repo))
+        with self.subTest(owner="another uid"):
+            with mock.patch("cqa.security.os.geteuid", return_value=os.geteuid() + 1):
+                self.assertFalse(security._writable_scratch(private, self.repo))
+                refused(private)
+        self.assertEqual(_write_roots(_profile([str(self.repo)], str(private), self.repo)), [private])
 
     def test_git_read_bounds_output_and_logs_no_child_output(self):
         sentinel = "cqa-git-sentinel-" + os.urandom(6).hex()

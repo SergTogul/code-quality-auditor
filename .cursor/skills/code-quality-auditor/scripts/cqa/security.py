@@ -443,7 +443,7 @@ def _policy_probe(base):
     allowed = base / "allowed"
     denied = base / "denied"
     root = base / "root"
-    allowed.mkdir()
+    allowed.mkdir(mode=0o700)
     denied.mkdir()
     root.mkdir()
     expected = secrets.token_hex(16).encode()
@@ -575,11 +575,17 @@ def _too_broad(path, protected):
 
 
 def _writable_scratch(write_path, cwd):
-    """A write path must be a private directory below the system temp root, apart from the audit tree."""
+    """A write path must be a private directory below the system temp root, apart from the audit tree.
+
+    Private means owned by this process's effective uid with no group or other permissions, as mkdtemp creates.
+    """
     path = Path(write_path).resolve()
     temp = Path(tempfile.gettempdir()).resolve()
     root = Path(cwd).resolve()
     if not path.is_dir() or _too_broad(path, _protected_roots()) or temp not in path.parents:
+        return False
+    info = path.stat()
+    if info.st_uid != os.geteuid() or info.st_mode & 0o077:
         return False
     return not (path == root or root in path.parents or path in root.parents)
 
