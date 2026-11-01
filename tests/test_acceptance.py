@@ -1046,6 +1046,121 @@ class AcceptanceTests(unittest.TestCase):
         self.assertTrue(any(item["operation"] == "containment" for item in report["execution"]["denied"]))
         self.assertFalse(any(item["command"] and item["command"][0] == str(clang) for item in report["execution"]["commands"]))
 
+    def _scripted_clang(self, outcomes):
+        """Each file maps to an exception to raise or a (returncode, stderr) pair from a contained clang."""
+        real_which = shutil.which
+
+        def which(name, *args, **kwargs):
+            return "/usr/bin/clang" if name == "clang" else real_which(name, *args, **kwargs)
+
+        def run(command, cwd, log, timeout=60):
+            outcome = outcomes[command[-1]]
+            if isinstance(outcome, BaseException):
+                raise outcome
+            returncode, stderr = outcome
+            return subprocess.CompletedProcess(command, returncode, "", stderr)
+
+        return mock.patch("cqa.checks.shutil.which", side_effect=which), mock.patch("cqa.checks.run_tool", side_effect=run)
+
+    def _syntax_repo(self, name, files):
+        repo = self.repo(name)
+        _write(repo / "quality-auditor.yaml", """
+        version: 1
+        default_profile: syntax
+        profiles:
+          syntax:
+            include: [syntax_static]
+        """)
+        for relative, text in files.items():
+            _write(repo / relative, text)
+        return repo
+
+    def test_clang_that_does_not_finish_conclusively_is_unavailable(self):
+        """Requirements: 4.4, 8.7."""
+        repo = self._syntax_repo("clang-inconclusive", {"a.cpp": "int a() { return 1; }\n", "b.cpp": "int b() { return 2; }\n"})
+        clean = (0, "")
+        cases = {
+            "timeout": subprocess.TimeoutExpired(["clang"], 20),
+            "launch error": OSError("exec format error"),
+            "signal death with output": (-11, "Stack dump:\n0. Program arguments: clang\n"),
+            "silent signal death": (-9, ""),
+            "exit 1 without a diagnostic": (1, "clang: error: unable to execute command\n"),
+            "exit 2": (2, ""),
+            "crash exit": (139, "clang: error: clang frontend command failed\n"),
+        }
+        for name, outcome in cases.items():
+            with self.subTest(outcome=name):
+                which_patch, run_patch = self._scripted_clang({"a.cpp": outcome, "b.cpp": clean})
+                with which_patch, run_patch:
+                    report = self.audit(repo, profile="syntax", allow_tools=True)
+                metrics = {item["metric_id"]: item for item in report["metrics"]}
+                self.assertEqual(metrics["REL-004"]["status"], "UNAVAILABLE")
+                self.assertIsNone(metrics["REL-004"]["measured_value"])
+                self.assertEqual(report["decision"], "INCOMPLETE")
+                self.assertTrue(any("a.cpp" in item and "clang syntax checking" in item for item in report["execution"]["limitations"]))
+        for name, outcome in {"clean exit": clean, "semantic diagnostic only": (1, "a.cpp:1:18: error: use of undeclared identifier 'x'\n")}.items():
+            with self.subTest(outcome=name):
+                which_patch, run_patch = self._scripted_clang({"a.cpp": outcome, "b.cpp": clean})
+                with which_patch, run_patch:
+                    report = self.audit(repo, profile="syntax", allow_tools=True)
+                metrics = {item["metric_id"]: item for item in report["metrics"]}
+                self.assertEqual(metrics["REL-004"]["status"], "PASS")
+                self.assertEqual(report["decision"], "PASS")
+
+    def test_later_clang_diagnostic_still_fails_after_an_unfinished_file(self):
+        """Requirements: 4.4, 8.7."""
+        repo = self._syntax_repo("clang-partial", {"a.cpp": "int a() { return 1; }\n", "b.cpp": "int b() {\n  return 2\n}\n"})
+        which_patch, run_patch = self._scripted_clang({"a.cpp": subprocess.TimeoutExpired(["clang"], 20), "b.cpp": (1, "b.cpp:2:11: error: expected ';' after return statement\n")})
+        with which_patch, run_patch:
+            report = self.audit(repo, profile="syntax", allow_tools=True)
+        metrics = {item["metric_id"]: item for item in report["metrics"]}
+        self.assertEqual(metrics["REL-004"]["status"], "FAIL")
+        self.assertEqual(report["decision"], "FAIL")
+        self.assertTrue(any(item["file"] == "b.cpp" and "clang:" in item["observation"] for item in report["findings"]))
+
+    def test_excepting_every_syntax_finding_does_not_pass_without_clang_evidence(self):
+        """Requirements: 4.4, 8.7."""
+        repo = self.repo("clang-refused-excepted")
+        _write(repo / "quality-auditor.yaml", """
+        version: 1
+        default_profile: syntax
+        exceptions:
+          - id: EX-SYNTAX
+            metric_id: REL-004
+            file: broken.py
+            justification: Fixture file kept broken on purpose.
+            scope: file
+        profiles:
+          syntax:
+            include: [syntax_static]
+        """)
+        _write(repo / "broken.py", "def broken(:\n    return 1\n")
+        _write(repo / "valid.cpp", "int run() { return 1; }\n")
+        clang = self.tmp / "excepted-bin" / "clang"
+        clang.parent.mkdir()
+        clang.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        clang.chmod(0o755)
+        real_which = shutil.which
+
+        def which(name, *args, **kwargs):
+            return str(clang) if name == "clang" else real_which(name, *args, **kwargs)
+
+        with mock.patch("cqa.checks.shutil.which", side_effect=which), mock.patch("cqa.security._trusted_sandbox", return_value=None):
+            unapproved = self.audit(repo, profile="syntax")
+            refused = self.audit(repo, profile="syntax", allow_tools=True)
+        self.assertEqual({item["metric_id"]: item["status"] for item in unapproved["metrics"]}["REL-004"], "PASS")
+        self.assertEqual(unapproved["decision"], "PASS")
+        self.assertTrue(any(item["confidence"] == "accepted_exception" for item in refused["findings"]))
+        metrics = {item["metric_id"]: item for item in refused["metrics"]}
+        self.assertEqual(metrics["REL-004"]["status"], "UNAVAILABLE")
+        self.assertIsNone(metrics["REL-004"]["measured_value"])
+        self.assertEqual(refused["decision"], "INCOMPLETE")
+        _write(repo / "other.py", "def other(:\n    return 2\n")
+        with mock.patch("cqa.checks.shutil.which", side_effect=which), mock.patch("cqa.security._trusted_sandbox", return_value=None):
+            failing = self.audit(repo, profile="syntax", allow_tools=True)
+        self.assertEqual({item["metric_id"]: item["status"] for item in failing["metrics"]}["REL-004"], "FAIL")
+        self.assertEqual(failing["decision"], "FAIL")
+
     def test_concurrency_primitives_need_a_concurrency_test(self):
         """Requirements: 8.3."""
         repo = self.repo("workers")

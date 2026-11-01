@@ -11,6 +11,7 @@ import selectors
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -184,8 +185,8 @@ def _proc_children():
             continue
         try:
             with open(f"/proc/{entry}/stat", "rb") as handle:
-                stat = handle.read().decode("ascii", "replace")
-            ppid = int(stat.rsplit(")", 1)[1].split()[1])
+                fields = handle.read().decode("ascii", "replace")
+            ppid = int(fields.rsplit(")", 1)[1].split()[1])
         except (OSError, ValueError, IndexError):
             continue
         children.setdefault(ppid, []).append(int(entry))
@@ -261,9 +262,12 @@ def _decode(chunks):
 
 
 def _run_process(command, cwd, env, timeout, limit=_OUTPUT_LIMIT, text=True):
-    """Run a command in its own session with bounded output. Timeout or overflow kills the whole tree.
+    """Run a command in its own session with bounded output. Neither exception carries the child's output.
 
-    Neither exception carries the child's output.
+    On timeout or overflow the child's session is killed, and on Linux children still parented under it
+    in /proc are stopped and killed as well. This cleanup is best effort, not a containment guarantee: a
+    process that calls setsid or is reparented away can survive, especially on macOS, where no /proc
+    sweep runs. The sandbox profile, not this cleanup, is the security boundary.
     """
     process = subprocess.Popen(
         command,
@@ -737,8 +741,50 @@ def run_tool(command, cwd, log, timeout=60):
         shutil.rmtree(scratch, ignore_errors=True)
 
 
+_GIT_CANDIDATES = ("/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git")
+
+
+def _trusted_git(repo):
+    """A git at a fixed platform path, outside the audit root, owned by root or this user and writable only by its owner.
+
+    PATH is never consulted, so neither the repository nor an earlier PATH entry can choose the git that runs.
+    """
+    for raw in _GIT_CANDIDATES:
+        path = Path(raw)
+        try:
+            if not path.is_file():
+                continue
+            resolved = path.resolve()
+            info = resolved.stat()
+        except OSError:
+            continue
+        if _lexically_inside(repo, path) or _inside(repo, resolved):
+            continue
+        if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o022 or info.st_uid not in {0, os.geteuid()}:
+            continue
+        return resolved
+    return None
+
+
+def contained_file(root, path):
+    """The resolved regular file for path, only when both the path and its target lie inside root."""
+    try:
+        if not _lexically_inside(root, path) or not _inside(root, path):
+            return None
+        resolved = Path(path).resolve()
+        if not stat.S_ISREG(resolved.stat().st_mode):
+            return None
+    except OSError:
+        return None
+    return resolved
+
+
 def git_read(repo, args, log, timeout=20, limit=_OUTPUT_LIMIT):
-    command = ["git", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=", "-c", "protocol.allow=never", "--no-optional-locks"]
+    git = _trusted_git(repo)
+    if git is None:
+        log.record(["git", *args], "skipped", "no trusted git was found at a fixed platform path; PATH is not consulted, so git was not run")
+        return None
+    command = [str(git), "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=", "-c", "protocol.allow=never", "--no-optional-locks"]
     for alias in GIT_ALIASES:
         command.extend(["-c", f"alias.{alias}="])
     command.extend(args)

@@ -192,6 +192,10 @@ def recompute_defect_counts(metrics_by_id, measurements, findings):
         related = [item for item in findings if metric_id in (item.get("metric_ids") or []) and item.get("confidence") == "confirmed"]
         excepted = [item for item in findings if metric_id in (item.get("metric_ids") or []) and item.get("confidence") == "accepted_exception"]
         if related or excepted:
+            if not related and measurement.get("incomplete_evidence"):
+                measurement["value"] = None
+                measurement["status"] = "UNAVAILABLE"
+                continue
             measurement["value"] = len(related)
             measurement["status"] = None
 

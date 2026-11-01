@@ -30,8 +30,9 @@ from cqa.reporting import (
     recompute_defect_counts,
     write_reports,
 )
-from cqa.security import ExecutionLog, detect_runtime, git_read
+from cqa.security import ExecutionLog, contained_file, detect_runtime, git_read
 
+_REVISION_PREFIX_BYTES = 100_000
 SECURITY_KEYS = {
     "allow_tools",
     "allow_repo_execution",
@@ -105,9 +106,14 @@ def _revision(root, log):
     if completed is None:
         digest = hashlib.sha256()
         for path in sorted(Path(root).rglob("*")):
-            if path.is_file() and ".git" not in path.parts:
-                digest.update(path.relative_to(root).as_posix().encode())
-                digest.update(path.read_bytes()[:100_000])
+            if ".git" in path.parts:
+                continue
+            resolved = contained_file(root, path)
+            if resolved is None:
+                continue
+            digest.update(path.relative_to(root).as_posix().encode())
+            with resolved.open("rb") as handle:
+                digest.update(handle.read(_REVISION_PREFIX_BYTES))
         return "uncommitted:" + digest.hexdigest()[:16]
     return completed.stdout.decode().strip()
 

@@ -20,7 +20,7 @@ from xml.etree import ElementTree as ET
 
 from cqa import ENGINE_VERSION
 from cqa.adapters import _scan_tokens, analyze_path
-from cqa.security import run_contained, run_tool
+from cqa.security import contained_file, run_contained, run_tool
 from cqa.duplication import apply_justifications, exact_duplicates, semantic_candidates, structural_duplicates, token_duplicates
 from cqa.graph import build_graph
 
@@ -149,10 +149,16 @@ def run_syntax_static(ctx):
             findings.append(item)
             seen.add(key)
     applicable = bool(analyses)
-    if findings or not clang_refused:
+    if not clang_refused:
         measurement = _measure(len(findings) if applicable else None, applicable, reason="" if applicable else "no supported source files")
     else:
-        measurement = _measure(None, True, status="UNAVAILABLE", reason="the approved clang syntax check was refused by analyzer containment; built-in checks alone cannot pass C++ syntax")
+        reason = "the approved clang syntax check was refused or did not finish conclusively; built-in checks alone cannot pass C++ syntax"
+        if findings:
+            measurement = _measure(len(findings), True, reason=reason)
+        else:
+            measurement = _measure(None, True, status="UNAVAILABLE", reason=reason)
+        # Exceptions recomputed later must not turn the missing clang evidence into a PASS.
+        measurement["incomplete_evidence"] = True
     return _result(
         findings,
         {"REL-004": measurement},
@@ -163,7 +169,9 @@ def run_syntax_static(ctx):
 def _clang_syntax(ctx, analyses):
     """Confirmed C++ parse errors from clang. Semantic and missing-include diagnostics are not syntax failures.
 
-    Returns findings, limitations, and whether containment refused an approved, installed clang.
+    Returns findings, limitations, and whether an approved, installed clang was refused or finished
+    inconclusively for any file. Exit 0 is conclusive; exit 1 is conclusive only with at least one clang
+    error diagnostic line. A signal death, any other exit, a timeout, or a launch error is not.
     """
     log = getattr(ctx, "log", None)
     if log is None or not log.allow_tools:
@@ -192,11 +200,14 @@ def _clang_syntax(ctx, analyses):
             break
         except (OSError, subprocess.TimeoutExpired) as exc:
             limitations.append(f"clang syntax checking did not finish for {relative}: {exc}")
+            refused = True
             continue
+        diagnostics = 0
         for line in (completed.stderr or "").splitlines():
             match = _CLANG_DIAGNOSTIC.match(line.strip())
             if not match:
                 continue
+            diagnostics += 1
             message = match.group("message")
             if _CLANG_IGNORE.search(message) or not _CLANG_SYNTAX.search(message):
                 ignored += 1
@@ -211,6 +222,9 @@ def _clang_syntax(ctx, analyses):
                     "Correct the syntax so the file parses.",
                 )
             )
+        if not (completed.returncode == 0 or (completed.returncode == 1 and diagnostics)):
+            limitations.append(f"clang syntax checking was inconclusive for {relative}: exit {completed.returncode} without a clang error diagnostic")
+            refused = True
     if ignored:
         limitations.append("clang reported diagnostics that are not confirmed syntax errors; those were not counted")
     return findings, limitations, refused
@@ -1722,10 +1736,13 @@ def _config_texts(ctx):
             if path.suffix.lower() not in _CONFIG_SUFFIXES and not name.startswith(".env"):
                 continue
             rel = path.relative_to(root).as_posix()
-            if rel in seen or path.stat().st_size > 1_000_000:
+            if rel in seen:
                 continue
+            resolved = contained_file(root, path)
             try:
-                text = path.read_text(encoding="utf-8", errors="replace")
+                if resolved is None or resolved.stat().st_size > 1_000_000:
+                    continue
+                text = resolved.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
             yield rel, text
@@ -2446,17 +2463,26 @@ def _discover_requirements(ctx):
     found = []
     root = Path(ctx.root)
     for path in root.rglob("*"):
-        if not path.is_file():
-            continue
         if any(part in {".git", ".venv", "node_modules", "__pycache__"} for part in path.parts):
             continue
         rel = path.relative_to(root).as_posix()
         if path.suffix.lower() in {".md", ".markdown"} and ("doc" in rel.lower() or "requirement" in path.name.lower() or "adr" in rel.lower()):
-            found.extend(_requirements_from_text(rel, path.read_text(encoding="utf-8", errors="replace")))
+            kind = "text"
         elif path.suffix.lower() == ".docx" and "requirement" in path.name.lower():
-            found.extend(_requirements_from_text(rel, _docx_text(path)))
+            kind = "docx"
         elif path.name in {"requirements.yaml", "requirements.yml", "traceability.yaml", "traceability.yml"}:
-            found.extend(_requirements_from_yaml(rel, path))
+            kind = "yaml"
+        else:
+            continue
+        resolved = contained_file(root, path)
+        if resolved is None:
+            continue
+        if kind == "text":
+            found.extend(_requirements_from_text(rel, resolved.read_text(encoding="utf-8", errors="replace")))
+        elif kind == "docx":
+            found.extend(_requirements_from_text(rel, _docx_text(resolved)))
+        else:
+            found.extend(_requirements_from_yaml(rel, resolved))
     ctx.requirements = found
     return found
 

@@ -10,6 +10,8 @@ the profile natively.
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import importlib.util
 import json
 import os
@@ -23,6 +25,7 @@ import textwrap
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,7 +36,7 @@ spec = importlib.util.spec_from_file_location("auditor", SKILL / "scripts" / "au
 auditor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(auditor)
 
-from cqa import security  # noqa: E402
+from cqa import checks, security  # noqa: E402
 from cqa.project import discover_repository, init_repository  # noqa: E402
 from cqa.security import _SECRET_DIRS, ExecutionLog, _profile, _trusted_sandbox, probe_sandbox, run_contained, run_tool  # noqa: E402
 
@@ -678,8 +681,9 @@ class SandboxTrustTests(unittest.TestCase):
         sentinel = "cqa-git-sentinel-" + os.urandom(6).hex()
         fake_dir = self.tmp / "git-bin"
         fake_dir.mkdir()
-        _write_executable(fake_dir / "git", f"#!/bin/sh\nwhile :; do echo {sentinel}; echo {sentinel} >&2; done\n")
-        os.environ["PATH"] = str(fake_dir) + os.pathsep + os.environ.get("PATH", "")
+        fake = fake_dir / "git"
+        _write_executable(fake, f"#!/bin/sh\nwhile :; do echo {sentinel}; echo {sentinel} >&2; done\n")
+        self._patch("cqa.security._trusted_git", return_value=fake)
         log = self._log()
         started = time.monotonic()
         self.assertIsNone(security.git_read(self.repo, ["log"], log, timeout=10, limit=4096))
@@ -692,8 +696,93 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertNotIn(sentinel, json.dumps({"denied": log.denied, "commands": log.commands}))
         self.assertTrue(any(item["outcome"] == "timeout" for item in log.commands))
         _write_executable(fake_dir / "git", "#!/bin/sh\nprintf 'abc\\n'\n")
-        completed = security.git_read(self.repo, ["rev-parse", "HEAD"], self._log())
+        log = self._log()
+        completed = security.git_read(self.repo, ["rev-parse", "HEAD"], log)
         self.assertEqual(completed.stdout, b"abc\n")
+        self.assertEqual(completed.args[0], str(fake))
+        self.assertTrue(all(item["command"][0] == str(fake) for item in log.commands))
+
+    def test_git_read_never_runs_path_or_repository_git(self):
+        marker = self.tmp / "git-ran"
+        spoof = f"#!/bin/sh\n: > {marker}\nprintf 'spoofed\\n'\n"
+        path_bin = self.tmp / "path-bin"
+        path_bin.mkdir()
+        _write_executable(path_bin / "git", spoof)
+        _write_executable(self.repo / "git", spoof)
+        repo_bin = self.repo / "bin"
+        repo_bin.mkdir()
+        host = next((Path(raw) for raw in security._GIT_CANDIDATES if Path(raw).is_file()), Path("/usr/bin/true"))
+        (repo_bin / "git").symlink_to(host.resolve())
+        os.environ["PATH"] = os.pathsep.join([str(path_bin), str(repo_bin), ".", os.environ.get("PATH", "")])
+        self._chdir(self.repo)
+        forbidden = {"git", str(path_bin / "git"), str(self.repo / "git"), str(repo_bin / "git"), "./git"}
+        trusted = security._trusted_git(self.repo)
+        real = security._run_process
+        calls = []
+
+        def record(command, *args, **kwargs):
+            calls.append(list(command))
+            return real(command, *args, **kwargs)
+
+        log = self._log()
+        with mock.patch("cqa.security._run_process", side_effect=record):
+            for args in (["rev-parse", "HEAD"], ["log", "--numstat", "--format=%H"]):
+                completed = security.git_read(self.repo, args, log)
+                self.assertTrue(completed is None or b"spoofed" not in completed.stdout)
+        self.assertFalse(marker.exists())
+        launched = [item["command"] for item in log.commands if item["outcome"] != "skipped"]
+        for command in calls + launched:
+            self.assertNotIn(command[0], forbidden)
+            self.assertFalse(security._lexically_inside(self.repo, command[0]), command[0])
+        if trusted is None:
+            self.assertEqual(calls, [])
+            self.assertTrue(all(item["outcome"] == "skipped" for item in log.commands))
+        else:
+            self.assertTrue(calls)
+            self.assertFalse(security._inside(self.repo, trusted))
+            for command in calls + launched:
+                self.assertEqual(command[0], str(trusted))
+
+    def test_trusted_git_needs_a_fixed_owner_writable_file_outside_the_repository(self):
+        good = self.tmp / "good" / "git"
+        good.parent.mkdir()
+        _write_executable(good, "#!/bin/sh\nexit 0\n")
+        good.chmod(0o755)
+        shared = self.tmp / "shared" / "git"
+        shared.parent.mkdir()
+        _write_executable(shared, "#!/bin/sh\nexit 0\n")
+        shared.chmod(0o775)
+        _write_executable(self.repo / "git", "#!/bin/sh\nexit 0\n")
+        (self.repo / "git").chmod(0o755)
+        into_repo = self.tmp / "into-repo-git"
+        into_repo.symlink_to(self.repo / "git")
+        directory = self.tmp / "dir" / "git"
+        directory.mkdir(parents=True)
+        to_good = self.tmp / "to-good-git"
+        to_good.symlink_to(good)
+        rejected = {
+            "missing": self.tmp / "missing" / "git",
+            "inside the repository": self.repo / "git",
+            "symlink into the repository": into_repo,
+            "group writable": shared,
+            "directory": directory,
+        }
+        for name, candidate in rejected.items():
+            with self.subTest(candidate=name):
+                with mock.patch("cqa.security._GIT_CANDIDATES", (str(candidate),)):
+                    self.assertIsNone(security._trusted_git(self.repo))
+        if os.geteuid() != 0:
+            with self.subTest(candidate="owned by another user"):
+                with mock.patch("cqa.security._GIT_CANDIDATES", (str(good),)), mock.patch("cqa.security.os.geteuid", return_value=os.geteuid() + 1):
+                    self.assertIsNone(security._trusted_git(self.repo))
+        with mock.patch("cqa.security._GIT_CANDIDATES", (*(str(path) for path in rejected.values()), str(to_good), str(good))):
+            self.assertEqual(security._trusted_git(self.repo), good.resolve())
+        with mock.patch("cqa.security._GIT_CANDIDATES", tuple(str(path) for path in rejected.values())):
+            log = self._log()
+            with mock.patch("cqa.security._run_process") as runner:
+                self.assertIsNone(security.git_read(self.repo, ["rev-parse", "HEAD"], log))
+                runner.assert_not_called()
+        self.assertEqual([item["outcome"] for item in log.commands], ["skipped"])
 
     def test_install_analyzer_bounds_output_and_logs_no_child_output(self):
         import hashlib
@@ -775,6 +864,75 @@ class SandboxTrustTests(unittest.TestCase):
             if path.is_file():
                 self.assertNotIn(sentinel, path.read_text(encoding="utf-8", errors="replace"), path)
         self.assertFalse(any(item.get("file") == "link.py" for item in report["findings"]))
+
+    def _outside_sentinel(self, name, text):
+        outside = self.tmp / "outside"
+        outside.mkdir(exist_ok=True)
+        path = outside / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_config_scan_skips_file_symlinks_that_leave_the_repository(self):
+        sentinel = "cqa-config-sentinel-" + os.urandom(6).hex()
+        secret = self._outside_sentinel("settings.yaml", f"token: {sentinel}\ndebug: true\n")
+        (self.repo / "app.yaml").write_text("debug: false\n", encoding="utf-8")
+        (self.repo / "link.yaml").symlink_to(secret)
+        (self.repo / ".env.local").symlink_to(secret)
+        (self.repo / "dangling.yaml").symlink_to(self.tmp / "missing.yaml")
+        texts = dict(checks._config_texts(SimpleNamespace(root=self.repo, analyses=[])))
+        self.assertEqual(sorted(texts), ["app.yaml"])
+        self.assertNotIn(sentinel, json.dumps(texts))
+
+    def test_requirements_discovery_skips_file_symlinks_that_leave_the_repository(self):
+        sentinel = "cqa-requirement-sentinel-" + os.urandom(6).hex()
+        secret = self._outside_sentinel("requirements.md", f"## REQ-9 {sentinel}\n")
+        docs = self.repo / "docs"
+        docs.mkdir()
+        (docs / "requirements.md").write_text("## REQ-1 Inside requirement\n", encoding="utf-8")
+        (docs / "outside.md").symlink_to(secret)
+        (self.repo / "requirements.yaml").symlink_to(secret)
+        found = checks._discover_requirements(SimpleNamespace(root=self.repo))
+        self.assertNotIn(sentinel, json.dumps(found, default=str))
+        self.assertEqual({(item["id"], item["file"]) for item in found}, {("REQ-1", "docs/requirements.md")})
+
+    def test_revision_fallback_reads_only_a_bounded_prefix_of_files_inside_the_repository(self):
+        from cqa import audit as audit_module
+
+        bound = audit_module._REVISION_PREFIX_BYTES
+        secret = self._outside_sentinel("secret.txt", "cqa-revision-sentinel")
+        (self.repo / "inside.txt").write_text("inside", encoding="utf-8")
+        big = self.repo / "big.bin"
+        big.write_bytes(b"a" * bound + b"tail")
+        (self.repo / "link.txt").symlink_to(secret)
+        expected = hashlib.sha256()
+        for name, data in (("big.bin", b"a" * bound), ("inside.txt", b"inside")):
+            expected.update(name.encode())
+            expected.update(data)
+        reads = []
+        real = audit_module.contained_file
+
+        class Recorder:
+            def __init__(self, path):
+                self.path = path
+
+            @contextlib.contextmanager
+            def open(self, mode):
+                with self.path.open(mode) as handle:
+                    yield SimpleNamespace(read=lambda size=-1: reads.append((self.path.name, size)) or handle.read(size))
+
+        def spy(root, path):
+            resolved = real(root, path)
+            return Recorder(resolved) if resolved is not None else None
+
+        with mock.patch("cqa.audit.git_read", return_value=None), mock.patch("cqa.audit.contained_file", side_effect=spy):
+            revision = audit_module._revision(self.repo, self._log())
+        self.assertEqual(revision, "uncommitted:" + expected.hexdigest()[:16])
+        self.assertEqual(sorted(reads), [("big.bin", bound), ("inside.txt", bound)])
+        with mock.patch("cqa.audit.git_read", return_value=None):
+            self.assertEqual(audit_module._revision(self.repo, self._log()), revision)
+            secret.write_text("changed outside", encoding="utf-8")
+            big.write_bytes(b"a" * bound + b"other tail")
+            self.assertEqual(audit_module._revision(self.repo, self._log()), revision)
 
     def test_interpreter_wrapper_is_rejected(self):
         shell = Path("/bin/bash")
