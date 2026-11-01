@@ -313,6 +313,23 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertNotIn('(allow file-read* (subpath "/etc"))', profile)
         self.assertNotIn('(allow file-read* (subpath "/opt"))', profile)
 
+    def test_profile_does_not_grant_a_home_interpreter_prefix(self):
+        home = self.tmp / "home"
+        prefix = home / ".local"
+        sentinel = prefix / "share" / "keyrings" / "login"
+        sentinel.parent.mkdir(parents=True)
+        sentinel.write_text("secret", encoding="utf-8")
+        (home / ".ssh").mkdir()
+        repo = home / "repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+        with mock.patch.object(Path, "home", return_value=home), mock.patch("cqa.security.sys.prefix", str(prefix)), mock.patch("cqa.security.sys.base_prefix", str(prefix)):
+            profile = _profile([str(repo)], None, repo)
+        self.assertFalse(_read_allowed(profile, sentinel))
+        self.assertNotIn(f'(subpath "{prefix.resolve()}")', profile)
+        self.assertFalse(_read_allowed(profile, home / ".ssh" / "id_ed25519"))
+        self.assertTrue(_read_allowed(profile, repo / "app.py"))
+
     def test_profile_denies_home_secrets_even_when_they_are_requested(self):
         home = self.tmp / "home"
         (home / ".ssh").mkdir(parents=True)
@@ -526,6 +543,79 @@ class SandboxTrustTests(unittest.TestCase):
         self._chdir(elsewhere)
         wrapped = security._contained_command(["bin/tool"], self.repo, None)
         self.assertEqual(wrapped[4], str((self.repo / "bin" / "tool").resolve()))
+
+    def test_pytest_read_root_is_the_audit_root(self):
+        """A marker directory can be the process cwd, but reads stay inside the audit root.
+
+        The fake sandbox only builds the profile. It is not native seatbelt enforcement.
+        """
+        repo = self.repo
+        (repo / "app.py").write_text("def add(left, right):\n    return left + right\n", encoding="utf-8")
+        (repo / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
+        tests = repo / "tests"
+        tests.mkdir()
+        (tests / "conftest.py").write_text("import app\n", encoding="utf-8")
+        (tests / "test_app.py").write_text("def test_add():\n    assert True\n", encoding="utf-8")
+        (tests / "bin").mkdir()
+        _write_executable(tests / "bin" / "tool", "#!/bin/sh\nexit 0\n")
+        (repo / "bin").mkdir()
+        _write_executable(repo / "bin" / "tool", "#!/bin/sh\nexit 0\n")
+        pytest_bin = repo / ".venv" / "bin" / "pytest"
+        pytest_bin.parent.mkdir(parents=True)
+        _write_executable(pytest_bin, "#!/bin/sh\nexit 0\n")
+        sibling = self.tmp / "home-credential"
+        sibling.write_text("secret", encoding="utf-8")
+        home = self.tmp / "home"
+        home_pytest = home / ".venv" / "bin" / "pytest"
+        home_pytest.parent.mkdir(parents=True)
+        _write_executable(home_pytest, "#!/bin/sh\nexit 0\n")
+        above = self.tmp / ".venv" / "bin" / "pytest"
+        above.parent.mkdir(parents=True)
+        _write_executable(above, "#!/bin/sh\nexit 0\n")
+
+        analyses = [
+            {"path": "app.py", "symbols": []},
+            {"path": "tests/test_app.py", "symbols": []},
+            {"path": "tests/conftest.py", "symbols": []},
+        ]
+        ctx = SimpleNamespace(root=repo, files=[item["path"] for item in analyses], analyses=analyses, texts={}, log=self._log())
+        captured = {}
+
+        def fake_run(command, cwd, log, timeout=30, write_path=None, env=None, read_root=None):
+            captured.update(command=command, cwd=cwd, env=env, read_root=read_root, log=log)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch("cqa.checks.run_contained", side_effect=fake_run):
+            result = checks.project_test_result(ctx)
+        self.assertEqual(result["runner"], "pytest")
+        self.assertEqual(Path(captured["cwd"]).resolve(), tests.resolve())
+        self.assertEqual(Path(captured["read_root"]).resolve(), repo.resolve())
+        self.assertEqual(captured["command"][0], str(pytest_bin.resolve()))
+        pythonpath = captured["env"]["PYTHONPATH"].split(os.pathsep)
+        self.assertEqual(pythonpath[0], str(repo.resolve()))
+        self.assertIn(str(tests.resolve()), pythonpath)
+        self._select_sandbox(self._fake_sandbox())
+        wrapped = security._contained_command(captured["command"], captured["cwd"], None, read_root=captured["read_root"])
+        profile = wrapped[2]
+        self.assertTrue(_read_allowed(profile, repo / "app.py"))
+        self.assertTrue(_read_allowed(profile, repo / "pyproject.toml"))
+        self.assertTrue(_read_allowed(profile, pytest_bin))
+        self.assertFalse(_read_allowed(profile, sibling))
+        relative = security._contained_command(["bin/tool"], tests, None, read_root=repo)
+        self.assertEqual(relative[-1], str((tests / "bin" / "tool").resolve()))
+
+        bare = home / "bare-repo"
+        (bare / "tests").mkdir(parents=True)
+        (bare / "tests" / "conftest.py").write_text("", encoding="utf-8")
+        with mock.patch.object(Path, "home", return_value=home):
+            found = checks._pytest_executable(bare, bare)
+            nested = checks._pytest_executable(bare / "tests", bare)
+        self.assertNotEqual(found, home_pytest.resolve())
+        self.assertNotEqual(nested, home_pytest.resolve())
+        self.assertNotEqual(found, above.resolve())
+        self.assertNotEqual(nested, above.resolve())
+        self.assertTrue(found is None or home not in Path(found).parents)
+        self.assertEqual(checks._pytest_executable(tests, repo), pytest_bin.resolve())
 
     def test_containment_denial_does_not_store_child_output(self):
         self._accept_fake_sandbox()
@@ -948,6 +1038,63 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertIsNone(security.git_read(child, ["diff", "--name-only"], log))
         self.assertIsNone(security.git_read(child, ["rev-parse", "--show-toplevel"], log))
         self.assertFalse(marker.exists())
+
+    def test_git_read_pins_the_work_tree(self):
+        resolved = str(self.repo.resolve())
+        (self.repo / ".git").mkdir()
+        fake = self.tmp / "fake-git"
+        _write_executable(fake, "#!/bin/sh\nprintf 'should-not-run\\n'\n")
+        log = self._log()
+        with mock.patch("cqa.security._trusted_git", return_value=fake.resolve()), mock.patch(
+            "cqa.security._run_process", return_value=subprocess.CompletedProcess(["git"], 0, b"", b"")
+        ) as runner:
+            security.git_read(self.repo, ["diff", "--name-only"], log)
+        command = list(runner.call_args.args[0])
+        self.assertLess(command.index("--work-tree"), command.index("diff"))
+        self.assertEqual(command[command.index("--work-tree") + 1], resolved)
+        self.assertIn(f"core.worktree={resolved}", command)
+        runner.assert_called_once()
+
+        trusted = security._trusted_git(self.repo)
+        if trusted is None:
+            skipped = self._log()
+            with mock.patch("cqa.security._run_process") as real_runner:
+                self.assertIsNone(security.git_read(self.repo, ["diff", "--name-only"], skipped))
+                real_runner.assert_not_called()
+            self.assertEqual([item["outcome"] for item in skipped.commands], ["skipped"])
+            return
+
+        import shutil
+
+        shutil.rmtree(self.repo / ".git")
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+
+        def run_git(*args):
+            subprocess.run([str(trusted), *args], cwd=self.repo, env=env, check=True, capture_output=True)
+
+        run_git("init", "-q")
+        run_git("config", "user.email", "cqa@example.invalid")
+        run_git("config", "user.name", "cqa")
+        sentinel = "cqa-worktree-sentinel.txt"
+        (self.repo / "readme.txt").write_text("inside\n", encoding="utf-8")
+        (self.repo / sentinel).write_text("clean\n", encoding="utf-8")
+        run_git("add", ".")
+        run_git("commit", "-q", "-m", "one")
+        outside = self.tmp / "outside-worktree"
+        outside.mkdir()
+        (outside / "readme.txt").write_text("inside\n", encoding="utf-8")
+        (outside / sentinel).write_text("outside-secret\n", encoding="utf-8")
+        run_git("config", "core.worktree", str(outside.resolve()))
+        log = self._log()
+        completed = security.git_read(self.repo, ["diff", "--name-only"], log)
+        self.assertIsNotNone(completed)
+        stdout = completed.stdout.decode()
+        self.assertNotIn(sentinel, stdout)
+        self.assertNotIn("outside-secret", stdout)
+        recorded = next(item["command"] for item in log.commands if "diff" in item["command"])
+        self.assertEqual(recorded[recorded.index("--work-tree") + 1], resolved)
+        self.assertIn(f"core.worktree={resolved}", recorded)
+        self.assertNotIn(str(outside.resolve()), recorded)
 
     def _sentinel_yaml(self):
         sentinel = self.tmp / "sentinel.yaml"

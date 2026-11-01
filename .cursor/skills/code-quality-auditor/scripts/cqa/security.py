@@ -506,9 +506,14 @@ def _policy_probe(base):
 
 
 def _existing_reads(read_paths):
+    """Existing paths from the caller. The interpreter prefix is not added.
+
+    A prefix under the home, such as ~/.local or ~/.pyenv, would be re-allowed
+    after the home deny and would expose credential directories there. A system
+    interpreter is already covered by the reviewed system roots. Any other
+    interpreter stays unreadable and containment fails closed.
+    """
     candidates = list(read_paths or [])
-    candidates.append(sys.prefix)
-    candidates.append(getattr(sys, "base_prefix", sys.prefix))
     roots = []
     seen = set()
     for raw in candidates:
@@ -606,11 +611,11 @@ def _profile(read_paths, write_path, cwd):
     """Deny by default and grant only scoped rules.
 
     No file rule is unfiltered. Reads cover the reviewed system roots, the device
-    files, and the command's own inputs, including an accepted write path. Writes
-    cover only a write path that _writable_scratch accepts for cwd. User roots are
-    denied before the command's inputs are re-opened, and credential directories
-    are denied last. If seatbelt cannot launch under this profile, probe_sandbox
-    reports containment unavailable.
+    files, and the command's own inputs, including an accepted write path. The
+    interpreter prefix is not granted. Writes cover only a write path that
+    _writable_scratch accepts for cwd. User roots are denied before the command's
+    inputs are re-opened, and credential directories are denied last. If seatbelt
+    cannot launch under this profile, probe_sandbox reports containment unavailable.
     """
     if write_path and not _writable_scratch(write_path, cwd):
         write_path = None
@@ -655,7 +660,12 @@ def _profile(read_paths, write_path, cwd):
 """
 
 
-def _contained_command(command, cwd, write_path):
+def _audit_root(cwd, read_root):
+    """The repository granted for reads. Defaults to the process cwd."""
+    return Path(cwd if read_root is None else read_root).resolve()
+
+
+def _contained_command(command, cwd, write_path, read_root=None):
     command = list(command)
     executable = Path(command[0])
     if os.sep in str(command[0]):
@@ -664,7 +674,8 @@ def _contained_command(command, cwd, write_path):
         if executable.is_file():
             command[0] = str(executable.resolve())
     resolved_write = str(Path(write_path).resolve()) if write_path else None
-    profile = _profile(_command_read_paths(cwd, command), resolved_write, cwd)
+    root = _audit_root(cwd, read_root)
+    profile = _profile(_command_read_paths(root, command), resolved_write, root)
     return _sandbox_command(profile, command)
 
 
@@ -677,13 +688,14 @@ def _containment_failed(completed):
     return completed.returncode < 0 and not stdout.strip() and not stderr.strip()
 
 
-def _run_sandboxed(command, cwd, log, timeout, write_path, env=None):
+def _run_sandboxed(command, cwd, log, timeout, write_path, env=None, read_root=None):
     """The only launch path for host analyzers and repository code. A containment failure is never retried unsandboxed."""
-    ok, detail = probe_sandbox(cwd)
+    root = _audit_root(cwd, read_root)
+    ok, detail = probe_sandbox(root)
     if not ok:
         log.deny("containment", detail)
         raise PermissionError(detail)
-    if write_path and not _writable_scratch(write_path, cwd):
+    if write_path and not _writable_scratch(write_path, root):
         detail = "the write path is not a private temporary directory outside the audit root; the command was not run"
         log.deny("containment", detail)
         raise PermissionError(detail)
@@ -693,7 +705,7 @@ def _run_sandboxed(command, cwd, log, timeout, write_path, env=None):
     if write_path:
         scratch = str(Path(write_path).resolve())
         run_env.update({"TMPDIR": scratch, "TMP": scratch, "TEMP": scratch})
-    wrapped = _contained_command(command, cwd, write_path)
+    wrapped = _contained_command(command, cwd, write_path, read_root)
     log.record(wrapped, "started")
     try:
         completed = _run_process(wrapped, cwd, run_env, timeout)
@@ -710,15 +722,20 @@ def _run_sandboxed(command, cwd, log, timeout, write_path, env=None):
     return completed
 
 
-def run_contained(command, cwd, log, timeout=30, write_path=None, env=None):
-    """Run a command only when repository execution is approved and containment actually applies."""
+def run_contained(command, cwd, log, timeout=30, write_path=None, env=None, read_root=None):
+    """Run a command only when repository execution is approved and containment actually applies.
+
+    cwd is the process working directory. read_root is the audit root used for the
+    read grant and the scratch-directory check. It defaults to cwd. A relative
+    executable is still resolved against cwd.
+    """
     if not log.allow_repo_execution:
         log.deny("repository-execution", "repository code was not executed; approval was not given")
         raise PermissionError("repository execution was not approved")
     if not log.sandbox_confirmed:
         log.deny("sandbox-confirmation", "sandbox confirmation was not given")
         raise PermissionError("sandbox confirmation was not given")
-    return _run_sandboxed(command, cwd, log, timeout, write_path, env)
+    return _run_sandboxed(command, cwd, log, timeout, write_path, env, read_root)
 
 
 def run_tool(command, cwd, log, timeout=60):
@@ -987,6 +1004,9 @@ def git_read(repo, args, log, timeout=20, limit=_OUTPUT_LIMIT):
     except _GitConfigRefused as exc:
         log.record(["git", *args], "skipped", str(exc))
         return None
+    # The path is this process's view of the audit root, never a value read from repository config.
+    # --work-tree overrides core.worktree. -c pins the same path so config cannot choose another tree.
+    resolved_repo = Path(repo).resolve()
     command = [str(git), "--no-pager", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=", "-c", "protocol.allow=never", "--no-optional-locks"]
     for key in _GIT_HELPER_KEYS:
         command.extend(["-c", f"{key}="])
@@ -995,16 +1015,18 @@ def git_read(repo, args, log, timeout=20, limit=_OUTPUT_LIMIT):
     command.extend(overrides)
     for alias in GIT_ALIASES:
         command.extend(["-c", f"alias.{alias}="])
+    command.extend(["-c", f"core.worktree={resolved_repo}"])
     args = list(args)
     if args and args[0] in _GIT_DIFF_COMMANDS:
         # Repository config and .gitattributes can name external diff and textconv commands.
         args[1:1] = ["--no-ext-diff", "--no-textconv"]
+    command.extend(["--work-tree", str(resolved_repo)])
     command.extend(args)
     env = os.environ.copy()
     for key in ("GIT_EXTERNAL_DIFF", "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
         env.pop(key, None)
     # Only the repository's own .git was classified; never let discovery climb to a parent repository.
-    env["GIT_CEILING_DIRECTORIES"] = str(Path(repo).resolve().parent)
+    env["GIT_CEILING_DIRECTORIES"] = str(resolved_repo.parent)
     env["GIT_CONFIG_GLOBAL"] = os.devnull
     env["GIT_CONFIG_SYSTEM"] = os.devnull
     env["GIT_TERMINAL_PROMPT"] = "0"

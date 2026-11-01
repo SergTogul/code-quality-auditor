@@ -2135,12 +2135,21 @@ def _pytest_cwd(ctx, tests):
     return max(candidates, key=lambda path: len(path.parts))
 
 
-def _pytest_executable(cwd):
-    for base in (cwd, cwd.parent):
+def _pytest_executable(cwd, root):
+    """Find pytest in a venv from cwd upward through the audit root, then on PATH.
+
+    The parent of the audit root is never searched, so a home-directory venv is not selected.
+    """
+    directory = Path(cwd).resolve()
+    root = Path(root).resolve()
+    while directory == root or root in directory.parents:
         for name in (".venv", "venv"):
-            candidate = base / name / "bin" / "pytest"
+            candidate = directory / name / "bin" / "pytest"
             if candidate.is_file() and os.access(candidate, os.X_OK):
                 return candidate.resolve()
+        if directory == root:
+            break
+        directory = directory.parent
     system = shutil.which("pytest")
     return Path(system).resolve() if system else None
 
@@ -2201,8 +2210,9 @@ def project_test_result(ctx):
     work = Path(tempfile.mkdtemp(prefix="cqa-runner-")).resolve()
     try:
         if _uses_pytest(ctx, tests):
+            root = Path(ctx.root).resolve()
             cwd = _pytest_cwd(ctx, tests)
-            executable = _pytest_executable(cwd)
+            executable = _pytest_executable(cwd, root)
             if executable is None:
                 return None
             command = [
@@ -2239,10 +2249,15 @@ def project_test_result(ctx):
             ctx.project_tests = {"runner": "unittest", "cwd": root, "failures": failures, "returncode": returncode}
             return ctx.project_tests
         env = {"PYTHONDONTWRITEBYTECODE": "1"}
+        entries = [str(root)]
+        if cwd.resolve() != root:
+            entries.append(str(cwd.resolve()))
         previous = os.environ.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = str(cwd) if not previous else str(cwd) + os.pathsep + previous
+        if previous:
+            entries.append(previous)
+        env["PYTHONPATH"] = os.pathsep.join(entries)
         try:
-            completed = run_contained(command, cwd, ctx.log, timeout=180, write_path=work, env=env)
+            completed = run_contained(command, cwd, ctx.log, timeout=180, write_path=work, env=env, read_root=root)
         except (PermissionError, subprocess.TimeoutExpired):
             return None
         text = f"{completed.stdout or ''}\n{completed.stderr or ''}"
@@ -2251,7 +2266,6 @@ def project_test_result(ctx):
             ctx.project_tests = None
             ctx._project_tests_ready = True
             return None
-        root = Path(ctx.root).resolve()
         failures = [
             f"{(cwd / item.split(':', 1)[0]).resolve().relative_to(root).as_posix()}:{item.split(':', 1)[1]}"
             for item in failures
@@ -2277,7 +2291,7 @@ def _pytest_line_reason(ctx, tests, result):
         if coverage_installed:
             return "coverage.py is installed; its report was not parsed and line coverage was not estimated"
         return "pytest ran; coverage.py is not installed and line coverage was not estimated"
-    if _pytest_executable(_pytest_cwd(ctx, tests)) is None:
+    if _pytest_executable(_pytest_cwd(ctx, tests), ctx.root) is None:
         return "pytest is the repository runner and it is not installed; coverage was not estimated"
     return "pytest did not finish; coverage.py was not run and line coverage was not estimated"
 
