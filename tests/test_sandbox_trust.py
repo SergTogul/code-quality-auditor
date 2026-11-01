@@ -195,16 +195,24 @@ class SandboxTrustTests(unittest.TestCase):
             profile.index('(deny file-read-metadata (subpath "/"))'),
             profile.index('(allow file-read-metadata (literal "/"))'),
         )
-        self.assertTrue(_read_allowed(profile, "/"))
-        self.assertFalse(_read_allowed(profile, "/etc/passwd"))
-        self.assertFalse(_read_allowed(profile, "/var/lib/cqa-not-allowed"))
-        self.assertFalse(_read_allowed(profile, "/opt/cqa-not-allowed"))
-        self.assertFalse(_read_allowed(profile, sibling))
-        self.assertTrue(_read_allowed(profile, repo_file))
-        self.assertTrue(_read_allowed(profile, Path("/usr/bin/true")))
         secret = Path.home() / ".ssh" / "id_ed25519"
-        self.assertFalse(_read_allowed(profile, secret))
+        allowed = ("/", repo_file, "/usr/bin/true")
+        denied = (
+            "/etc/passwd",
+            "/var/lib/cqa-not-allowed",
+            "/opt/cqa-not-allowed",
+            sibling,
+            secret,
+        )
+        for operation in ("file-read*", "file-read-metadata"):
+            for path in allowed:
+                with self.subTest(operation=operation, path=str(path)):
+                    self.assertTrue(_read_allowed(profile, path, operation))
+            for path in denied:
+                with self.subTest(operation=operation, path=str(path)):
+                    self.assertFalse(_read_allowed(profile, path, operation))
         self.assertNotIn('(allow file-read* (subpath "/"))', profile)
+        self.assertNotIn('(allow file-read-metadata (subpath "/"))', profile)
         self.assertNotIn('(allow file-read* (subpath "/etc"))', profile)
         self.assertNotIn('(allow file-read* (subpath "/opt"))', profile)
 
@@ -329,26 +337,29 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertIn("interpreter or shell", detail)
 
 
-def _read_allowed(profile, path):
-    """Last matching file-read* rule wins, which is how seatbelt evaluates a profile."""
+def _read_allowed(profile, path, operation="file-read*"):
+    """Last matching rule wins, which is how seatbelt evaluates a profile.
+
+    `file-read*` is a wildcard that also covers `file-read-metadata`, so its
+    rules count when evaluating metadata reads.
+    """
+    operations = {"file-read*", operation}
     decision = False
     target = Path(path)
     for raw in profile.splitlines():
         line = raw.strip()
-        if line == "(allow file-read*)":
-            decision = True
-            continue
-        if line == "(deny file-read*)":
-            decision = False
-            continue
         for verb, allowed in (("allow", True), ("deny", False)):
-            for kind in ("subpath", "literal"):
-                prefix = f'({verb} file-read* ({kind} "'
-                if not line.startswith(prefix) or not line.endswith('"))'):
-                    continue
-                root = Path(line[len(prefix):-3])
-                if target == root or (kind == "subpath" and root in target.parents):
+            for op in operations:
+                if line == f"({verb} {op})":
                     decision = allowed
+                    continue
+                for kind in ("subpath", "literal"):
+                    prefix = f'({verb} {op} ({kind} "'
+                    if not line.startswith(prefix) or not line.endswith('"))'):
+                        continue
+                    root = Path(line[len(prefix):-3])
+                    if target == root or (kind == "subpath" and root in target.parents):
+                        decision = allowed
     return decision
 
 
