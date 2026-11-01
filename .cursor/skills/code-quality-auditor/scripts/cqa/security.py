@@ -384,9 +384,20 @@ def _compile_toolchain_grants(link, target):
             bundle = parent
             break
     metadata = []
-    for alias in _seatbelt_aliases(link.parent):
-        if alias not in metadata and not _too_broad(alias, _user_roots()):
-            metadata.append(alias)
+
+    def add_meta(path):
+        for alias in _seatbelt_aliases(path):
+            if alias not in metadata and not _too_broad(alias, _user_roots()):
+                metadata.append(alias)
+
+    add_meta(link.parent)
+    # The bundle subpath does not cover its ancestors. realpath of an SDK
+    # inside /Applications/Xcode_*.app fails unless /Applications itself can
+    # be stat'd. Metadata on that directory does not make sibling apps readable.
+    for parent in bundle.parents:
+        if parent == Path("/"):
+            break
+        add_meta(parent)
     return [link, bundle], metadata
 
 
