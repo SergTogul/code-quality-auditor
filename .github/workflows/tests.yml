@@ -22,14 +22,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # macOS is intentionally absent. See "Known limitations" in the README.
           - os: ubuntu-latest
             python-version: "3.12"
           - os: ubuntu-latest
             python-version: "3.13"
           - os: ubuntu-latest
             python-version: "3.14"
-          - os: macos-15
-            python-version: "3.12"
     defaults:
       run:
         shell: bash
@@ -108,31 +107,6 @@ jobs:
 
       - name: Run test suite
         run: python scripts/ci/run_unittest.py --start-directory tests --result-json "$RESULTS_DIR/unittest.json" --verbosity 2
-
-      - name: Require native sandbox tests to run on macOS
-        if: runner.os == 'macOS'
-        run: |
-          python - <<'EOF'
-          import json
-          import os
-          import sys
-          from pathlib import Path
-
-          results = Path(os.environ["RESULTS_DIR"])
-          platform_info = json.loads((results / "platform.json").read_text(encoding="utf-8"))
-          data = json.loads((results / "unittest.json").read_text(encoding="utf-8"))
-          problems = []
-          if platform_info.get("sandbox_exec_is_file") is not True:
-              problems.append("/usr/bin/sandbox-exec is not a file on this macOS runner")
-          skipped = [item["id"] for item in data["skipped_details"] if item["reason"] == "requires macOS /usr/bin/sandbox-exec"]
-          for test_id in skipped:
-              problems.append(f"native sandbox test was skipped: {test_id}")
-          for problem in problems:
-              print(f"::error::{problem}")
-          if problems:
-              sys.exit(1)
-          print("native sandbox-exec is present and no native sandbox test was skipped")
-          EOF
 
       - name: Summarize test results
         if: always()

@@ -12,4 +12,10 @@ Python 3.12 or newer is required. Install `requirements.txt` into `.venv` for lo
 
 `.venv/bin/python -m unittest discover -s tests -v`
 
-CI (`.github/workflows/tests.yml`) installs the exact pin in `requirements-ci.txt` and runs the same discovery through `scripts/ci/run_unittest.py` on Linux with Python 3.12, 3.13, and 3.14 and on macOS with Python 3.12. On Linux only the portions that need the native macOS `/usr/bin/sandbox-exec` are skipped, with the reason `requires macOS /usr/bin/sandbox-exec`; the unapproved-execution assertions in those tests still run. A skipped test is not counted as platform coverage. The macOS job fails if `/usr/bin/sandbox-exec` is missing or any of those native tests is skipped. Each matrix job attaches machine-readable results (`unittest.json`, `selfcheck.json`, `platform.json`) as an Actions artifact. The stable check to require for merges is `Required tests`.
+CI (`.github/workflows/tests.yml`) installs the exact pin in `requirements-ci.txt` and runs the same discovery through `scripts/ci/run_unittest.py` on Linux with Python 3.12, 3.13, and 3.14. Tests that need the native macOS `/usr/bin/sandbox-exec` are skipped there, with the reason `requires macOS /usr/bin/sandbox-exec`; the unapproved-execution assertions in those tests still run. A skipped test is not counted as platform coverage. Each matrix job attaches machine-readable results (`unittest.json`, `selfcheck.json`, `platform.json`) as an Actions artifact. The stable check to require for merges is `Required tests`.
+
+## Known limitations
+
+GitHub Actions does not run a macOS job. Native `sandbox-exec` coverage, including contained repository execution and `clang` syntax checks inside the sandbox, is local-only until that runner is reliable.
+
+On GitHub-hosted macOS 15 the binary `/usr/bin/sandbox-exec` is present, but a contained `clang` still cannot read the selected Xcode SDK. `xcode-select` uses `/var/select/developer_dir`, and `clang` then fails `realpath` of `MacOSX.sdk` with `Operation not permitted` (observed under `/Applications/Xcode_16.4.app`). Those tests are not required for merge. Run them on a Mac with `python -m unittest discover -s tests -v` when you need that coverage.
