@@ -1046,6 +1046,50 @@ class AcceptanceTests(unittest.TestCase):
         self.assertTrue(any(item["operation"] == "containment" for item in report["execution"]["denied"]))
         self.assertFalse(any(item["command"] and item["command"][0] == str(clang) for item in report["execution"]["commands"]))
 
+    def test_cached_syntax_pass_is_not_reused_when_approved_clang_cannot_run(self):
+        """Requirements: 4.4, 8.7. Cache keys must change with tool approval so an unapproved PASS is not replayed when clang cannot be contained."""
+        marker = self.tmp / "clang-ran"
+        clang = self.tmp / "host-bin" / "clang"
+        clang.parent.mkdir()
+        clang.write_text(f"#!/bin/sh\n: > {marker}\nexit 0\n", encoding="utf-8")
+        clang.chmod(0o755)
+        real_which = shutil.which
+
+        def which(name, *args, **kwargs):
+            return str(clang) if name == "clang" else real_which(name, *args, **kwargs)
+
+        repo = self.repo("clang-cache-approvals")
+        _write(repo / "quality-auditor.yaml", """
+        version: 1
+        default_profile: syntax
+        profiles:
+          syntax:
+            include: [syntax_static]
+        """)
+        _write(repo / "valid.cpp", "int run() { return 1; }\n")
+        cache = self.tmp / "syntax-cache"
+        invocation = {"cache_dir": str(cache)}
+        with mock.patch("cqa.checks.shutil.which", side_effect=which), mock.patch("cqa.security._trusted_sandbox", return_value=None):
+            unapproved = self.audit(repo, profile="syntax", invocation=invocation)
+            approved = self.audit(repo, profile="syntax", allow_tools=True, invocation=invocation)
+            again = self.audit(repo, profile="syntax", invocation=invocation)
+        self.assertFalse(marker.exists())
+        unapproved_metrics = {item["metric_id"]: item for item in unapproved["metrics"]}
+        self.assertEqual(unapproved["decision"], "PASS")
+        self.assertEqual(unapproved_metrics["REL-004"]["status"], "PASS")
+        approved_metrics = {item["metric_id"]: item for item in approved["metrics"]}
+        approved_task = next(task for task in approved["execution"]["tasks"] if task["task_id"] == "syntax_static")
+        self.assertEqual(approved["decision"], "INCOMPLETE")
+        self.assertEqual(approved_metrics["REL-004"]["status"], "UNAVAILABLE")
+        self.assertTrue(approved_task["ok"])
+        self.assertIsNot(approved_task.get("cached"), True)
+        self.assertTrue(any(item["operation"] == "containment" for item in approved["execution"]["denied"]))
+        again_metrics = {item["metric_id"]: item for item in again["metrics"]}
+        again_task = next(task for task in again["execution"]["tasks"] if task["task_id"] == "syntax_static")
+        self.assertEqual(again["decision"], "PASS")
+        self.assertEqual(again_metrics["REL-004"]["status"], "PASS")
+        self.assertTrue(again_task["cached"])
+
     def _scripted_clang(self, outcomes):
         """Each file maps to an exception to raise or a (returncode, stderr) pair from a contained clang."""
         real_which = shutil.which

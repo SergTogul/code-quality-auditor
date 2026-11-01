@@ -30,7 +30,7 @@ from cqa.reporting import (
     recompute_defect_counts,
     write_reports,
 )
-from cqa.security import ExecutionLog, contained_file, detect_runtime, git_read
+from cqa.security import ExecutionLog, contained_file, detect_runtime, git_read, probe_sandbox
 
 _REVISION_PREFIX_BYTES = 100_000
 SECURITY_KEYS = {
@@ -160,6 +160,23 @@ def _fingerprint_factory(ctx, profile, config_hash):
             file_bytes.append(Path(path).read_bytes())
         except OSError:
             file_bytes.append(b"")
+    # Approvals and containment change whether a task may run. Mix them in once so a
+    # cached success is not replayed when the same tree is audited under different gates.
+    log = ctx.log
+    approvals = {
+        "allow_tools": bool(log.allow_tools),
+        "allow_repo_execution": bool(log.allow_repo_execution),
+        "sandbox_confirmed": bool(log.sandbox_confirmed),
+        "allow_install": bool(log.allow_install),
+        "allow_network": bool(log.allow_network),
+        "allow_write": bool(log.allow_write),
+    }
+    containment_available, _detail = probe_sandbox()
+    execution_material = json.dumps(
+        {"approvals": approvals, "containment": bool(containment_available)},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
 
     def fingerprint(task_id):
         digest = hashlib.sha256()
@@ -167,6 +184,7 @@ def _fingerprint_factory(ctx, profile, config_hash):
         digest.update(task_id.encode())
         digest.update(profile.encode())
         digest.update(config_hash.encode())
+        digest.update(execution_material)
         for blob in file_bytes:
             digest.update(blob)
         return digest.hexdigest()
