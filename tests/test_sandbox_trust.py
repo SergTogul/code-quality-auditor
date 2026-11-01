@@ -960,10 +960,14 @@ class SandboxTrustTests(unittest.TestCase):
         textconv = self.tmp / "textconv-ran"
         external_script = self.tmp / "external-diff"
         textconv_script = self.tmp / "textconv"
+        command_marker = self.tmp / "diff-command-ran"
+        command_script = self.tmp / "diff-command"
         _write_executable(external_script, f"#!/bin/sh\n: > {external}\n")
         _write_executable(textconv_script, f'#!/bin/sh\n: > {textconv}\ncat "$1"\n')
+        _write_executable(command_script, f"#!/bin/sh\n: > {command_marker}\n")
         run_git("config", "diff.external", str(external_script))
         run_git("config", "diff.evil.textconv", str(textconv_script))
+        run_git("config", "diff.evil.command", str(command_script))
         (self.repo / "a.txt").write_text("three\n", encoding="utf-8")
         os.environ["GIT_EXTERNAL_DIFF"] = str(external_script)
         log = self._log()
@@ -976,6 +980,7 @@ class SandboxTrustTests(unittest.TestCase):
         results = {name: security.git_read(self.repo, args, log) for name, args in calls.items()}
         self.assertFalse(external.exists())
         self.assertFalse(textconv.exists())
+        self.assertFalse(command_marker.exists())
         for name, completed in results.items():
             self.assertIsNotNone(completed, name)
         self.assertIn(b"a.txt", results["diff"].stdout)
@@ -985,7 +990,7 @@ class SandboxTrustTests(unittest.TestCase):
             self.assertIn(flag, log_command)
         self.assertLess(log_command.index("--no-pager"), log_command.index("log"))
         self.assertEqual(log_command[log_command.index("log") + 1 : log_command.index("log") + 3], ["--no-ext-diff", "--no-textconv"])
-        for key in ("diff.external=", "core.sshCommand=", "core.pager=", "credential.helper="):
+        for key in ("diff.external=", "diff.evil.command=", "core.sshCommand=", "core.pager=", "credential.helper="):
             self.assertIn(key, log_command)
         rev_log = self._log()
         self.assertIsNotNone(security.git_read(self.repo, ["rev-parse", "HEAD"], rev_log))
@@ -1360,6 +1365,102 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertEqual(completed.returncode, 0)
         self.assertTrue(completed.stdout.strip())
         self.assertIn("exit 0", [item["outcome"] for item in log.commands])
+
+        nested = self.repo / "nested"
+        nested.mkdir()
+        (nested / ".gitattributes").write_text("* text\n", encoding="utf-8")
+        (self.repo / "alias").symlink_to(nested, target_is_directory=True)
+        object_attributes = self.repo / ".git" / "objects" / ".gitattributes"
+        object_attributes.parent.mkdir(exist_ok=True)
+        object_attributes.symlink_to(self.tmp / "object-attributes.fifo")
+        log = self._log()
+        started = time.monotonic()
+        completed = security.git_read(self.repo, ["rev-parse", "HEAD"], log, timeout=8)
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(completed.stdout.strip())
+        self.assertIn("exit 0", [item["outcome"] for item in log.commands])
+
+    def _assert_git_refused_before_launch(self, detail):
+        log = self._log()
+        started = time.monotonic()
+        with mock.patch("cqa.security._trusted_git", return_value=Path("/usr/bin/git")), mock.patch(
+            "cqa.security._run_process"
+        ) as runner:
+            completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log, timeout=8)
+            runner.assert_not_called()
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertIsNone(completed)
+        self.assertEqual([item["outcome"] for item in log.commands], ["skipped"])
+        self.assertNotIn("started", [item["outcome"] for item in log.commands])
+        self.assertEqual(log.commands[0]["detail"], detail)
+
+    def test_git_read_refuses_a_nested_gitattributes_symlink(self):
+        (self.repo / ".git").mkdir()
+        fifo = self.tmp / "nested-attributes.fifo"
+        os.mkfifo(fifo)
+        attributes = self.repo / "subdir" / ".gitattributes"
+        attributes.parent.mkdir()
+        attributes.symlink_to(fifo)
+        self._assert_git_refused_before_launch("subdir/.gitattributes is a symlink; git was not run")
+
+    def test_git_read_refuses_a_nested_non_regular_gitattributes(self):
+        (self.repo / ".git").mkdir()
+        attributes = self.repo / "nested" / ".gitattributes"
+        attributes.parent.mkdir()
+        os.mkfifo(attributes)
+        detail = "nested/.gitattributes is not a regular file inside the audit root; git was not run"
+        self._assert_git_refused_before_launch(detail)
+        attributes.unlink()
+        attributes.mkdir()
+        self._assert_git_refused_before_launch(detail)
+
+    def test_git_read_refuses_a_directory_symlink_outside_the_audit_root(self):
+        (self.repo / ".git").mkdir()
+        outside = self.tmp / "outside-attrs"
+        outside.mkdir()
+        fifo = self.tmp / "outside-attributes.fifo"
+        os.mkfifo(fifo)
+        (outside / ".gitattributes").symlink_to(fifo)
+        (self.repo / "escape").symlink_to(outside, target_is_directory=True)
+        self._assert_git_refused_before_launch(
+            "escape is a directory symlink outside the audit root; git was not run"
+        )
+
+    def test_git_read_does_not_open_trace2_targets(self):
+        run_git = self._git_repository()
+        keys = ("trace2.eventTarget", "trace2.normalTarget", "trace2.perfTarget")
+        fifo = self.tmp / "trace2.fifo"
+        os.mkfifo(fifo)
+        for key in keys:
+            run_git("config", key, str(fifo))
+        log = self._log()
+        started = time.monotonic()
+        completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log, timeout=8)
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.returncode, 0)
+        command = next(item["command"] for item in log.commands if "log" in item["command"])
+        for key in keys:
+            self.assertIn(f"{key}=", command)
+
+        sentinel = self.tmp / "trace2-sentinel.txt"
+        payload = b"trace2-sentinel-bytes\n"
+        sentinel.write_bytes(payload)
+        for key in keys:
+            run_git("config", key, str(sentinel))
+        log = self._log()
+        started = time.monotonic()
+        completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log, timeout=8)
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(sentinel.read_bytes(), payload)
+        command = next(item["command"] for item in log.commands if "log" in item["command"])
+        for key in keys:
+            self.assertIn(f"{key}=", command)
+            self.assertNotIn(str(sentinel), command)
 
     def test_git_read_does_not_inherit_ld_preload(self):
         self._git_repository()

@@ -788,6 +788,13 @@ _GIT_FORCED_CONFIG = (
     # and -O/dev/null is not a valid way to clear that setting.
     ("core.attributesFile", "/dev/null"),
     ("diff.orderFile", "/dev/null"),
+    # An empty value does not name a file. On git 2.43 these targets are taken from
+    # system config, global config, and the environment, which git_read already clears;
+    # repo config and -c are ignored. The empty -c values still win on a git that
+    # applies command-line config over a repo path.
+    ("trace2.normalTarget", ""),
+    ("trace2.perfTarget", ""),
+    ("trace2.eventTarget", ""),
 )
 _GIT_DIFF_COMMANDS = {"log", "diff", "show"}
 
@@ -1048,24 +1055,87 @@ def _git_config_overrides(repo):
     return overrides
 
 
-def _git_local_attribute_refusal(repo):
-    """Skip git when .gitattributes or .git/info/attributes is unsafe to open.
+def _git_attribute_entry_refusal(root, path, relative):
+    """Refuse one attributes path. A missing path is allowed. A symlink is not followed."""
+    if not os.path.lexists(path):
+        return None
+    if path.is_symlink():
+        return f"{relative} is a symlink; git was not run"
+    if contained_file(root, path) is None:
+        return f"{relative} is not a regular file inside the audit root; git was not run"
+    return None
 
-    Git reads both paths even when core.attributesFile and diff.orderFile are /dev/null.
-    A symlink is refused without following it. A missing path is allowed. A regular file
-    inside the repository is allowed. A fifo, directory, or path that does not stay inside
-    the repository is refused.
+
+def _directory_symlink_outside(root, path):
+    """True when path is a symlink to a directory that does not stay inside root.
+
+    The target is classified, not listed. A dangling link is not a directory.
+    """
+    try:
+        if not path.is_symlink() or not path.is_dir():
+            return False
+        return not _inside(root, path)
+    except OSError:
+        return True
+
+
+def _git_worktree_attribute_refusal(root):
+    """Refuse a nested .gitattributes or a directory symlink that leaves the audit root.
+
+    os.walk is top-down with followlinks=False, and .git is removed from dirnames,
+    so the walk does not enter .git/objects or a symlinked directory.
+    """
+    errors = []
+
+    def onerror(_error):
+        errors.append(_error)
+
+    for dirpath, dirnames, filenames in os.walk(root, topdown=True, onerror=onerror, followlinks=False):
+        if errors:
+            return "work tree could not be walked; git was not run"
+        current = Path(dirpath)
+        if ".gitattributes" in filenames or ".gitattributes" in dirnames:
+            path = current / ".gitattributes"
+            relative = path.relative_to(root).as_posix()
+            refusal = _git_attribute_entry_refusal(root, path, relative)
+            if refusal is not None:
+                return refusal
+        kept = []
+        for name in dirnames:
+            if name == ".git":
+                continue
+            entry = current / name
+            relative = entry.relative_to(root).as_posix()
+            try:
+                linked = entry.is_symlink()
+            except OSError:
+                return f"{relative} could not be classified; git was not run"
+            if linked:
+                if _directory_symlink_outside(root, entry):
+                    return f"{relative} is a directory symlink outside the audit root; git was not run"
+                continue
+            kept.append(name)
+        dirnames[:] = kept
+    if errors:
+        return "work tree could not be walked; git was not run"
+    return None
+
+
+def _git_local_attribute_refusal(repo):
+    """Skip git when a work-tree attributes file or .git/info/attributes is unsafe to open.
+
+    Git reads .gitattributes in every directory on a path, and .git/info/attributes,
+    even when core.attributesFile and diff.orderFile are /dev/null. A symlink is refused
+    without following it. A missing path is allowed. A regular file inside the repository
+    is allowed. A fifo, directory, or path that does not stay inside the repository is refused.
+    A directory symlink whose target is outside the audit root is refused without walking that target.
     """
     root = Path(repo)
     for relative in (".gitattributes", ".git/info/attributes"):
-        path = root / relative
-        if not os.path.lexists(path):
-            continue
-        if path.is_symlink():
-            return f"{relative} is a symlink; git was not run"
-        if contained_file(root, path) is None:
-            return f"{relative} is not a regular file inside the audit root; git was not run"
-    return None
+        refusal = _git_attribute_entry_refusal(root, root / relative, relative)
+        if refusal is not None:
+            return refusal
+    return _git_worktree_attribute_refusal(root)
 
 
 def git_read(repo, args, log, timeout=20, limit=_OUTPUT_LIMIT):
