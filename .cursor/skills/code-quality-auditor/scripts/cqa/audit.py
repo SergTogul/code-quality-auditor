@@ -30,8 +30,9 @@ from cqa.reporting import (
     recompute_defect_counts,
     write_reports,
 )
-from cqa.security import ExecutionLog, detect_runtime, git_read
+from cqa.security import ExecutionLog, contained_file, detect_runtime, git_read, probe_sandbox
 
+_REVISION_PREFIX_BYTES = 100_000
 SECURITY_KEYS = {
     "allow_tools",
     "allow_repo_execution",
@@ -100,14 +101,29 @@ def _outside(root, output):
     return root != output and root not in output.parents
 
 
+def _repository_config(repo, path):
+    """Load a repository quality-auditor.yaml only when it is a regular file whose path and target stay inside repo."""
+    if not (path.is_symlink() or path.is_file()):
+        return {}
+    resolved = contained_file(repo, path)
+    if resolved is None:
+        raise ValueError(f"configuration error: {Path(path).name} must be a regular file inside the audited repository")
+    return load(resolved)
+
+
 def _revision(root, log):
     completed = git_read(root, ["rev-parse", "HEAD"], log)
     if completed is None:
         digest = hashlib.sha256()
         for path in sorted(Path(root).rglob("*")):
-            if path.is_file() and ".git" not in path.parts:
-                digest.update(path.relative_to(root).as_posix().encode())
-                digest.update(path.read_bytes()[:100_000])
+            if ".git" in path.parts:
+                continue
+            resolved = contained_file(root, path)
+            if resolved is None:
+                continue
+            digest.update(path.relative_to(root).as_posix().encode())
+            with resolved.open("rb") as handle:
+                digest.update(handle.read(_REVISION_PREFIX_BYTES))
         return "uncommitted:" + digest.hexdigest()[:16]
     return completed.stdout.decode().strip()
 
@@ -144,6 +160,23 @@ def _fingerprint_factory(ctx, profile, config_hash):
             file_bytes.append(Path(path).read_bytes())
         except OSError:
             file_bytes.append(b"")
+    # Approvals and containment change whether a task may run. Mix them in once so a
+    # cached success is not replayed when the same tree is audited under different gates.
+    log = ctx.log
+    approvals = {
+        "allow_tools": bool(log.allow_tools),
+        "allow_repo_execution": bool(log.allow_repo_execution),
+        "sandbox_confirmed": bool(log.sandbox_confirmed),
+        "allow_install": bool(log.allow_install),
+        "allow_network": bool(log.allow_network),
+        "allow_write": bool(log.allow_write),
+    }
+    containment_available, _detail = probe_sandbox()
+    execution_material = json.dumps(
+        {"approvals": approvals, "containment": bool(containment_available)},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
 
     def fingerprint(task_id):
         digest = hashlib.sha256()
@@ -151,6 +184,7 @@ def _fingerprint_factory(ctx, profile, config_hash):
         digest.update(task_id.encode())
         digest.update(profile.encode())
         digest.update(config_hash.encode())
+        digest.update(execution_material)
         for blob in file_bytes:
             digest.update(blob)
         return digest.hexdigest()
@@ -184,15 +218,10 @@ def audit(
     repo = Path(repo).resolve()
     ignored = []
     skill_config = load(skill_root / "quality-auditor.yaml")
-    user_config = {}
-    user_path = repo / "quality-auditor.yaml"
-    if user_path.is_file():
-        user_config = load(user_path)
+    user_config = _repository_config(repo, repo / "quality-auditor.yaml")
     directory_config = {}
     if directories and len(directories) == 1:
-        directory_path = repo / directories[0] / "quality-auditor.yaml"
-        if directory_path.is_file():
-            directory_config = load(directory_path)
+        directory_config = _repository_config(repo, repo / directories[0] / "quality-auditor.yaml")
     merged = _deep_merge(skill_config, user_config, ignored)
     merged = _deep_merge(merged, directory_config, ignored)
     if thresholds:
@@ -386,8 +415,8 @@ def audit(
             "runtime": detect_runtime(),
             "limitations": sorted(set(limitations)),
             "platform_limitations": [
-                "Windows containment uses CQA_SANDBOX_CMD when sandbox-exec is absent.",
-                "External analyzers run only when they are already installed and tool execution is approved.",
+                "Containment is available only on macOS through /usr/bin/sandbox-exec. Linux and Windows fail closed, and CQA_SANDBOX_CMD cannot authorize containment.",
+                "External analyzers run only when they are already installed, tool execution is approved, and containment applies.",
             ],
         },
         "configuration_precedence": PRECEDENCE,

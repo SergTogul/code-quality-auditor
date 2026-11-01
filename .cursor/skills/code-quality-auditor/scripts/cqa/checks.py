@@ -20,7 +20,7 @@ from xml.etree import ElementTree as ET
 
 from cqa import ENGINE_VERSION
 from cqa.adapters import _scan_tokens, analyze_path
-from cqa.security import run_contained, run_tool
+from cqa.security import contained_file, read_contained_output, run_contained, run_tool
 from cqa.duplication import apply_justifications, exact_duplicates, semantic_candidates, structural_duplicates, token_duplicates
 from cqa.graph import build_graph
 
@@ -141,7 +141,7 @@ def run_syntax_static(ctx):
                     "Correct the syntax so the file parses.",
                 )
             )
-    clang_findings, clang_limits = _clang_syntax(ctx, analyses)
+    clang_findings, clang_limits, clang_refused = _clang_syntax(ctx, analyses)
     seen = {(item["file"], item["line"]) for item in findings}
     for item in clang_findings:
         key = (item["file"], item["line"])
@@ -149,26 +149,42 @@ def run_syntax_static(ctx):
             findings.append(item)
             seen.add(key)
     applicable = bool(analyses)
+    if not clang_refused:
+        measurement = _measure(len(findings) if applicable else None, applicable, reason="" if applicable else "no supported source files")
+    else:
+        reason = "the approved clang syntax check is not installed, was refused, or did not finish conclusively; built-in checks alone cannot pass C++ syntax"
+        if findings:
+            measurement = _measure(len(findings), True, reason=reason)
+        else:
+            measurement = _measure(None, True, status="UNAVAILABLE", reason=reason)
+        # Exceptions recomputed later must not turn the missing clang evidence into a PASS.
+        measurement["incomplete_evidence"] = True
     return _result(
         findings,
-        {"REL-004": _measure(len(findings) if applicable else None, applicable, reason="" if applicable else "no supported source files")},
+        {"REL-004": measurement},
         [limit for analysis in analyses for limit in analysis["limits"]] + clang_limits,
     )
 
 
 def _clang_syntax(ctx, analyses):
-    """Confirmed C++ parse errors from clang. Semantic and missing-include diagnostics are not syntax failures."""
+    """Confirmed C++ parse errors from clang. Semantic and missing-include diagnostics are not syntax failures.
+
+    Returns findings, limitations, and whether approved clang evidence is missing for any file: clang is
+    not installed, was refused, or finished inconclusively. Exit 0 is conclusive; exit 1 is conclusive only with at least one clang
+    error diagnostic line. A signal death, any other exit, a timeout, or a launch error is not.
+    """
     log = getattr(ctx, "log", None)
     if log is None or not log.allow_tools:
-        return [], []
+        return [], [], False
     paths = [analysis["path"] for analysis in analyses if Path(analysis["path"]).suffix.lower() in {".cpp", ".cc", ".cxx"}]
     if not paths:
-        return [], []
+        return [], [], False
     clang = shutil.which("clang")
     if clang is None:
-        return [], ["clang syntax checking was approved but clang is not installed"]
+        return [], ["clang syntax checking was approved but clang is not installed"], True
     findings = []
     limitations = []
+    refused = False
     ignored = 0
     for relative in paths:
         try:
@@ -178,13 +194,20 @@ def _clang_syntax(ctx, analyses):
                 log=log,
                 timeout=20,
             )
+        except PermissionError as exc:
+            limitations.append(f"clang syntax checking was not run because analyzer containment is unavailable or refused the run: {exc}. Built-in syntax checks still apply.")
+            refused = True
+            break
         except (OSError, subprocess.TimeoutExpired) as exc:
             limitations.append(f"clang syntax checking did not finish for {relative}: {exc}")
+            refused = True
             continue
+        diagnostics = 0
         for line in (completed.stderr or "").splitlines():
             match = _CLANG_DIAGNOSTIC.match(line.strip())
             if not match:
                 continue
+            diagnostics += 1
             message = match.group("message")
             if _CLANG_IGNORE.search(message) or not _CLANG_SYNTAX.search(message):
                 ignored += 1
@@ -199,9 +222,12 @@ def _clang_syntax(ctx, analyses):
                     "Correct the syntax so the file parses.",
                 )
             )
+        if not (completed.returncode == 0 or (completed.returncode == 1 and diagnostics)):
+            limitations.append(f"clang syntax checking was inconclusive for {relative}: exit {completed.returncode} without a clang error diagnostic")
+            refused = True
     if ignored:
         limitations.append("clang reported diagnostics that are not confirmed syntax errors; those were not counted")
-    return findings, limitations
+    return findings, limitations, refused
 
 
 def run_symbol_index(ctx):
@@ -1191,14 +1217,14 @@ def _version_tuple(value):
 def _declared_versions(ctx):
     declared = {}
     root = Path(ctx.root)
-    requirements = root / "requirements.txt"
-    if requirements.is_file():
+    requirements = _root_manifest(root, "requirements.txt")
+    if requirements is not None:
         for line in requirements.read_text(encoding="utf-8", errors="replace").splitlines():
             match = re.match(r"\s*([A-Za-z0-9_.-]+)==([^\s#]+)", line)
             if match:
                 declared[match.group(1).lower()] = match.group(2)
-    package = root / "package.json"
-    if package.is_file():
+    package = _root_manifest(root, "package.json")
+    if package is not None:
         try:
             import json
 
@@ -1212,12 +1238,24 @@ def _declared_versions(ctx):
     return declared
 
 
+def _repository_input(ctx, raw):
+    """A configured repository file: a relative path whose lexical and resolved target stay inside the audit root."""
+    if not raw or Path(str(raw)).is_absolute():
+        return None
+    return contained_file(ctx.root, Path(ctx.root) / str(raw))
+
+
+def _root_manifest(root, name):
+    """A manifest at the audit root, or None when it is missing or a symlink that leaves the root."""
+    return contained_file(root, Path(root) / name)
+
+
 def _freshness_snapshot(ctx):
     configured = ctx.config.get("freshness_snapshot")
     if isinstance(configured, dict) and configured:
         return {str(key).lower(): value for key, value in configured.items()}
-    path = Path(ctx.root) / (ctx.config.get("freshness_snapshot_file") or "freshness-snapshot.yaml")
-    if not path.is_file():
+    path = _repository_input(ctx, ctx.config.get("freshness_snapshot_file") or "freshness-snapshot.yaml")
+    if path is None:
         return None
     import yaml
 
@@ -1633,16 +1671,9 @@ def _local_advisories(ctx):
     if configured:
         return _advisory_entries(configured), True
     raw = ctx.config.get("advisory_file")
-    if raw:
-        path = Path(raw)
-        if not path.is_absolute():
-            path = Path(ctx.root) / path
-    else:
-        path = Path(ctx.root) / "advisories.yaml"
-        if not path.is_file():
-            return None, False
-    if not path.is_file():
-        return None, True
+    path = _repository_input(ctx, raw or "advisories.yaml")
+    if path is None:
+        return None, bool(raw)
     import yaml
 
     try:
@@ -1655,14 +1686,14 @@ def _local_advisories(ctx):
 def _pinned_dependencies(ctx):
     pins = []
     root = Path(ctx.root)
-    requirements = root / "requirements.txt"
-    if requirements.is_file():
+    requirements = _root_manifest(root, "requirements.txt")
+    if requirements is not None:
         for index, line in enumerate(requirements.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
             match = re.match(r"\s*([A-Za-z0-9_.-]+)==([^\s#]+)", line)
             if match:
                 pins.append({"file": "requirements.txt", "line": index, "name": match.group(1).lower(), "version": match.group(2)})
-    package = root / "package.json"
-    if package.is_file():
+    package = _root_manifest(root, "package.json")
+    if package is not None:
         try:
             import json
 
@@ -1682,8 +1713,9 @@ def _manifests(root):
     root = Path(root)
     for dirpath, dirnames, filenames in os_walk_limited(root):
         for name in filenames:
-            if name in names:
-                found.append(str(Path(dirpath) / name))
+            path = Path(dirpath) / name
+            if name in names and contained_file(root, path) is not None:
+                found.append(str(path))
     return found
 
 
@@ -1710,10 +1742,13 @@ def _config_texts(ctx):
             if path.suffix.lower() not in _CONFIG_SUFFIXES and not name.startswith(".env"):
                 continue
             rel = path.relative_to(root).as_posix()
-            if rel in seen or path.stat().st_size > 1_000_000:
+            if rel in seen:
                 continue
+            resolved = contained_file(root, path)
             try:
-                text = path.read_text(encoding="utf-8", errors="replace")
+                if resolved is None or resolved.stat().st_size > 1_000_000:
+                    continue
+                text = resolved.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 continue
             yield rel, text
@@ -1995,15 +2030,15 @@ def _property_declared(ctx, specs):
     if any("property" in f"{item.get('text', '')} {item.get('id', '')}".lower() for item in specs):
         return True
     root = Path(ctx.root)
-    requirements = root / "requirements.txt"
-    if requirements.is_file() and re.search(r"(?im)^\s*hypothesis(?:\s|==|>=|~=|\[|$)", requirements.read_text(encoding="utf-8", errors="replace")):
+    requirements = _root_manifest(root, "requirements.txt")
+    if requirements is not None and re.search(r"(?im)^\s*hypothesis(?:\s|==|>=|~=|\[|$)", requirements.read_text(encoding="utf-8", errors="replace")):
         return True
-    package = root / "package.json"
-    if package.is_file() and re.search(r"fast-check|rapidcheck", package.read_text(encoding="utf-8", errors="replace"), re.I):
+    package = _root_manifest(root, "package.json")
+    if package is not None and re.search(r"fast-check|rapidcheck", package.read_text(encoding="utf-8", errors="replace"), re.I):
         return True
     for name in ("CMakeLists.txt", "conanfile.txt", "vcpkg.json"):
-        path = root / name
-        if path.is_file() and re.search(r"rapidcheck", path.read_text(encoding="utf-8", errors="replace"), re.I):
+        path = _root_manifest(root, name)
+        if path is not None and re.search(r"rapidcheck", path.read_text(encoding="utf-8", errors="replace"), re.I):
             return True
     return False
 
@@ -2100,12 +2135,21 @@ def _pytest_cwd(ctx, tests):
     return max(candidates, key=lambda path: len(path.parts))
 
 
-def _pytest_executable(cwd):
-    for base in (cwd, cwd.parent):
+def _pytest_executable(cwd, root):
+    """Find pytest in a venv from cwd upward through the audit root, then on PATH.
+
+    The parent of the audit root is never searched, so a home-directory venv is not selected.
+    """
+    directory = Path(cwd).resolve()
+    root = Path(root).resolve()
+    while directory == root or root in directory.parents:
         for name in (".venv", "venv"):
-            candidate = base / name / "bin" / "pytest"
+            candidate = directory / name / "bin" / "pytest"
             if candidate.is_file() and os.access(candidate, os.X_OK):
                 return candidate.resolve()
+        if directory == root:
+            break
+        directory = directory.parent
     system = shutil.which("pytest")
     return Path(system).resolve() if system else None
 
@@ -2166,8 +2210,9 @@ def project_test_result(ctx):
     work = Path(tempfile.mkdtemp(prefix="cqa-runner-")).resolve()
     try:
         if _uses_pytest(ctx, tests):
+            root = Path(ctx.root).resolve()
             cwd = _pytest_cwd(ctx, tests)
-            executable = _pytest_executable(cwd)
+            executable = _pytest_executable(cwd, root)
             if executable is None:
                 return None
             command = [
@@ -2204,10 +2249,15 @@ def project_test_result(ctx):
             ctx.project_tests = {"runner": "unittest", "cwd": root, "failures": failures, "returncode": returncode}
             return ctx.project_tests
         env = {"PYTHONDONTWRITEBYTECODE": "1"}
+        entries = [str(root)]
+        if cwd.resolve() != root:
+            entries.append(str(cwd.resolve()))
         previous = os.environ.get("PYTHONPATH", "")
-        env["PYTHONPATH"] = str(cwd) if not previous else str(cwd) + os.pathsep + previous
+        if previous:
+            entries.append(previous)
+        env["PYTHONPATH"] = os.pathsep.join(entries)
         try:
-            completed = run_contained(command, cwd, ctx.log, timeout=180, write_path=work, env=env)
+            completed = run_contained(command, cwd, ctx.log, timeout=180, write_path=work, env=env, read_root=root)
         except (PermissionError, subprocess.TimeoutExpired):
             return None
         text = f"{completed.stdout or ''}\n{completed.stderr or ''}"
@@ -2216,7 +2266,6 @@ def project_test_result(ctx):
             ctx.project_tests = None
             ctx._project_tests_ready = True
             return None
-        root = Path(ctx.root).resolve()
         failures = [
             f"{(cwd / item.split(':', 1)[0]).resolve().relative_to(root).as_posix()}:{item.split(':', 1)[1]}"
             for item in failures
@@ -2242,7 +2291,7 @@ def _pytest_line_reason(ctx, tests, result):
         if coverage_installed:
             return "coverage.py is installed; its report was not parsed and line coverage was not estimated"
         return "pytest ran; coverage.py is not installed and line coverage was not estimated"
-    if _pytest_executable(_pytest_cwd(ctx, tests)) is None:
+    if _pytest_executable(_pytest_cwd(ctx, tests), ctx.root) is None:
         return "pytest is the repository runner and it is not installed; coverage was not estimated"
     return "pytest did not finish; coverage.py was not run and line coverage was not estimated"
 
@@ -2319,7 +2368,9 @@ def _trace_line_coverage(ctx):
         hits = missing = 0
         evidence = []
         for cover_file in cover.glob("*.cover"):
-            body = cover_file.read_text(encoding="utf-8", errors="replace")
+            body = read_contained_output(cover_file)
+            if body is None:
+                continue
             reconstructed = _reconstruct_cover(body)
             if reconstructed not in production.values():
                 continue
@@ -2434,17 +2485,26 @@ def _discover_requirements(ctx):
     found = []
     root = Path(ctx.root)
     for path in root.rglob("*"):
-        if not path.is_file():
-            continue
         if any(part in {".git", ".venv", "node_modules", "__pycache__"} for part in path.parts):
             continue
         rel = path.relative_to(root).as_posix()
         if path.suffix.lower() in {".md", ".markdown"} and ("doc" in rel.lower() or "requirement" in path.name.lower() or "adr" in rel.lower()):
-            found.extend(_requirements_from_text(rel, path.read_text(encoding="utf-8", errors="replace")))
+            kind = "text"
         elif path.suffix.lower() == ".docx" and "requirement" in path.name.lower():
-            found.extend(_requirements_from_text(rel, _docx_text(path)))
+            kind = "docx"
         elif path.name in {"requirements.yaml", "requirements.yml", "traceability.yaml", "traceability.yml"}:
-            found.extend(_requirements_from_yaml(rel, path))
+            kind = "yaml"
+        else:
+            continue
+        resolved = contained_file(root, path)
+        if resolved is None:
+            continue
+        if kind == "text":
+            found.extend(_requirements_from_text(rel, resolved.read_text(encoding="utf-8", errors="replace")))
+        elif kind == "docx":
+            found.extend(_requirements_from_text(rel, _docx_text(resolved)))
+        else:
+            found.extend(_requirements_from_yaml(rel, resolved))
     ctx.requirements = found
     return found
 
@@ -2807,17 +2867,20 @@ def _performance_numbers(ctx):
     numbers = {}
     root = Path(ctx.root)
     for path in root.rglob("*"):
-        if not path.is_file() or path.suffix.lower() not in {".json", ".yaml", ".yml"}:
+        if path.suffix.lower() not in {".json", ".yaml", ".yml"}:
             continue
         if path.name in {"quality-auditor.yaml", "exports-baseline.yaml"}:
             continue
         if not re.search(r"bench|perf|measure", path.name, re.I):
             continue
+        resolved = contained_file(root, path)
+        if resolved is None:
+            continue
         try:
             if path.suffix.lower() == ".json":
-                data = json.loads(path.read_text(encoding="utf-8"))
+                data = json.loads(resolved.read_text(encoding="utf-8"))
             else:
-                data = yaml.safe_load(path.read_text(encoding="utf-8"))
+                data = yaml.safe_load(resolved.read_text(encoding="utf-8"))
         except (OSError, ValueError, yaml.YAMLError):
             continue
         if isinstance(data, dict):
@@ -2901,9 +2964,8 @@ def _baseline_exports(ctx):
     configured = ctx.config.get("export_baseline")
     if isinstance(configured, list):
         return {str(item) for item in configured}
-    filename = ctx.config.get("export_baseline_file") or "exports-baseline.yaml"
-    path = Path(ctx.root) / filename
-    if not path.is_file():
+    path = _repository_input(ctx, ctx.config.get("export_baseline_file") or "exports-baseline.yaml")
+    if path is None:
         return None
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}

@@ -102,6 +102,8 @@ def discover(root, languages=None, directories=None):
             path = current / name
             if prefixes and not any(path == prefix or prefix in path.parents for prefix in prefixes):
                 continue
+            if root not in path.resolve().parents:
+                continue
             language = language_of(path)
             if language is None:
                 continue

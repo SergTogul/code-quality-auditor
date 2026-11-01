@@ -9,7 +9,7 @@ import yaml
 
 from cqa.adapters import discover
 from cqa.profiles import explain_profile, resolve_profile
-from cqa.security import ExecutionLog, detect_runtime, runtime_probe
+from cqa.security import ExecutionLog, contained_file, detect_runtime, runtime_probe
 
 ANALYZER_FILES = (
     "pyproject.toml",
@@ -89,8 +89,14 @@ def init_repository(root, skill_config, approve_write=False, languages=None, dir
         log.deny("config-write", "initialization stayed read-only because write approval was not given")
         return {"discovery": discovery, "written": False, "path": str(target), "log": log.denied, "installations": []}
     existing = {}
-    if target.exists():
-        existing = yaml.safe_load(target.read_text(encoding="utf-8")) or {}
+    destination = target
+    if target.is_symlink() or target.exists():
+        resolved = contained_file(root, target)
+        if resolved is None:
+            log.deny("config-write", "quality-auditor.yaml is not a regular file inside the repository; it was not read or written")
+            return {"discovery": discovery, "written": False, "path": str(target), "log": log.denied, "installations": []}
+        existing = yaml.safe_load(resolved.read_text(encoding="utf-8")) or {}
+        destination = resolved
     generated = {
         "version": 1,
         "default_profile": existing.get("default_profile", skill_config.get("default_profile", "full")),
@@ -113,7 +119,7 @@ def init_repository(root, skill_config, approve_write=False, languages=None, dir
             generated[key] = existing[key]
     if "languages" in existing and languages is None:
         generated["languages"] = existing["languages"]
-    _dump(target, generated)
+    _dump(destination, generated)
     return {"discovery": discovery, "written": True, "path": str(target), "preserved": [key for key in PRESERVE_KEYS if key in existing], "installations": [], "log": log.ignored_overrides}
 
 
