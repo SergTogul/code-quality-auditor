@@ -1107,6 +1107,32 @@ class AcceptanceTests(unittest.TestCase):
                 self.assertEqual(metrics["REL-004"]["status"], "PASS")
                 self.assertEqual(report["decision"], "PASS")
 
+    def test_approved_clang_that_is_not_installed_is_unavailable(self):
+        """Requirements: 4.4, 8.7."""
+        real_which = shutil.which
+
+        def which(name, *args, **kwargs):
+            return None if name == "clang" else real_which(name, *args, **kwargs)
+
+        clean = self._syntax_repo("clang-missing-clean", {"valid.cpp": "int run() { return 1; }\n"})
+        broken = self._syntax_repo("clang-missing-broken", {"valid.cpp": "int run() { return 1; }\n", "broken.py": "def broken(:\n    return 1\n"})
+        with mock.patch("cqa.checks.shutil.which", side_effect=which), mock.patch("cqa.checks.run_tool") as runner:
+            unapproved = self.audit(clean, profile="syntax")
+            missing = self.audit(clean, profile="syntax", allow_tools=True)
+            failing = self.audit(broken, profile="syntax", allow_tools=True)
+            runner.assert_not_called()
+        self.assertEqual({item["metric_id"]: item["status"] for item in unapproved["metrics"]}["REL-004"], "PASS")
+        metrics = {item["metric_id"]: item for item in missing["metrics"]}
+        self.assertEqual(metrics["REL-004"]["status"], "UNAVAILABLE")
+        self.assertIsNone(metrics["REL-004"]["measured_value"])
+        self.assertIn("not installed", metrics["REL-004"]["reason"])
+        self.assertEqual(missing["decision"], "INCOMPLETE")
+        self.assertIn("clang syntax checking was approved but clang is not installed", missing["execution"]["limitations"])
+        failing_metrics = {item["metric_id"]: item for item in failing["metrics"]}
+        self.assertEqual(failing_metrics["REL-004"]["status"], "FAIL")
+        self.assertEqual(failing_metrics["REL-004"]["measured_value"], 1)
+        self.assertEqual(failing["decision"], "FAIL")
+
     def test_later_clang_diagnostic_still_fails_after_an_unfinished_file(self):
         """Requirements: 4.4, 8.7."""
         repo = self._syntax_repo("clang-partial", {"a.cpp": "int a() { return 1; }\n", "b.cpp": "int b() {\n  return 2\n}\n"})

@@ -6,6 +6,7 @@ import hashlib
 import json
 import locale
 import os
+import re
 import secrets
 import selectors
 import shutil
@@ -781,14 +782,201 @@ def contained_file(root, path):
     return resolved
 
 
+_GIT_CONFIG_LIMIT = 1024 * 1024
+_GIT_INCLUDE_DEPTH = 4
+_GIT_DRIVER_NAME = re.compile(r"^[A-Za-z0-9_.-]+$")
+_GIT_VALUE_ESCAPES = {"n": "\n", "t": "\t", "b": "\b", '"': '"', "\\": "\\"}
+
+
+class _GitConfigRefused(Exception):
+    """The repository's git config cannot be fully classified, so git must not run."""
+
+
+def _git_config_value(text, index):
+    """Parse a value the way git does: quotes, escapes, continuations, and unquoted comments."""
+    value = []
+    quoted = False
+    pending_space = ""
+    while index < len(text):
+        char = text[index]
+        index += 1
+        if char == "\n" and not quoted:
+            break
+        if char in "#;" and not quoted:
+            while index < len(text) and text[index] != "\n":
+                index += 1
+            break
+        if char in " \t" and not quoted:
+            if value:
+                pending_space += char
+            continue
+        value.append(pending_space)
+        pending_space = ""
+        if char == "\\":
+            if index >= len(text):
+                raise ValueError("dangling escape")
+            escaped = text[index]
+            index += 1
+            if escaped == "\n":
+                continue
+            if escaped not in _GIT_VALUE_ESCAPES:
+                raise ValueError("unknown escape")
+            value.append(_GIT_VALUE_ESCAPES[escaped])
+        elif char == '"':
+            quoted = not quoted
+        elif char == "\n":
+            raise ValueError("newline inside a quoted value")
+        else:
+            value.append(char)
+    if quoted:
+        raise ValueError("unterminated quote")
+    return "".join(value), index
+
+
+def _git_config_header(text, index):
+    """Parse `[section]`, `[section.sub]`, or `[section "sub"]` starting after the bracket."""
+    start = index
+    while index < len(text) and (text[index].isalnum() or text[index] in ".-"):
+        index += 1
+    name = text[start:index].lower()
+    if not name:
+        raise ValueError("empty section name")
+    if index < len(text) and text[index] == "]":
+        section, _dot, subsection = name.partition(".")
+        return section, (subsection or None), index + 1
+    while index < len(text) and text[index] in " \t":
+        index += 1
+    if index >= len(text) or text[index] != '"' or "." in name:
+        raise ValueError("malformed section header")
+    index += 1
+    subsection = []
+    while True:
+        if index >= len(text) or text[index] == "\n":
+            raise ValueError("unterminated subsection")
+        char = text[index]
+        index += 1
+        if char == '"':
+            break
+        if char == "\\":
+            if index >= len(text) or text[index] == "\n":
+                raise ValueError("unterminated subsection")
+            char = text[index]
+            index += 1
+        subsection.append(char)
+    if index >= len(text) or text[index] != "]":
+        raise ValueError("malformed section header")
+    return name, "".join(subsection), index + 1
+
+
+def _parse_git_config(text):
+    """Yield (section, subsection, key, value) entries. Raise ValueError for anything git might read differently."""
+    section = subsection = None
+    text = text.replace("\r\n", "\n")
+    index = 0
+    if text.startswith("\ufeff"):
+        index = 1
+    while index < len(text):
+        char = text[index]
+        if char in " \t\r\n":
+            index += 1
+            continue
+        if char in "#;":
+            while index < len(text) and text[index] != "\n":
+                index += 1
+            continue
+        if char == "[":
+            section, subsection, index = _git_config_header(text, index + 1)
+            continue
+        if not char.isalpha() or section is None:
+            raise ValueError("malformed key")
+        start = index
+        while index < len(text) and (text[index].isalnum() or text[index] == "-"):
+            index += 1
+        key = text[start:index].lower()
+        while index < len(text) and text[index] in " \t\r":
+            index += 1
+        value = None
+        if index < len(text) and text[index] == "=":
+            value, index = _git_config_value(text, index + 1)
+        elif index < len(text) and text[index] not in "\n#;":
+            raise ValueError("malformed key")
+        yield section, subsection, key, value
+
+
+def _git_config_overrides(repo):
+    """`-c` arguments that blank every filter and diff driver the repository's own git config defines.
+
+    Git config is read here as bounded text, never through git, because asking git would load it.
+    Raise _GitConfigRefused when any file git would read cannot be confirmed to lie inside the repository.
+    """
+    root = Path(repo)
+    git_dir = root / ".git"
+    if git_dir.is_symlink() or not git_dir.is_dir() or not _inside(root, git_dir):
+        raise _GitConfigRefused("the audit root has no .git directory of its own; git was not run")
+    if os.path.lexists(git_dir / "commondir"):
+        raise _GitConfigRefused("repository git directory delegates its config to another directory; git was not run")
+    outside = "repository git config includes a path outside the audit root; git was not run"
+    pending = [(git_dir / name, 0) for name in ("config.worktree", "config") if os.path.lexists(git_dir / name)]
+    visited = set()
+    filters = set()
+    drivers = set()
+    while pending:
+        path, depth = pending.pop()
+        resolved = contained_file(root, path)
+        if resolved is None:
+            raise _GitConfigRefused(outside)
+        if resolved in visited:
+            continue
+        visited.add(resolved)
+        try:
+            with resolved.open("rb") as handle:
+                data = handle.read(_GIT_CONFIG_LIMIT + 1)
+        except OSError:
+            raise _GitConfigRefused("repository git config could not be read; git was not run") from None
+        if len(data) > _GIT_CONFIG_LIMIT:
+            raise _GitConfigRefused("repository git config exceeds 1 MiB; git was not run")
+        try:
+            entries = list(_parse_git_config(data.decode("utf-8")))
+        except (UnicodeDecodeError, ValueError):
+            raise _GitConfigRefused("repository git config could not be parsed; git was not run") from None
+        for section, subsection, key, value in entries:
+            if section == "filter" and subsection is not None:
+                filters.add(subsection)
+            elif section == "diff" and subsection is not None:
+                drivers.add(subsection)
+            elif section in {"include", "includeif"} and key == "path":
+                if not value or value.startswith("~") or Path(value).is_absolute():
+                    raise _GitConfigRefused(outside)
+                if depth >= _GIT_INCLUDE_DEPTH:
+                    raise _GitConfigRefused("repository git config nests includes too deeply; git was not run")
+                pending.append((path.parent / value, depth + 1))
+    if any(not _GIT_DRIVER_NAME.match(name) for name in filters | drivers):
+        raise _GitConfigRefused("repository git config names a filter or diff driver with unsupported characters; git was not run")
+    overrides = []
+    for name in sorted(filters):
+        # required=false keeps a blanked required filter from aborting the read.
+        for key, value in (("clean", ""), ("smudge", ""), ("process", ""), ("required", "false")):
+            overrides.extend(["-c", f"filter.{name}.{key}={value}"])
+    for name in sorted(drivers):
+        for key in ("textconv", "command"):
+            overrides.extend(["-c", f"diff.{name}.{key}="])
+    return overrides
+
+
 def git_read(repo, args, log, timeout=20, limit=_OUTPUT_LIMIT):
     git = _trusted_git(repo)
     if git is None:
         log.record(["git", *args], "skipped", "no trusted git was found at a fixed platform path; PATH is not consulted, so git was not run")
         return None
+    try:
+        overrides = _git_config_overrides(repo)
+    except _GitConfigRefused as exc:
+        log.record(["git", *args], "skipped", str(exc))
+        return None
     command = [str(git), "--no-pager", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=", "-c", "protocol.allow=never", "--no-optional-locks"]
     for key in _GIT_HELPER_KEYS:
         command.extend(["-c", f"{key}="])
+    command.extend(overrides)
     for alias in GIT_ALIASES:
         command.extend(["-c", f"alias.{alias}="])
     args = list(args)
@@ -797,7 +985,10 @@ def git_read(repo, args, log, timeout=20, limit=_OUTPUT_LIMIT):
         args[1:1] = ["--no-ext-diff", "--no-textconv"]
     command.extend(args)
     env = os.environ.copy()
-    env.pop("GIT_EXTERNAL_DIFF", None)
+    for key in ("GIT_EXTERNAL_DIFF", "GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR"):
+        env.pop(key, None)
+    # Only the repository's own .git was classified; never let discovery climb to a parent repository.
+    env["GIT_CEILING_DIRECTORIES"] = str(Path(repo).resolve().parent)
     env["GIT_CONFIG_GLOBAL"] = os.devnull
     env["GIT_CONFIG_SYSTEM"] = os.devnull
     env["GIT_TERMINAL_PROMPT"] = "0"

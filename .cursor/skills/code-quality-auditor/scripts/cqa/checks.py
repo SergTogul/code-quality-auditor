@@ -152,7 +152,7 @@ def run_syntax_static(ctx):
     if not clang_refused:
         measurement = _measure(len(findings) if applicable else None, applicable, reason="" if applicable else "no supported source files")
     else:
-        reason = "the approved clang syntax check was refused or did not finish conclusively; built-in checks alone cannot pass C++ syntax"
+        reason = "the approved clang syntax check is not installed, was refused, or did not finish conclusively; built-in checks alone cannot pass C++ syntax"
         if findings:
             measurement = _measure(len(findings), True, reason=reason)
         else:
@@ -169,8 +169,8 @@ def run_syntax_static(ctx):
 def _clang_syntax(ctx, analyses):
     """Confirmed C++ parse errors from clang. Semantic and missing-include diagnostics are not syntax failures.
 
-    Returns findings, limitations, and whether an approved, installed clang was refused or finished
-    inconclusively for any file. Exit 0 is conclusive; exit 1 is conclusive only with at least one clang
+    Returns findings, limitations, and whether approved clang evidence is missing for any file: clang is
+    not installed, was refused, or finished inconclusively. Exit 0 is conclusive; exit 1 is conclusive only with at least one clang
     error diagnostic line. A signal death, any other exit, a timeout, or a launch error is not.
     """
     log = getattr(ctx, "log", None)
@@ -181,7 +181,7 @@ def _clang_syntax(ctx, analyses):
         return [], [], False
     clang = shutil.which("clang")
     if clang is None:
-        return [], ["clang syntax checking was approved but clang is not installed"], False
+        return [], ["clang syntax checking was approved but clang is not installed"], True
     findings = []
     limitations = []
     refused = False
@@ -1238,12 +1238,19 @@ def _declared_versions(ctx):
     return declared
 
 
+def _repository_input(ctx, raw):
+    """A configured repository file: a relative path whose lexical and resolved target stay inside the audit root."""
+    if not raw or Path(str(raw)).is_absolute():
+        return None
+    return contained_file(ctx.root, Path(ctx.root) / str(raw))
+
+
 def _freshness_snapshot(ctx):
     configured = ctx.config.get("freshness_snapshot")
     if isinstance(configured, dict) and configured:
         return {str(key).lower(): value for key, value in configured.items()}
-    path = Path(ctx.root) / (ctx.config.get("freshness_snapshot_file") or "freshness-snapshot.yaml")
-    if not path.is_file():
+    path = _repository_input(ctx, ctx.config.get("freshness_snapshot_file") or "freshness-snapshot.yaml")
+    if path is None:
         return None
     import yaml
 
@@ -1659,16 +1666,9 @@ def _local_advisories(ctx):
     if configured:
         return _advisory_entries(configured), True
     raw = ctx.config.get("advisory_file")
-    if raw:
-        path = Path(raw)
-        if not path.is_absolute():
-            path = Path(ctx.root) / path
-    else:
-        path = Path(ctx.root) / "advisories.yaml"
-        if not path.is_file():
-            return None, False
-    if not path.is_file():
-        return None, True
+    path = _repository_input(ctx, raw or "advisories.yaml")
+    if path is None:
+        return None, bool(raw)
     import yaml
 
     try:
@@ -2845,17 +2845,20 @@ def _performance_numbers(ctx):
     numbers = {}
     root = Path(ctx.root)
     for path in root.rglob("*"):
-        if not path.is_file() or path.suffix.lower() not in {".json", ".yaml", ".yml"}:
+        if path.suffix.lower() not in {".json", ".yaml", ".yml"}:
             continue
         if path.name in {"quality-auditor.yaml", "exports-baseline.yaml"}:
             continue
         if not re.search(r"bench|perf|measure", path.name, re.I):
             continue
+        resolved = contained_file(root, path)
+        if resolved is None:
+            continue
         try:
             if path.suffix.lower() == ".json":
-                data = json.loads(path.read_text(encoding="utf-8"))
+                data = json.loads(resolved.read_text(encoding="utf-8"))
             else:
-                data = yaml.safe_load(path.read_text(encoding="utf-8"))
+                data = yaml.safe_load(resolved.read_text(encoding="utf-8"))
         except (OSError, ValueError, yaml.YAMLError):
             continue
         if isinstance(data, dict):
@@ -2939,9 +2942,8 @@ def _baseline_exports(ctx):
     configured = ctx.config.get("export_baseline")
     if isinstance(configured, list):
         return {str(item) for item in configured}
-    filename = ctx.config.get("export_baseline_file") or "exports-baseline.yaml"
-    path = Path(ctx.root) / filename
-    if not path.is_file():
+    path = _repository_input(ctx, ctx.config.get("export_baseline_file") or "exports-baseline.yaml")
+    if path is None:
         return None
     try:
         data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}

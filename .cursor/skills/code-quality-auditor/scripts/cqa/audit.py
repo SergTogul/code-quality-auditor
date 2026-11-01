@@ -101,6 +101,16 @@ def _outside(root, output):
     return root != output and root not in output.parents
 
 
+def _repository_config(repo, path):
+    """Load a repository quality-auditor.yaml only when it is a regular file whose path and target stay inside repo."""
+    if not (path.is_symlink() or path.is_file()):
+        return {}
+    resolved = contained_file(repo, path)
+    if resolved is None:
+        raise ValueError(f"configuration error: {Path(path).name} must be a regular file inside the audited repository")
+    return load(resolved)
+
+
 def _revision(root, log):
     completed = git_read(root, ["rev-parse", "HEAD"], log)
     if completed is None:
@@ -190,15 +200,10 @@ def audit(
     repo = Path(repo).resolve()
     ignored = []
     skill_config = load(skill_root / "quality-auditor.yaml")
-    user_config = {}
-    user_path = repo / "quality-auditor.yaml"
-    if user_path.is_file():
-        user_config = load(user_path)
+    user_config = _repository_config(repo, repo / "quality-auditor.yaml")
     directory_config = {}
     if directories and len(directories) == 1:
-        directory_path = repo / directories[0] / "quality-auditor.yaml"
-        if directory_path.is_file():
-            directory_config = load(directory_path)
+        directory_config = _repository_config(repo, repo / directories[0] / "quality-auditor.yaml")
     merged = _deep_merge(skill_config, user_config, ignored)
     merged = _deep_merge(merged, directory_config, ignored)
     if thresholds:

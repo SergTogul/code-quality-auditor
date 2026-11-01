@@ -684,6 +684,7 @@ class SandboxTrustTests(unittest.TestCase):
         fake = fake_dir / "git"
         _write_executable(fake, f"#!/bin/sh\nwhile :; do echo {sentinel}; echo {sentinel} >&2; done\n")
         self._patch("cqa.security._trusted_git", return_value=fake)
+        (self.repo / ".git").mkdir()
         log = self._log()
         started = time.monotonic()
         self.assertIsNone(security.git_read(self.repo, ["log"], log, timeout=10, limit=4096))
@@ -713,6 +714,7 @@ class SandboxTrustTests(unittest.TestCase):
         repo_bin.mkdir()
         host = next((Path(raw) for raw in security._GIT_CANDIDATES if Path(raw).is_file()), Path("/usr/bin/true"))
         (repo_bin / "git").symlink_to(host.resolve())
+        (self.repo / ".git").mkdir()
         os.environ["PATH"] = os.pathsep.join([str(path_bin), str(repo_bin), ".", os.environ.get("PATH", "")])
         self._chdir(self.repo)
         forbidden = {"git", str(path_bin / "git"), str(self.repo / "git"), str(repo_bin / "git"), "./git"}
@@ -798,6 +800,189 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertIn("--no-pager", rev_command)
         self.assertNotIn("--no-ext-diff", rev_command)
         self.assertNotIn("--no-textconv", rev_command)
+
+    def _git_repository(self):
+        git = security._trusted_git(self.repo)
+        if git is None:
+            self.skipTest("no trusted git is installed at a fixed platform path")
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+
+        def run_git(*args):
+            subprocess.run([str(git), *args], cwd=self.repo, env=env, check=True, capture_output=True)
+
+        run_git("init", "-q")
+        run_git("config", "user.email", "cqa@example.invalid")
+        run_git("config", "user.name", "cqa")
+        (self.repo / ".gitattributes").write_text("a.txt filter=evil\nb.txt filter=other\n", encoding="utf-8")
+        (self.repo / "a.txt").write_text("one\n", encoding="utf-8")
+        (self.repo / "b.txt").write_text("one\n", encoding="utf-8")
+        run_git("add", ".")
+        run_git("commit", "-q", "-m", "one")
+        (self.repo / "a.txt").write_text("two\n", encoding="utf-8")
+        (self.repo / "b.txt").write_text("two\n", encoding="utf-8")
+        run_git("commit", "-q", "-am", "two")
+        return run_git
+
+    def _marker_script(self, name):
+        marker = self.tmp / f"{name}-ran"
+        script = self.tmp / name
+        _write_executable(script, f"#!/bin/sh\n: > {marker}\ncat\n")
+        return script, marker
+
+    def _dirty(self):
+        (self.repo / "a.txt").write_text("three, longer\n", encoding="utf-8")
+        (self.repo / "b.txt").write_text("three, longer\n", encoding="utf-8")
+
+    def test_git_read_blanks_repository_filter_drivers(self):
+        run_git = self._git_repository()
+        clean, clean_marker = self._marker_script("evil-clean")
+        process, process_marker = self._marker_script("evil-process")
+        other, other_marker = self._marker_script("other-clean")
+        run_git("config", "filter.evil.clean", str(clean))
+        run_git("config", "filter.evil.process", str(process))
+        run_git("config", "filter.evil.required", "true")
+        run_git("config", "filter.other.clean", str(other))
+        self._dirty()
+        log = self._log()
+        diff = security.git_read(self.repo, ["diff", "--name-only"], log)
+        history = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log)
+        for marker in (clean_marker, process_marker, other_marker):
+            self.assertFalse(marker.exists(), marker.name)
+        self.assertIsNotNone(diff)
+        self.assertEqual(sorted(diff.stdout.decode().split()), ["a.txt", "b.txt"])
+        self.assertIsNotNone(history)
+        command = next(item["command"] for item in log.commands if "log" in item["command"])
+        for name in ("evil", "other"):
+            for key in ("clean=", "smudge=", "process="):
+                self.assertIn(f"filter.{name}.{key}", command)
+
+    def test_git_read_refuses_config_includes_it_cannot_confirm_inside_the_repository(self):
+        run_git = self._git_repository()
+        script, marker = self._marker_script("included-clean")
+        outside = self.tmp / "outside.gitconfig"
+        outside.write_text(f"[filter \"evil\"]\n\tclean = {script}\n", encoding="utf-8")
+        inside = self.repo / "inside.gitconfig"
+        inside.write_text(f"[filter \"evil\"]\n\tclean = {script}\n", encoding="utf-8")
+        (self.repo / "link.gitconfig").symlink_to(outside)
+        self._dirty()
+        config = self.repo / ".git" / "config"
+        original = config.read_text(encoding="utf-8")
+        refused = {
+            "absolute include": f"[include]\n\tpath = {outside}\n",
+            "relative escape": "[include]\n\tpath = ../../outside.gitconfig\n",
+            "home include": "[includeIf \"gitdir:/\"]\n\tpath = ~/outside.gitconfig\n",
+            "symlink out": "[include]\n\tpath = ../link.gitconfig\n",
+            "missing include": "[include]\n\tpath = ../missing.gitconfig\n",
+            "unsupported driver name": '[filter "bad name"]\n\tclean = x\n',
+            "unparsable": '[filter "evil"\n',
+        }
+        for name, extra in refused.items():
+            with self.subTest(config=name):
+                config.write_text(original + extra, encoding="utf-8")
+                log = self._log()
+                with mock.patch("cqa.security._run_process") as runner:
+                    self.assertIsNone(security.git_read(self.repo, ["diff", "--name-only"], log))
+                    runner.assert_not_called()
+                self.assertEqual([item["outcome"] for item in log.commands], ["skipped"])
+                if "include" in name or name == "symlink out":
+                    self.assertIn("outside the audit root", log.commands[0]["detail"])
+        self.assertFalse(marker.exists())
+        config.write_text(original + "[include]\n\tpath = ../inside.gitconfig\n", encoding="utf-8")
+        log = self._log()
+        diff = security.git_read(self.repo, ["diff", "--name-only"], log)
+        self.assertIsNotNone(diff)
+        self.assertFalse(marker.exists())
+        self.assertIn("filter.evil.clean=", next(item["command"] for item in log.commands if "diff" in item["command"]))
+        config.write_text(original, encoding="utf-8")
+        (self.repo / ".git" / "commondir").write_text(str(self.tmp) + "\n", encoding="utf-8")
+        log = self._log()
+        self.assertIsNone(security.git_read(self.repo, ["rev-parse", "HEAD"], log))
+        self.assertEqual([item["outcome"] for item in log.commands], ["skipped"])
+
+    def test_git_read_never_climbs_to_a_parent_repository(self):
+        run_git = self._git_repository()
+        script, marker = self._marker_script("parent-clean")
+        run_git("config", "filter.evil.clean", str(script))
+        self._dirty()
+        child = self.repo / "child"
+        (child / ".git").mkdir(parents=True)
+        (child / "c.txt").write_text("child\n", encoding="utf-8")
+        log = self._log()
+        self.assertIsNone(security.git_read(child, ["diff", "--name-only"], log))
+        self.assertIsNone(security.git_read(child, ["rev-parse", "--show-toplevel"], log))
+        self.assertFalse(marker.exists())
+
+    def _sentinel_yaml(self):
+        sentinel = self.tmp / "sentinel.yaml"
+        sentinel.write_text(
+            'advisories:\n  requests: "2.31.0"\npackages:\n  requests: "9.9.9"\nsymbols: [sentinel_symbol]\nlatency_ms: 5\n',
+            encoding="utf-8",
+        )
+        return sentinel
+
+    def test_repository_config_symlink_out_of_the_repository_is_a_configuration_error(self):
+        sentinel = self.tmp / "sentinel-config.yaml"
+        marker = "cqa-config-sentinel-" + os.urandom(6).hex()
+        sentinel.write_text(f"{marker}: [unclosed\n", encoding="utf-8")
+        outside_dir = self.tmp / "outside-dir"
+        outside_dir.mkdir()
+        (outside_dir / "quality-auditor.yaml").symlink_to(sentinel)
+        sub = self.repo / "sub"
+        sub.mkdir()
+        (sub / "quality-auditor.yaml").symlink_to(sentinel)
+        from cqa import audit as audit_module
+
+        real_load = audit_module.load
+        cases = {
+            "repository": ({}, self.repo / "quality-auditor.yaml"),
+            "directory": ({"directories": ["sub"]}, None),
+            "absolute directory": ({"directories": [str(outside_dir)]}, None),
+        }
+        for name, (kwargs, link) in cases.items():
+            with self.subTest(config=name):
+                if link is not None:
+                    link.symlink_to(sentinel)
+                out = self.tmp / f"out-{name.replace(' ', '-')}"
+                out.mkdir()
+                try:
+                    with mock.patch("cqa.audit.load", side_effect=real_load) as loader:
+                        with self.assertRaises(ValueError) as raised:
+                            auditor.audit(self.repo, skill_root=SKILL, output_dir=out, profile="fast", **kwargs)
+                finally:
+                    if link is not None:
+                        link.unlink()
+                self.assertTrue(str(raised.exception).startswith("configuration error:"))
+                self.assertNotIn(marker, str(raised.exception))
+                loaded = [Path(call.args[0]).resolve() for call in loader.call_args_list]
+                self.assertNotIn(sentinel.resolve(), loaded)
+
+    def test_optional_repository_inputs_never_read_outside_the_repository(self):
+        sentinel = self._sentinel_yaml()
+        inside = self.repo / "sec"
+        inside.mkdir()
+        (inside / "advisories.yaml").write_text('advisories:\n  flask: "1.0"\n', encoding="utf-8")
+        (inside / "perf.json").write_text('{"inside_ms": 1}\n', encoding="utf-8")
+        (self.repo / "bench-numbers.yaml").symlink_to(sentinel)
+        (self.repo / "advisories.yaml").symlink_to(sentinel)
+        (self.repo / "freshness-snapshot.yaml").symlink_to(sentinel)
+        (self.repo / "exports-baseline.yaml").symlink_to(sentinel)
+
+        def ctx(**config):
+            return SimpleNamespace(root=self.repo, config=config)
+
+        self.assertEqual(checks._local_advisories(ctx(advisory_file=str(sentinel))), (None, True))
+        self.assertEqual(checks._local_advisories(ctx(advisory_file="../sentinel.yaml")), (None, True))
+        self.assertEqual(checks._local_advisories(ctx()), (None, False))
+        entries, configured = checks._local_advisories(ctx(advisory_file="sec/advisories.yaml"))
+        self.assertTrue(configured)
+        self.assertTrue(entries)
+        self.assertNotIn("requests", json.dumps(entries, default=str))
+        self.assertIsNone(checks._freshness_snapshot(ctx(freshness_snapshot_file=str(sentinel))))
+        self.assertIsNone(checks._freshness_snapshot(ctx()))
+        self.assertIsNone(checks._baseline_exports(ctx(export_baseline_file="../sentinel.yaml")))
+        self.assertIsNone(checks._baseline_exports(ctx(export_baseline_file=str(sentinel))))
+        self.assertIsNone(checks._baseline_exports(ctx()))
+        self.assertEqual(checks._performance_numbers(ctx()), {"inside_ms": 1.0})
 
     def test_trusted_git_needs_a_fixed_owner_writable_file_outside_the_repository(self):
         good = self.tmp / "good" / "git"
