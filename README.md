@@ -5,17 +5,11 @@ Install the folder `.cursor/skills/code-quality-auditor/` into your Cursor proje
 This repository is the universal Code Quality Auditor. It includes 112 metric definitions in YAML, metric-to-check mapping, registered tool capabilities, user profiles, a safe DAG runner, a cross-language code graph, reporting, and CSV history. Quantitative risk checks run when the source declares those calculations. No repository name is special-cased. For complete security and correctness testing, grant explicit approval and provide approved analyzer environments; unavailable checks are never called PASS.
 
 ## Safety defaults
-The engine only inspects files by default. External analyzers need `--allow-tools`; repository tests and scripts need an authorized sandbox and `--allow-repo-execution` plus `--sandbox-confirmed`. Installation is never automatic. Reports are written outside the audited repository by default.
+The engine only inspects files by default. External analyzers need `--allow-tools`; repository tests and scripts need `--allow-repo-execution` plus `--sandbox-confirmed`. Installation is never automatic. Reports are written outside the audited repository by default.
+
+Approved analyzers and repository code both run only under containment, because analyzers read repository-controlled content. The only supported containment is the root-owned `/usr/bin/sandbox-exec` on macOS. Its profile denies by default and allows scoped reads, writes to one scratch directory, and no network. A probe must show that the profile blocks sibling files and loopback network before anything runs. On Linux and Windows containment is unavailable, so external analyzers and repository execution are reported unavailable while built-in static checks continue. `CQA_SANDBOX_CMD` and other custom wrappers cannot authorize containment, and a containment failure is never retried unsandboxed.
+
+The profile still allows `sysctl-read`, `mach-lookup`, and `ipc-posix*` without filters. These are compatibility exceptions so that macOS processes can start, not least privilege, and `mach-lookup` in particular reaches system services outside the file and network rules. Native enforcement of the profile has not been verified yet; that is tracked in issue #10. The sandbox trust tests mock `_trusted_sandbox()` and check policy text, probe decisions, and the launch path; they are not evidence that macOS Seatbelt enforces the profile. On timeout or output overflow the engine kills the command's session, and on Linux also its remaining `/proc` children, but this cleanup is best effort: a process that calls `setsid` or is reparented can survive, especially on macOS, so it is not part of the containment guarantee.
 
 ## Local verification
-Python 3.12 or newer is required. Install `requirements.txt` into `.venv` for local work, then run:
-
 `.venv/bin/python -m unittest discover -s tests -v`
-
-CI (`.github/workflows/tests.yml`) installs the exact pin in `requirements-ci.txt` and runs the same discovery through `scripts/ci/run_unittest.py` on Linux with Python 3.12, 3.13, and 3.14. Tests that need the native macOS `/usr/bin/sandbox-exec` are skipped there, with the reason `requires macOS /usr/bin/sandbox-exec`; the unapproved-execution assertions in those tests still run. A skipped test is not counted as platform coverage. Each matrix job attaches machine-readable results (`unittest.json`, `selfcheck.json`, `platform.json`) as an Actions artifact. The stable check to require for merges is `Required tests`.
-
-## Known limitations
-
-GitHub Actions does not run a macOS job. Native `sandbox-exec` coverage, including contained repository execution and `clang` syntax checks inside the sandbox, is local-only until that runner is reliable.
-
-On GitHub-hosted macOS 15 the binary `/usr/bin/sandbox-exec` is present, but a contained `clang` still cannot read the selected Xcode SDK. `xcode-select` uses `/var/select/developer_dir`, and `clang` then fails `realpath` of `MacOSX.sdk` with `Operation not permitted` (observed under `/Applications/Xcode_16.4.app`). Those tests are not required for merge. Run them on a Mac with `python -m unittest discover -s tests -v` when you need that coverage.

@@ -2,19 +2,31 @@
 
 These tests exercise the execution policy directly. They are not a full external
 audit, and they do not mark requirements verified in the traceability checklist.
+They run on any POSIX host. A fake sandbox command stands in for sandbox-exec
+through a mocked `_trusted_sandbox()`, so they check the policy text, the probe
+decision logic, and the launch path. They do not show that seatbelt enforces
+the profile natively.
 """
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import importlib.util
+import io
+import json
 import os
+import re
+import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import textwrap
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,21 +37,17 @@ spec = importlib.util.spec_from_file_location("auditor", SKILL / "scripts" / "au
 auditor = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(auditor)
 
+from cqa import checks, security  # noqa: E402
 from cqa.project import discover_repository, init_repository  # noqa: E402
-from cqa.security import (  # noqa: E402
-    ExecutionLog,
-    _compile_toolchain_grants,
-    _profile,
-    _seatbelt_aliases,
-    probe_sandbox,
-    run_contained,
-    run_tool,
-)
+from cqa.security import _SECRET_DIRS, ExecutionLog, _profile, _trusted_sandbox, probe_sandbox, run_contained, run_tool  # noqa: E402
 
-requires_macos_sandbox = unittest.skipUnless(
-    sys.platform == "darwin" and Path("/usr/bin/sandbox-exec").is_file(),
-    "requires macOS /usr/bin/sandbox-exec",
-)
+PASSTHROUGH = """#!/bin/sh
+[ "$1" = "-p" ] || exit 64
+shift 2
+[ "$1" = "--" ] || exit 64
+shift
+exec "$@"
+"""
 
 
 def _write_executable(path, text):
@@ -49,7 +57,8 @@ def _write_executable(path, text):
 
 class SandboxTrustTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp(prefix="cqa-sandbox-"))
+        self.tmp = Path(tempfile.mkdtemp(prefix="cqa-sandbox-")).resolve()
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
         self.repo = self.tmp / "repo"
         self.repo.mkdir()
         self._saved = os.environ.copy()
@@ -64,6 +73,28 @@ class SandboxTrustTests(unittest.TestCase):
         defaults.update(kwargs)
         return ExecutionLog(**defaults)
 
+    def _fake_sandbox(self, name="sandbox-exec"):
+        path = self.tmp / "trusted-bin" / name
+        path.parent.mkdir(exist_ok=True)
+        _write_executable(path, PASSTHROUGH)
+        return path
+
+    def _patch(self, target, **kwargs):
+        patcher = mock.patch(target, **kwargs)
+        patched = patcher.start()
+        self.addCleanup(patcher.stop)
+        return patched
+
+    def _select_sandbox(self, path):
+        self._patch("cqa.security._trusted_sandbox", return_value=Path(path))
+
+    def _accept_fake_sandbox(self):
+        """A passthrough fake that the probe is told to accept. It checks the launch path, not enforcement."""
+        fake = self._fake_sandbox()
+        self._select_sandbox(fake)
+        self._patch("cqa.security.probe_sandbox", return_value=(True, str(fake)))
+        return fake
+
     def test_passthrough_custom_sandbox_is_rejected_before_the_command(self):
         wrapper = self.tmp / "passthrough"
         _write_executable(wrapper, "#!/bin/sh\nexec \"$@\"\n")
@@ -77,6 +108,29 @@ class SandboxTrustTests(unittest.TestCase):
         with self.assertRaises(PermissionError):
             run_contained([str(payload)], self.repo, self._log())
         self.assertFalse(marker.exists())
+
+    def test_custom_sandbox_differing_from_the_trusted_command_is_never_executed(self):
+        self._select_sandbox(self._fake_sandbox())
+        log_path = self.tmp / "custom.log"
+        wrapper = self.tmp / "custom-wrapper"
+        _write_executable(wrapper, f"#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log_path}\nexec \"$@\"\n")
+        marker = self.tmp / "ran"
+        payload = self.tmp / "payload"
+        _write_executable(payload, f"#!/bin/sh\n: > {marker}\n")
+        os.environ["CQA_SANDBOX_CMD"] = str(wrapper)
+        with mock.patch("cqa.security._run_process") as runner:
+            available, detail = probe_sandbox(self.repo)
+            self.assertFalse(available)
+            self.assertIn("allowlisted", detail)
+            log = self._log()
+            with self.assertRaises(PermissionError):
+                run_contained([str(payload)], self.repo, log)
+            with self.assertRaises(PermissionError):
+                run_tool([str(payload)], self.repo, log)
+            runner.assert_not_called()
+        self.assertFalse(marker.exists())
+        self.assertFalse(log_path.exists())
+        self.assertTrue(any(item["operation"] == "containment" for item in log.denied))
 
     def test_custom_sandbox_inside_the_repository_is_rejected(self):
         wrapper = self.repo / "sandbox-wrapper"
@@ -96,31 +150,51 @@ class SandboxTrustTests(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 run_contained(["/usr/bin/true"], self.repo, self._log())
 
-    @requires_macos_sandbox
     def test_sandbox_apply_failure_is_not_rerun(self):
-        import subprocess
-
-        from cqa import security
-
+        fake = self._accept_fake_sandbox()
         marker = self.tmp / "payload-ran"
         payload = self.tmp / "payload"
         _write_executable(payload, f"#!/bin/sh\n: > {marker}\n")
-        calls = []
-        real = security._run_process
+        work = self.tmp / "work"
+        work.mkdir(mode=0o700)
+        failures = {
+            "status 71": (71, "", ""),
+            "sandbox_apply": (1, "", "sandbox-exec: sandbox_apply: Operation not permitted"),
+            "silent signal": (-6, "", ""),
+        }
+        launchers = {
+            "run_contained": lambda log: run_contained([str(payload)], self.repo, log, write_path=work),
+            "run_tool": lambda log: run_tool([str(payload)], self.repo, log),
+        }
+        for failure, (code, stdout, stderr) in failures.items():
+            for name, launch in launchers.items():
+                with self.subTest(failure=failure, launcher=name):
+                    calls = []
 
-        def wrapped(command, cwd, env, timeout):
-            calls.append(list(command))
-            if command and Path(command[0]).name == "sandbox-exec":
-                return subprocess.CompletedProcess(command, 71, "", "sandbox_apply failed")
-            return real(command, cwd, env, timeout)
+                    def fail(command, cwd, env, timeout):
+                        calls.append(list(command))
+                        return subprocess.CompletedProcess(command, code, stdout, stderr)
 
-        with mock.patch("cqa.security._run_process", side_effect=wrapped):
-            with self.assertRaises(PermissionError) as caught:
-                run_contained([str(payload)], self.repo, self._log())
-        self.assertIn("not rerun", str(caught.exception))
-        self.assertFalse(marker.exists())
-        self.assertEqual(len(calls), 1)
-        self.assertEqual(Path(calls[0][0]).name, "sandbox-exec")
+                    log = self._log()
+                    with mock.patch("cqa.security._run_process", side_effect=fail):
+                        with self.assertRaises(PermissionError) as caught:
+                            launch(log)
+                    self.assertIn("not rerun", str(caught.exception))
+                    self.assertFalse(marker.exists())
+                    self.assertEqual(len(calls), 1)
+                    self.assertEqual(calls[0][0], str(fake))
+                    self.assertEqual(calls[0][1], "-p")
+                    self.assertTrue(any(item["operation"] == "containment" for item in log.denied))
+
+    def test_ordinary_analyzer_failure_is_not_a_containment_failure(self):
+        self._accept_fake_sandbox()
+        for code, stdout, stderr in ((1, "", "broken.cpp:1:1: error: expected ';'"), (-11, "", "Segmentation fault")):
+            with self.subTest(code=code):
+                log = self._log()
+                with mock.patch("cqa.security._run_process", return_value=subprocess.CompletedProcess([], code, stdout, stderr)):
+                    completed = run_tool(["/usr/bin/true"], self.repo, log)
+                self.assertEqual(completed.returncode, code)
+                self.assertFalse(log.denied)
 
     def test_repository_executable_is_not_a_trusted_analyzer(self):
         marker = self.repo / "pwned"
@@ -130,8 +204,8 @@ class SandboxTrustTests(unittest.TestCase):
             run_tool([str(tool)], self.repo, self._log())
         self.assertFalse(marker.exists())
 
-    @requires_macos_sandbox
     def test_tool_timeout_kills_the_grandchild(self):
+        fake = self._accept_fake_sandbox()
         pid_file = self.tmp / "grandchild"
         tool = self.tmp / "parent-tool"
         _write_executable(
@@ -142,15 +216,17 @@ class SandboxTrustTests(unittest.TestCase):
             wait
             """,
         )
+        log = self._log()
         started = time.monotonic()
-        with self.assertRaises(subprocess_timeout()):
-            run_tool([str(tool)], self.repo, self._log(), timeout=1)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            run_tool([str(tool)], self.repo, log, timeout=1)
         self.assertLess(time.monotonic() - started, 5)
         grandchild = int(pid_file.read_text(encoding="utf-8").strip())
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline and _alive(grandchild):
             time.sleep(0.05)
         self.assertFalse(_alive(grandchild))
+        self.assertTrue(any(item["outcome"] == "timeout" and item["command"][0] == str(fake) for item in log.commands))
 
     def test_analyzer_configuration_is_not_executed(self):
         marker = self.repo / "config-executed"
@@ -172,200 +248,176 @@ class SandboxTrustTests(unittest.TestCase):
             run_tool([str(self.repo / "eslint.config.js")], self.repo, self._log())
         self.assertFalse(marker.exists())
 
-    @requires_macos_sandbox
-    def test_tool_environment_drops_startup_hooks(self):
+    def test_tool_environment_drops_startup_hooks_and_uses_private_scratch(self):
+        fake = self._accept_fake_sandbox()
         os.environ["PYTHONSTARTUP"] = str(self.tmp / "startup.py")
         os.environ["LD_PRELOAD"] = str(self.tmp / "preload.so")
         os.environ["NODE_OPTIONS"] = "--require " + str(self.tmp / "hook.js")
-        completed = run_tool(["/usr/bin/env"], self.repo, self._log(), timeout=10)
-        self.assertEqual(completed.returncode, 0)
+        os.environ["TMPDIR"] = tempfile.gettempdir()
+        log = self._log()
+        completed = run_tool(["/usr/bin/env"], self.repo, log, timeout=10)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
         output = completed.stdout
         self.assertNotIn("PYTHONSTARTUP", output)
         self.assertNotIn("LD_PRELOAD", output)
         self.assertNotIn("NODE_OPTIONS", output)
+        values = dict(line.split("=", 1) for line in output.splitlines() if "=" in line)
+        scratch = Path(values["TMPDIR"])
+        self.assertEqual(values["TMP"], str(scratch))
+        self.assertEqual(values["TEMP"], str(scratch))
+        self.assertNotEqual(scratch, Path(tempfile.gettempdir()).resolve())
+        self.assertTrue(scratch.name.startswith("cqa-tool-"))
+        self.assertFalse(scratch.exists())
+        wrapped = next(item["command"] for item in log.commands if item["outcome"] == "started")
+        self.assertEqual(wrapped[0], str(fake))
+        profile = wrapped[2]
+        writes = _write_roots(profile)
+        self.assertEqual(writes, [scratch])
+        self.assertTrue(_read_allowed(profile, scratch / "work.o"))
+        self.assertFalse(_allowed(profile, "file-write-data", Path(tempfile.gettempdir()) / "cqa-shared-file"))
+
+    def test_contained_temporary_variables_point_at_the_write_path(self):
+        self._accept_fake_sandbox()
+        work = self.tmp / "work"
+        work.mkdir(mode=0o700)
+        os.environ["TMPDIR"] = tempfile.gettempdir()
+        completed = run_contained(["/usr/bin/env"], self.repo, self._log(), timeout=10, write_path=work, env={"TMPDIR": "/tmp", "EXTRA": "1"})
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        values = dict(line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line)
+        for key in ("TMPDIR", "TMP", "TEMP"):
+            self.assertEqual(values[key], str(work), key)
+        self.assertEqual(values["EXTRA"], "1")
 
     def test_profile_closes_reads_outside_the_command_allowlist(self):
-        repo = Path.home() / "cqa-allowlist-repo"
-        repo.mkdir(exist_ok=True)
-        self.addCleanup(lambda: __import__("shutil").rmtree(repo, ignore_errors=True))
+        home = self.tmp / "home"
+        repo = home / "cqa-allowlist-repo"
+        repo.mkdir(parents=True)
         repo_file = repo / "visible.txt"
         repo_file.write_text("visible", encoding="utf-8")
-        sibling = Path.home() / "cqa-allowlist-sibling.txt"
+        sibling = home / "cqa-allowlist-sibling.txt"
         sibling.write_text("outside", encoding="utf-8")
-        self.addCleanup(lambda: sibling.unlink(missing_ok=True))
-        profile = _profile([str(repo)], str(repo))
-        blanket = profile.index("(allow file-read*)")
-        closure = profile.index('(deny file-read* (subpath "/"))')
-        self.assertLess(blanket, closure)
-        root_inode = profile.index('(allow file-read* (literal "/"))')
-        self.assertLess(closure, root_inode)
-        self.assertLess(
-            profile.index('(deny file-read-metadata (subpath "/"))'),
-            profile.index('(allow file-read-metadata (literal "/"))'),
-        )
-        secret = Path.home() / ".ssh" / "id_ed25519"
-        allowed = ("/", repo_file, "/usr/bin/true")
-        denied = (
-            "/etc/passwd",
-            "/var/lib/cqa-not-allowed",
-            "/opt/cqa-not-allowed",
-            sibling,
-            secret,
-        )
-        for operation in ("file-read*", "file-read-metadata"):
-            for path in allowed:
-                with self.subTest(operation=operation, path=str(path)):
-                    self.assertTrue(_read_allowed(profile, path, operation))
-            for path in denied:
-                with self.subTest(operation=operation, path=str(path)):
-                    self.assertFalse(_read_allowed(profile, path, operation))
+        with mock.patch.object(Path, "home", return_value=home):
+            profile = _profile([str(repo)], str(repo), repo)
+        self.assertNotIn("(allow default)", profile)
+        self.assertEqual(_unfiltered_file_allows(profile), [])
+        self.assertFalse(_read_allowed(profile, "/etc/passwd"))
+        self.assertFalse(_read_allowed(profile, "/var/lib/cqa-not-allowed"))
+        self.assertFalse(_read_allowed(profile, "/opt/cqa-not-allowed"))
+        self.assertFalse(_read_allowed(profile, "/Library/Keychains/login.keychain-db"))
+        self.assertFalse(_read_allowed(profile, sibling))
+        self.assertFalse(_read_allowed(profile, home))
+        self.assertTrue(_read_allowed(profile, repo_file))
+        self.assertTrue(_read_allowed(profile, Path("/usr/bin/true").resolve()))
+        for name in _SECRET_DIRS:
+            self.assertFalse(_read_allowed(profile, home / name / "credentials"), name)
         self.assertNotIn('(allow file-read* (subpath "/"))', profile)
-        self.assertNotIn('(allow file-read-metadata (subpath "/"))', profile)
         self.assertNotIn('(allow file-read* (subpath "/etc"))', profile)
         self.assertNotIn('(allow file-read* (subpath "/opt"))', profile)
 
-    def test_profile_covers_both_spellings_of_macos_symlinked_paths(self):
-        folders = _seatbelt_aliases(Path("/var/folders/ab/T/cqa"))
-        self.assertIn(Path("/var/folders/ab/T/cqa"), folders)
-        self.assertIn(Path("/private/var/folders/ab/T/cqa"), folders)
-        self.assertNotIn(Path("/var"), folders)
-        self.assertNotIn(Path("/private/var"), folders)
-        work_dir = _seatbelt_aliases(Path("/tmp/cqa-work"))
-        self.assertIn(Path("/tmp/cqa-work"), work_dir)
-        self.assertIn(Path("/private/tmp/cqa-work"), work_dir)
-        self.assertNotIn(Path("/tmp"), work_dir)
-        self.assertNotIn(Path("/private/tmp"), work_dir)
-
-        work = Path(tempfile.mkdtemp(prefix="cqa-alias-"))
-        self.addCleanup(lambda: __import__("shutil").rmtree(work, ignore_errors=True))
-        home = work / "home"
-        with mock.patch.dict(os.environ, {"HOME": str(home)}):
-            profile = _profile([str(work)], str(work), allow_temp_writes=True)
-        work_aliases = _seatbelt_aliases(work)
-        self.assertGreaterEqual(len(work_aliases), 2)
-        for alias in work_aliases:
-            self.assertIn(f'(allow file-read* (subpath "{alias}"))', profile)
-            self.assertIn(f'(allow file-write* (subpath "{alias}"))', profile)
-        for alias in _seatbelt_aliases(tempfile.gettempdir()):
-            self.assertIn(f'(allow file-write* (subpath "{alias}"))', profile)
-        for broad in ("/var", "/private/var"):
-            for operation in ("file-read*", "file-read-metadata", "file-write*"):
-                self.assertNotIn(f'(allow {operation} (subpath "{broad}"))', profile)
-        self.assertNotIn('(allow file-read* (subpath "/"))', profile)
-        self.assertNotIn('(allow file-read-metadata (subpath "/"))', profile)
-        self.assertNotIn('(allow file-read* (literal "/tmp"))', profile)
-        self.assertIn('(allow file-read-metadata (literal "/tmp"))', profile)
-
-        visible = [alias / "visible.txt" for alias in work_aliases]
-        secrets = _seatbelt_aliases(home / ".ssh" / "id_ed25519")
-        self.assertGreaterEqual(len(secrets), 2)
-        closed = [
-            *secrets,
-            "/etc/passwd",
-            "/private/etc/passwd",
-            "/var/lib/cqa-not-allowed",
-            "/private/var/lib/cqa-not-allowed",
-            "/opt/cqa-not-allowed",
-        ]
-        for operation in ("file-read*", "file-read-metadata"):
-            for path in visible:
-                with self.subTest(operation=operation, path=str(path)):
-                    self.assertTrue(_read_allowed(profile, path, operation))
-            for path in closed:
-                with self.subTest(operation=operation, path=str(path)):
-                    self.assertFalse(_read_allowed(profile, path, operation))
-
-    def test_clang_toolchain_grant_does_not_open_var_db_or_applications(self):
-        link = Path("/var/db/xcode_select_link")
-        target = Path("/Applications/Xcode.app/Contents/Developer")
-        reads, metadata = _compile_toolchain_grants(link, target)
-        self.assertEqual(reads, [link, Path("/Applications/Xcode.app")])
-        self.assertIn(Path("/var/db"), metadata)
-        self.assertIn(Path("/private/var/db"), metadata)
-        self.assertIn(Path("/Applications"), metadata)
-        self.assertNotIn(Path("/var"), metadata)
-        self.assertNotIn(Path("/Applications"), reads)
-        profile = _profile([], None, extra_reads=reads, metadata_literals=metadata)
-        self.assertIn('(allow file-read* (subpath "/Applications/Xcode.app"))', profile)
-        self.assertIn('(allow file-read* (subpath "/var/db/xcode_select_link"))', profile)
-        self.assertIn('(allow file-read-metadata (literal "/var/db"))', profile)
-        self.assertIn('(allow file-read-metadata (literal "/Applications"))', profile)
-        self.assertNotIn('(allow file-read* (subpath "/Applications"))', profile)
-        self.assertNotIn('(allow file-read-metadata (subpath "/Applications"))', profile)
-        self.assertNotIn('(allow file-read* (subpath "/var/db"))', profile)
-        self.assertNotIn('(allow file-read-metadata (subpath "/var/db"))', profile)
-        for operation in ("file-read*", "file-read-metadata"):
-            self.assertFalse(_read_allowed(profile, "/var/db/sudo", operation))
-            self.assertFalse(_read_allowed(profile, "/etc/passwd", operation))
-            self.assertFalse(_read_allowed(profile, "/Applications/Other.app/Contents/Info.plist", operation))
-        self.assertTrue(_read_allowed(profile, "/Applications/Xcode.app/Contents/Developer/usr/bin/clang"))
-        self.assertTrue(_read_allowed(profile, "/var/db", "file-read-metadata"))
-        self.assertFalse(_read_allowed(profile, "/var/db", "file-read*"))
-        self.assertTrue(_read_allowed(profile, "/Applications", "file-read-metadata"))
-        self.assertFalse(_read_allowed(profile, "/Applications", "file-read*"))
-
-        select = Path("/var/select/developer_dir")
-        select_reads, select_meta = _compile_toolchain_grants(select, target)
-        self.assertEqual(select_reads, [select, Path("/Applications/Xcode.app")])
-        self.assertIn(Path("/var/select"), select_meta)
-        self.assertNotIn(Path("/var/select"), select_reads)
-        select_profile = _profile([], None, extra_reads=select_reads, metadata_literals=select_meta)
-        self.assertIn('(allow file-read* (subpath "/var/select/developer_dir"))', select_profile)
-        self.assertIn('(allow file-read-metadata (literal "/var/select"))', select_profile)
-        self.assertNotIn('(allow file-read* (subpath "/var/select"))', select_profile)
-        self.assertFalse(_read_allowed(select_profile, "/var/select/other", "file-read*"))
-        self.assertFalse(_read_allowed(select_profile, "/var/select/other", "file-read-metadata"))
-
-    @requires_macos_sandbox
-    def test_contained_command_cannot_read_home_secrets(self):
-        secret_dir = Path.home() / ".ssh"
-        secret_dir.mkdir(exist_ok=True)
-        sentinel = secret_dir / "cqa-sandbox-sentinel"
-        repo_file = self.repo / "visible.txt"
-        repo_file.write_text("visible", encoding="utf-8")
-        reader = self.tmp / "reader.py"
-        reader.write_text(
-            textwrap.dedent(
-                f"""
-                try:
-                    open({str(sentinel)!r}, encoding="utf-8").read()
-                    print("SECRET_READ")
-                except OSError:
-                    print("SECRET_BLOCKED")
-                try:
-                    print("REPO", open({str(repo_file)!r}, encoding="utf-8").read())
-                except OSError:
-                    print("REPO_BLOCKED")
-                """
-            ).lstrip(),
-            encoding="utf-8",
-        )
+    def test_profile_does_not_grant_a_home_interpreter_prefix(self):
+        home = self.tmp / "home"
+        prefix = home / ".local"
+        sentinel = prefix / "share" / "keyrings" / "login"
+        sentinel.parent.mkdir(parents=True)
         sentinel.write_text("secret", encoding="utf-8")
-        private = Path.home() / "cqa-sandbox-private-note"
+        (home / ".ssh").mkdir()
+        repo = home / "repo"
+        repo.mkdir()
+        (repo / "app.py").write_text("x = 1\n", encoding="utf-8")
+        with mock.patch.object(Path, "home", return_value=home), mock.patch("cqa.security.sys.prefix", str(prefix)), mock.patch("cqa.security.sys.base_prefix", str(prefix)):
+            profile = _profile([str(repo)], None, repo)
+        self.assertFalse(_read_allowed(profile, sentinel))
+        self.assertNotIn(f'(subpath "{prefix.resolve()}")', profile)
+        self.assertFalse(_read_allowed(profile, home / ".ssh" / "id_ed25519"))
+        self.assertTrue(_read_allowed(profile, repo / "app.py"))
+
+    def test_profile_denies_home_secrets_even_when_they_are_requested(self):
+        home = self.tmp / "home"
+        (home / ".ssh").mkdir(parents=True)
+        (home / ".config" / "gh").mkdir(parents=True)
+        private = home / "private-note"
         private.write_text("private", encoding="utf-8")
-        self.addCleanup(lambda: sentinel.unlink(missing_ok=True))
-        self.addCleanup(lambda: private.unlink(missing_ok=True))
-        reader.write_text(
-            reader.read_text(encoding="utf-8")
-            + textwrap.dedent(
-                f"""
-                try:
-                    open({str(private)!r}, encoding="utf-8").read()
-                    print("PRIVATE_READ")
-                except OSError:
-                    print("PRIVATE_BLOCKED")
-                """
-            ),
-            encoding="utf-8",
-        )
-        os.environ.pop("CQA_SANDBOX_CMD", None)
-        completed = run_contained([sys.executable, str(reader)], self.repo, self._log(), timeout=20)
-        output = completed.stdout
-        self.assertIn("SECRET_BLOCKED", output, f"rc={completed.returncode} stderr={completed.stderr!r} stdout={output!r}")
-        self.assertIn("PRIVATE_BLOCKED", output)
-        self.assertIn("REPO visible", output)
-        self.assertNotIn("SECRET_READ", output)
-        self.assertNotIn("PRIVATE_READ", output)
+        with mock.patch.object(Path, "home", return_value=home):
+            profile = _profile([str(home), str(home / ".ssh"), str(home / ".config" / "gh")], str(home / ".ssh"), self.repo)
+        self.assertFalse(_read_allowed(profile, private))
+        self.assertFalse(_read_allowed(profile, home / ".ssh" / "id_ed25519"))
+        self.assertFalse(_read_allowed(profile, home / ".config" / "gh" / "hosts.yml"))
+        self.assertFalse(_allowed(profile, "file-write-data", home / ".ssh" / "authorized_keys"))
+        for name in _SECRET_DIRS:
+            self.assertFalse(_read_allowed(profile, home / name / "x"), name)
+            self.assertFalse(_allowed(profile, "file-map-executable", home / name / "x"), name)
+
+    def test_profile_has_no_unfiltered_file_rules_and_scopes_writes(self):
+        work = self.tmp / "work"
+        work.mkdir(mode=0o700)
+        profile = _profile([str(self.repo)], str(work), self.repo)
+        self.assertEqual(_unfiltered_file_allows(profile), [])
+        self.assertEqual(_write_roots(profile), [work])
+        self.assertTrue(_allowed(profile, "file-write-data", work / "out.txt"))
+        self.assertTrue(_read_allowed(profile, work / "out.txt"))
+        self.assertFalse(_allowed(profile, "file-write-data", self.repo / "app.py"))
+        self.assertFalse(_allowed(profile, "file-write-data", self.tmp / "sibling.txt"))
+        self.assertFalse(_allowed(profile, "file-write-data", "/dev/null"))
+        no_write = _profile([str(self.repo)], None, self.repo)
+        self.assertEqual(_write_roots(no_write), [])
+        self.assertEqual(_unfiltered_file_allows(no_write), [])
+
+    def test_profile_denies_network_and_limits_process_rules(self):
+        profile = _profile([str(self.repo)], str(self.repo), self.repo)
+        lines = [line.strip() for line in profile.splitlines() if line.strip()]
+        self.assertIn("(deny network*)", lines)
+        self.assertFalse([line for line in lines if line.startswith("(allow network")])
+        self.assertFalse(_allowed(profile, "network-outbound", "/"))
+        self.assertNotIn("(allow process*)", lines)
+        self.assertFalse([line for line in lines if line.startswith("(allow signal")])
+        self.assertEqual(sorted(line for line in lines if line.startswith("(allow process")), ["(allow process-exec)", "(allow process-fork)"])
+        self.assertFalse([line for line in lines if line.startswith("(allow system-socket")])
+
+    def test_profile_uses_literal_device_rules_and_reviewed_roots(self):
+        self.assertEqual(security._SYSTEM_READ_ROOTS, ("/usr", "/bin", "/sbin", "/System/Library", "/Library/Developer", "/opt/homebrew"))
+        profile = _profile([str(self.repo)], None, self.repo)
+        for device in ("/dev/null", "/dev/random", "/dev/urandom"):
+            self.assertIn(f'(allow file-read* (literal "{device}"))', profile)
+            self.assertTrue(_read_allowed(profile, device))
+        self.assertNotIn('(subpath "/dev")', profile)
+        self.assertFalse(_read_allowed(profile, "/dev/disk0"))
+        self.assertFalse(_read_allowed(profile, "/dev/tty"))
+        self.assertNotIn('(subpath "/Library")', profile)
+        for root in ("/usr", "/bin", "/sbin"):
+            if Path(root).exists():
+                self.assertTrue(_read_allowed(profile, Path(root).resolve() / "cqa-tool"), root)
+
+    def test_profile_never_opens_the_macos_data_volume(self):
+        """/System/Volumes/Data is a second path to every user home and to /private on modern macOS."""
+        data = Path("/System/Volumes/Data")
+        for raw in security._SYSTEM_READ_ROOTS:
+            root = Path(raw)
+            self.assertFalse(root == data or root in data.parents, raw)
+        protected = security._protected_roots()
+        for broad in (data, data.parent, Path("/System"), Path("/")):
+            self.assertTrue(security._too_broad(broad, protected), broad)
+        repo = data / "Projects" / "cqa-repo"
+        self.assertFalse(security._too_broad(repo, protected))
+        requested = [str(data), str(data.parent), "/System", str(repo)]
+        with mock.patch("cqa.security._existing_reads", return_value=requested):
+            profile = _profile(requested, None, self.repo)
+        self.assertEqual(_unfiltered_file_allows(profile), [])
+        self.assertTrue(_read_allowed(profile, repo / "app.cpp"))
+        for raw in ("Users/someone/.ssh/id_ed25519", "private/etc/master.passwd", "private/var/folders/ab/T/cqa-unrelated", "Projects/cqa-sibling/secret.txt"):
+            self.assertFalse(_read_allowed(profile, data / raw), raw)
+        self.assertNotIn('(subpath "/System")', profile)
+        self.assertNotIn(f'(subpath "{data}")', profile)
+
+    def test_profile_denies_shared_temporary_storage(self):
+        work = Path(tempfile.mkdtemp(prefix="cqa-scratch-")).resolve()
+        self.addCleanup(__import__("shutil").rmtree, work, True)
+        shared = Path(tempfile.gettempdir()).resolve()
+        profile = _profile([str(self.repo), str(shared), "/tmp", "/var/tmp"], str(work), self.repo)
+        self.assertTrue(_read_allowed(profile, work / "scratch.txt"))
+        self.assertFalse(_read_allowed(profile, shared / "cqa-unrelated-file"))
+        for raw in ("/tmp/cqa-unrelated", "/private/tmp/cqa-unrelated", "/var/tmp/cqa-unrelated", "/private/var/folders/ab/T/cqa-unrelated"):
+            self.assertFalse(_read_allowed(profile, raw), raw)
+            self.assertFalse(_allowed(profile, "file-write-data", raw), raw)
 
     def test_tool_without_containment_does_not_run(self):
         marker = self.tmp / "side-effect"
@@ -374,6 +426,20 @@ class SandboxTrustTests(unittest.TestCase):
         with mock.patch("cqa.security.probe_sandbox", return_value=(False, "containment is unavailable")):
             with self.assertRaises(PermissionError):
                 run_tool([str(tool)], self.repo, self._log())
+        self.assertFalse(marker.exists())
+
+    def test_tool_never_falls_back_when_no_trusted_sandbox_exists(self):
+        marker = self.tmp / "side-effect"
+        tool = self.tmp / "host-tool"
+        _write_executable(tool, f"#!/bin/sh\n: > {marker}\n")
+        self._patch("cqa.security._trusted_sandbox", return_value=None)
+        with mock.patch("cqa.security._run_process") as runner:
+            for launch in (lambda log: run_tool([str(tool)], self.repo, log), lambda log: run_contained([str(tool)], self.repo, log)):
+                log = self._log()
+                with self.assertRaises(PermissionError):
+                    launch(log)
+                self.assertTrue(any(item["operation"] == "containment" for item in log.denied))
+            runner.assert_not_called()
         self.assertFalse(marker.exists())
 
     def test_wrapper_that_blocks_the_probe_but_allows_other_commands_is_not_trusted(self):
@@ -402,7 +468,6 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertFalse(log_path.exists())
 
-    @requires_macos_sandbox
     def test_path_sandbox_exec_is_never_executed(self):
         fake_dir = self.repo / ".venv" / "bin"
         fake_dir.mkdir(parents=True)
@@ -417,15 +482,1339 @@ class SandboxTrustTests(unittest.TestCase):
             """,
         )
         os.environ["PATH"] = str(fake_dir) + os.pathsep + os.environ.get("PATH", "")
-        available, detail = probe_sandbox(self.repo)
-        self.assertTrue(available)
-        self.assertEqual(detail, "/usr/bin/sandbox-exec")
+        self.assertIn(_trusted_sandbox(), (None, Path("/usr/bin/sandbox-exec")))
+        with mock.patch.dict(security._PLATFORM_SANDBOX, {sys.platform: str(fake_dir / "sandbox-exec")}):
+            if os.geteuid() != 0:
+                self.assertIsNone(_trusted_sandbox())
+        fake = self._accept_fake_sandbox()
         log = self._log()
         completed = run_tool(["/usr/bin/true"], self.repo, log, timeout=10)
-        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertFalse(log_path.exists())
         self.assertFalse(marker.exists())
-        self.assertTrue(any(item["command"] and item["command"][0] == "/usr/bin/sandbox-exec" for item in log.commands))
+        self.assertTrue(any(item["command"] and item["command"][0] == str(fake) for item in log.commands))
+
+    def _chdir(self, path):
+        previous = os.getcwd()
+        os.chdir(path)
+        self.addCleanup(os.chdir, previous)
+
+    def _wrapped_profile(self, command, write_path=None):
+        self._select_sandbox(self._fake_sandbox())
+        wrapped = security._contained_command(command, self.repo, write_path)
+        self.assertEqual(wrapped[1], "-p")
+        return wrapped[2]
+
+    def test_command_arguments_do_not_widen_reads(self):
+        elsewhere = self.tmp / "elsewhere"
+        (elsewhere / "leak").mkdir(parents=True)
+        (elsewhere / "leak" / "secret.txt").write_text("outside", encoding="utf-8")
+        self._chdir(elsewhere)
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("outside", encoding="utf-8")
+        (self.repo / "link.txt").symlink_to(outside / "secret.txt")
+        (self.repo / "dirlink").symlink_to(outside, target_is_directory=True)
+        (self.repo / "visible.txt").write_text("visible", encoding="utf-8")
+        command = [
+            "/usr/bin/true",
+            "leak/secret.txt",
+            "leak",
+            "/etc/passwd",
+            "/etc",
+            str(self.repo / "link.txt"),
+            "dirlink",
+            str(Path.home()),
+            tempfile.gettempdir(),
+        ]
+        profile = self._wrapped_profile(command)
+        self.assertTrue(_read_allowed(profile, self.repo / "visible.txt"))
+        for denied in (elsewhere / "leak" / "secret.txt", elsewhere / "other", Path("/etc/passwd"), Path("/etc/hosts"), outside / "secret.txt", outside / "other", Path(tempfile.gettempdir()).resolve() / "cqa-unrelated"):
+            self.assertFalse(_read_allowed(profile, denied), denied)
+        for root in (elsewhere, elsewhere / "leak", Path("/etc"), outside, Path.home().resolve(), Path(tempfile.gettempdir()).resolve()):
+            self.assertNotIn(f'(subpath "{root}")', profile.replace(f'(subpath "{self.repo}")', ""), root)
+
+    def test_relative_command_is_resolved_against_the_audit_root(self):
+        self._select_sandbox(self._fake_sandbox())
+        elsewhere = self.tmp / "elsewhere"
+        (elsewhere / "bin").mkdir(parents=True)
+        _write_executable(elsewhere / "bin" / "tool", "#!/bin/sh\nexit 0\n")
+        (self.repo / "bin").mkdir()
+        _write_executable(self.repo / "bin" / "tool", "#!/bin/sh\nexit 0\n")
+        self._chdir(elsewhere)
+        wrapped = security._contained_command(["bin/tool"], self.repo, None)
+        self.assertEqual(wrapped[4], str((self.repo / "bin" / "tool").resolve()))
+
+    def test_pytest_read_root_is_the_audit_root(self):
+        """A marker directory can be the process cwd, but reads stay inside the audit root.
+
+        The fake sandbox only builds the profile. It is not native seatbelt enforcement.
+        """
+        repo = self.repo
+        (repo / "app.py").write_text("def add(left, right):\n    return left + right\n", encoding="utf-8")
+        (repo / "pyproject.toml").write_text("[tool.pytest.ini_options]\n", encoding="utf-8")
+        tests = repo / "tests"
+        tests.mkdir()
+        (tests / "conftest.py").write_text("import app\n", encoding="utf-8")
+        (tests / "test_app.py").write_text("def test_add():\n    assert True\n", encoding="utf-8")
+        (tests / "bin").mkdir()
+        _write_executable(tests / "bin" / "tool", "#!/bin/sh\nexit 0\n")
+        (repo / "bin").mkdir()
+        _write_executable(repo / "bin" / "tool", "#!/bin/sh\nexit 0\n")
+        pytest_bin = repo / ".venv" / "bin" / "pytest"
+        pytest_bin.parent.mkdir(parents=True)
+        _write_executable(pytest_bin, "#!/bin/sh\nexit 0\n")
+        sibling = self.tmp / "home-credential"
+        sibling.write_text("secret", encoding="utf-8")
+        home = self.tmp / "home"
+        home_pytest = home / ".venv" / "bin" / "pytest"
+        home_pytest.parent.mkdir(parents=True)
+        _write_executable(home_pytest, "#!/bin/sh\nexit 0\n")
+        above = self.tmp / ".venv" / "bin" / "pytest"
+        above.parent.mkdir(parents=True)
+        _write_executable(above, "#!/bin/sh\nexit 0\n")
+
+        analyses = [
+            {"path": "app.py", "symbols": []},
+            {"path": "tests/test_app.py", "symbols": []},
+            {"path": "tests/conftest.py", "symbols": []},
+        ]
+        ctx = SimpleNamespace(root=repo, files=[item["path"] for item in analyses], analyses=analyses, texts={}, log=self._log())
+        captured = {}
+
+        def fake_run(command, cwd, log, timeout=30, write_path=None, env=None, read_root=None):
+            captured.update(command=command, cwd=cwd, env=env, read_root=read_root, log=log)
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch("cqa.checks.run_contained", side_effect=fake_run):
+            result = checks.project_test_result(ctx)
+        self.assertEqual(result["runner"], "pytest")
+        self.assertEqual(Path(captured["cwd"]).resolve(), tests.resolve())
+        self.assertEqual(Path(captured["read_root"]).resolve(), repo.resolve())
+        self.assertEqual(captured["command"][0], str(pytest_bin.resolve()))
+        pythonpath = captured["env"]["PYTHONPATH"].split(os.pathsep)
+        self.assertEqual(pythonpath[0], str(repo.resolve()))
+        self.assertIn(str(tests.resolve()), pythonpath)
+        self._select_sandbox(self._fake_sandbox())
+        wrapped = security._contained_command(captured["command"], captured["cwd"], None, read_root=captured["read_root"])
+        profile = wrapped[2]
+        self.assertTrue(_read_allowed(profile, repo / "app.py"))
+        self.assertTrue(_read_allowed(profile, repo / "pyproject.toml"))
+        self.assertTrue(_read_allowed(profile, pytest_bin))
+        self.assertFalse(_read_allowed(profile, sibling))
+        relative = security._contained_command(["bin/tool"], tests, None, read_root=repo)
+        self.assertEqual(relative[-1], str((tests / "bin" / "tool").resolve()))
+
+        bare = home / "bare-repo"
+        (bare / "tests").mkdir(parents=True)
+        (bare / "tests" / "conftest.py").write_text("", encoding="utf-8")
+        with mock.patch.object(Path, "home", return_value=home):
+            found = checks._pytest_executable(bare, bare)
+            nested = checks._pytest_executable(bare / "tests", bare)
+        self.assertNotEqual(found, home_pytest.resolve())
+        self.assertNotEqual(nested, home_pytest.resolve())
+        self.assertNotEqual(found, above.resolve())
+        self.assertNotEqual(nested, above.resolve())
+        self.assertTrue(found is None or home not in Path(found).parents)
+        self.assertEqual(checks._pytest_executable(tests, repo), pytest_bin.resolve())
+
+    def test_containment_denial_does_not_store_child_output(self):
+        self._accept_fake_sandbox()
+        secret = "cqa-child-secret-" + os.urandom(6).hex()
+        cases = (
+            (1, f"{secret} out", f"{secret} sandbox_apply: Operation not permitted"),
+            (71, f"{secret} out", f"{secret}"),
+        )
+        for code, stdout, stderr in cases:
+            with self.subTest(code=code):
+                log = self._log()
+                with mock.patch("cqa.security._run_process", return_value=subprocess.CompletedProcess([], code, stdout, stderr)):
+                    with self.assertRaises(PermissionError) as caught:
+                        run_tool(["/usr/bin/true"], self.repo, log)
+                self.assertNotIn(secret, str(caught.exception))
+                self.assertNotIn(secret, json.dumps({"denied": log.denied, "commands": log.commands}))
+                denial = next(item for item in log.denied if item["operation"] == "containment")
+                self.assertIn(f"exit {code}", denial["detail"])
+
+    def test_timeout_record_does_not_store_child_output(self):
+        self._accept_fake_sandbox()
+        secret = "cqa-child-secret-" + os.urandom(6).hex()
+        tool = self.tmp / "chatty-tool"
+        _write_executable(tool, f"#!/bin/sh\necho {secret}\necho {secret} >&2\nsleep 30\n")
+        log = self._log()
+        with self.assertRaises(subprocess.TimeoutExpired) as caught:
+            run_tool([str(tool)], self.repo, log, timeout=1)
+        self.assertIsNone(caught.exception.output)
+        self.assertIsNone(caught.exception.stderr)
+        self.assertNotIn(secret, str(caught.exception))
+        self.assertNotIn(secret, json.dumps({"denied": log.denied, "commands": log.commands}))
+        self.assertTrue(any(item["outcome"] == "timeout" for item in log.commands))
+
+    def test_run_process_caps_each_output_stream(self):
+        self.assertEqual(security._OUTPUT_LIMIT, 8 * 1024 * 1024)
+        for stream in ("stdout", "stderr"):
+            with self.subTest(stream=stream):
+                pid_file = self.tmp / f"{stream}.pid"
+                script = textwrap.dedent(
+                    f"""
+                    import os, sys, time
+                    open({str(pid_file)!r}, "w").write(str(os.getpid()))
+                    sys.{stream}.write("P" * 200000)
+                    sys.{stream}.flush()
+                    time.sleep(30)
+                    """
+                )
+                started = time.monotonic()
+                with self.assertRaises(security.OutputLimitExceeded) as caught:
+                    security._run_process([sys.executable, "-c", script], str(self.tmp), dict(os.environ), 20, limit=4096)
+                self.assertLess(time.monotonic() - started, 10)
+                self.assertNotIn("PPPP", str(caught.exception))
+                self.assertFalse(_alive(int(pid_file.read_text(encoding="utf-8"))))
+        completed = security._run_process([sys.executable, "-c", "print('x' * 1000)"], str(self.tmp), dict(os.environ), 20, limit=4096)
+        self.assertEqual(completed.stdout, "x" * 1000 + "\n")
+
+    def test_output_overflow_is_a_denial_not_a_result(self):
+        self._accept_fake_sandbox()
+        log = self._log()
+        with mock.patch("cqa.security._run_process", side_effect=security.OutputLimitExceeded("output exceeded 8 bytes on one stream")):
+            with self.assertRaises(PermissionError):
+                run_tool(["/usr/bin/true"], self.repo, log)
+        self.assertTrue(any(item["operation"] == "output-limit" for item in log.denied))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "the /proc descendant sweep is Linux only")
+    def test_timeout_kills_descendants_that_left_the_session(self):
+        pid_file = self.tmp / "detached.pid"
+        script = textwrap.dedent(
+            f"""
+            import os, time
+            if os.fork() == 0:
+                os.setsid()
+                open({str(pid_file)!r} + ".tmp", "w").write(str(os.getpid()))
+                os.replace({str(pid_file)!r} + ".tmp", {str(pid_file)!r})
+                time.sleep(30)
+                os._exit(0)
+            time.sleep(30)
+            """
+        )
+        with self.assertRaises(subprocess.TimeoutExpired):
+            security._run_process([sys.executable, "-c", script], str(self.tmp), dict(os.environ), 2)
+        detached = int(pid_file.read_text(encoding="utf-8"))
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline and _running(detached):
+            time.sleep(0.05)
+        self.assertFalse(_running(detached))
+
+    def test_broad_or_missing_write_path_is_refused_before_launch(self):
+        self._accept_fake_sandbox()
+        (self.repo / "build").mkdir()
+        refused = ["/", str(Path.home()), tempfile.gettempdir(), str(self.tmp / "missing"), str(self.repo), str(self.repo / "build"), str(self.tmp)]
+        refused.extend(path for path in ("/etc", "/usr", "/Library") if Path(path).is_dir())
+        for write_path in refused:
+            with self.subTest(write_path=write_path):
+                log = self._log()
+                calls = []
+                with mock.patch("cqa.security._run_process", side_effect=lambda *args, **kwargs: calls.append(args)):
+                    with self.assertRaises(PermissionError):
+                        run_contained(["/usr/bin/env"], self.repo, log, write_path=write_path)
+                self.assertEqual(calls, [])
+                self.assertFalse(any(item["outcome"] == "started" for item in log.commands))
+                self.assertTrue(any(item["operation"] == "containment" and "write path" in item["detail"] for item in log.denied))
+                self.assertEqual(_write_roots(_profile([str(self.repo)], write_path, self.repo)), [])
+                wrapped = security._contained_command(["/usr/bin/true"], self.repo, write_path)
+                self.assertEqual(_write_roots(wrapped[2]), [])
+        child = Path(tempfile.mkdtemp(prefix="cqa-tool-")).resolve()
+        self.addCleanup(__import__("shutil").rmtree, child, True)
+        self.assertEqual(_write_roots(_profile([str(self.repo)], str(child), self.repo)), [child])
+        completed = run_contained(["/usr/bin/env"], self.repo, self._log(), timeout=10, write_path=child)
+        self.assertEqual(dict(line.split("=", 1) for line in completed.stdout.splitlines() if "=" in line)["TMPDIR"], str(child))
+
+    def test_private_scratch_is_accepted_when_the_repository_is_under_temp(self):
+        self.assertIn(Path(tempfile.gettempdir()).resolve(), self.repo.parents)
+        child = Path(tempfile.mkdtemp(prefix="cqa-runner-")).resolve()
+        self.addCleanup(__import__("shutil").rmtree, child, True)
+        self.assertTrue(security._writable_scratch(child, self.repo))
+        nested = Path(tempfile.mkdtemp(prefix="cqa-runner-", dir=self.repo)).resolve()
+        self.assertFalse(security._writable_scratch(nested, self.repo))
+
+    def test_shared_or_foreign_scratch_is_refused_before_launch(self):
+        self._accept_fake_sandbox()
+
+        def refused(write_path):
+            log = self._log()
+            calls = []
+            with mock.patch("cqa.security._run_process", side_effect=lambda *args, **kwargs: calls.append(args)):
+                with self.assertRaises(PermissionError):
+                    run_contained(["/usr/bin/env"], self.repo, log, write_path=write_path)
+            self.assertEqual(calls, [])
+            self.assertFalse(any(item["outcome"] == "started" for item in log.commands))
+            self.assertTrue(any(item["operation"] == "containment" and "write path" in item["detail"] for item in log.denied))
+            self.assertEqual(_write_roots(_profile([str(self.repo)], str(write_path), self.repo)), [])
+            self.assertEqual(_write_roots(security._contained_command(["/usr/bin/true"], self.repo, str(write_path))[2]), [])
+
+        for mode in (0o755, 0o777, 0o750, 0o701):
+            with self.subTest(mode=oct(mode)):
+                shared = Path(tempfile.mkdtemp(prefix="cqa-shared-")).resolve()
+                self.addCleanup(__import__("shutil").rmtree, shared, True)
+                shared.chmod(mode)
+                self.assertFalse(security._writable_scratch(shared, self.repo))
+                refused(shared)
+        private = Path(tempfile.mkdtemp(prefix="cqa-private-")).resolve()
+        self.addCleanup(__import__("shutil").rmtree, private, True)
+        self.assertEqual(private.stat().st_mode & 0o777, 0o700)
+        self.assertTrue(security._writable_scratch(private, self.repo))
+        with self.subTest(owner="another uid"):
+            with mock.patch("cqa.security.os.geteuid", return_value=os.geteuid() + 1):
+                self.assertFalse(security._writable_scratch(private, self.repo))
+                refused(private)
+        self.assertEqual(_write_roots(_profile([str(self.repo)], str(private), self.repo)), [private])
+
+    def test_trace_coverage_does_not_follow_scratch_symlinks(self):
+        secret = "cqa-cover-sentinel-" + os.urandom(8).hex()
+        sentinel = self._outside_sentinel("cover-sentinel.txt", secret + "\n")
+        identity = (sentinel.stat().st_dev, sentinel.stat().st_ino)
+        opened = []
+        real_os_open = os.open
+        real_io_open = io.open
+
+        def record(fd):
+            try:
+                info = os.fstat(fd)
+            except OSError:
+                return
+            if (info.st_dev, info.st_ino) == identity:
+                opened.append((info.st_dev, info.st_ino))
+
+        def spy_os_open(path, flags, *args, **kwargs):
+            fd = real_os_open(path, flags, *args, **kwargs)
+            record(fd)
+            return fd
+
+        def spy_io_open(file, *args, **kwargs):
+            # Path.read_text calls io.open, which does not go through Python's os.open.
+            handle = real_io_open(file, *args, **kwargs)
+            try:
+                record(handle.fileno())
+            except (OSError, AttributeError, ValueError):
+                pass
+            return handle
+
+        probe = spy_os_open(sentinel, os.O_RDONLY | os.O_CLOEXEC)
+        self.assertEqual(opened, [identity])
+        os.close(probe)
+        opened.clear()
+
+        created = {}
+
+        def fake_run(*args, **kwargs):
+            link = Path(kwargs["write_path"]) / "x.cover"
+            link.symlink_to(sentinel)
+            created["symlink"] = link.is_symlink()
+            created["target"] = os.readlink(link)
+            return subprocess.CompletedProcess(args[0], 0, "", "")
+
+        ctx = SimpleNamespace(root=self.repo, analyses=[], texts={}, log=self._log())
+        started = time.monotonic()
+        with mock.patch("os.open", side_effect=spy_os_open), mock.patch("io.open", side_effect=spy_io_open), mock.patch(
+            "cqa.checks.run_contained", side_effect=fake_run
+        ):
+            value, evidence, error = checks._trace_line_coverage(ctx)
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 5)
+        self.assertTrue(created["symlink"])
+        self.assertEqual(created["target"], str(sentinel))
+        self.assertEqual(opened, [])
+        self.assertIsNone(value)
+        self.assertEqual(evidence, [])
+        self.assertEqual(error, "unittest discover produced no production coverage")
+        rendered = json.dumps({"value": value, "evidence": evidence, "reason": error})
+        self.assertNotIn(secret, rendered)
+        self.assertEqual(sentinel.read_text(encoding="utf-8"), secret + "\n")
+
+    def test_read_contained_output_reads_regular_scratch_and_refuses_oversize(self):
+        scratch = Path(tempfile.mkdtemp(prefix="cqa-cover-")).resolve()
+        self.addCleanup(__import__("shutil").rmtree, scratch, True)
+        text = "     1: def add(left, right):\n>>>>>>     return left + right\n"
+        regular = scratch / "app.cover"
+        regular.write_text(text, encoding="utf-8")
+        self.assertEqual(security.read_contained_output(regular), text)
+        self.assertLessEqual(regular.stat().st_size, security._OUTPUT_LIMIT)
+
+        limit = 64
+        exact = scratch / "exact.cover"
+        exact.write_bytes(b"a" * limit)
+        self.assertEqual(security.read_contained_output(exact, limit=limit), "a" * limit)
+        sentinel = self._outside_sentinel("not-a-cover.txt", "outside-sentinel\n")
+        link = scratch / "linked.cover"
+        link.symlink_to(sentinel)
+        fifo = scratch / "fifo.cover"
+        os.mkfifo(fifo)
+        directory = scratch / "dir.cover"
+        directory.mkdir()
+        started = time.monotonic()
+        for path in (link, fifo, directory):
+            self.assertIsNone(security.read_contained_output(path, limit=limit))
+        self.assertLess(time.monotonic() - started, 2)
+
+        huge = scratch / "huge.cover"
+        payload = b"z" * 20000
+        huge.write_bytes(payload)
+        reads = []
+        real_read = os.read
+
+        def spy_read(fd, size):
+            reads.append(size)
+            return real_read(fd, size)
+
+        with mock.patch("cqa.security.os.read", side_effect=spy_read):
+            self.assertIsNone(security.read_contained_output(huge, limit=limit))
+        self.assertLessEqual(sum(reads), limit + 1)
+        self.assertLess(sum(reads), len(payload))
+
+    def test_git_read_bounds_output_and_logs_no_child_output(self):
+        sentinel = "cqa-git-sentinel-" + os.urandom(6).hex()
+        fake_dir = self.tmp / "git-bin"
+        fake_dir.mkdir()
+        fake = fake_dir / "git"
+        _write_executable(fake, f"#!/bin/sh\nwhile :; do echo {sentinel}; echo {sentinel} >&2; done\n")
+        self._patch("cqa.security._trusted_git", return_value=fake)
+        (self.repo / ".git").mkdir()
+        log = self._log()
+        started = time.monotonic()
+        self.assertIsNone(security.git_read(self.repo, ["log"], log, timeout=10, limit=4096))
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertNotIn(sentinel, json.dumps({"denied": log.denied, "commands": log.commands}))
+        self.assertTrue(any("output exceeded" in item["detail"] for item in log.commands))
+        _write_executable(fake_dir / "git", f"#!/bin/sh\necho {sentinel}\necho {sentinel} >&2\nsleep 30\n")
+        log = self._log()
+        self.assertIsNone(security.git_read(self.repo, ["log"], log, timeout=1, limit=4096))
+        self.assertNotIn(sentinel, json.dumps({"denied": log.denied, "commands": log.commands}))
+        self.assertTrue(any(item["outcome"] == "timeout" for item in log.commands))
+        _write_executable(fake_dir / "git", "#!/bin/sh\nprintf 'abc\\n'\n")
+        log = self._log()
+        completed = security.git_read(self.repo, ["rev-parse", "HEAD"], log)
+        self.assertEqual(completed.stdout, b"abc\n")
+        self.assertEqual(completed.args[0], str(fake))
+        self.assertTrue(all(item["command"][0] == str(fake) for item in log.commands))
+
+    def test_git_read_never_runs_path_or_repository_git(self):
+        marker = self.tmp / "git-ran"
+        spoof = f"#!/bin/sh\n: > {marker}\nprintf 'spoofed\\n'\n"
+        path_bin = self.tmp / "path-bin"
+        path_bin.mkdir()
+        _write_executable(path_bin / "git", spoof)
+        _write_executable(self.repo / "git", spoof)
+        repo_bin = self.repo / "bin"
+        repo_bin.mkdir()
+        host = next((Path(raw) for raw in security._GIT_CANDIDATES if Path(raw).is_file()), Path("/usr/bin/true"))
+        (repo_bin / "git").symlink_to(host.resolve())
+        (self.repo / ".git").mkdir()
+        os.environ["PATH"] = os.pathsep.join([str(path_bin), str(repo_bin), ".", os.environ.get("PATH", "")])
+        self._chdir(self.repo)
+        forbidden = {"git", str(path_bin / "git"), str(self.repo / "git"), str(repo_bin / "git"), "./git"}
+        trusted = security._trusted_git(self.repo)
+        real = security._run_process
+        calls = []
+
+        def record(command, *args, **kwargs):
+            calls.append(list(command))
+            return real(command, *args, **kwargs)
+
+        log = self._log()
+        with mock.patch("cqa.security._run_process", side_effect=record):
+            for args in (["rev-parse", "HEAD"], ["log", "--numstat", "--format=%H"]):
+                completed = security.git_read(self.repo, args, log)
+                self.assertTrue(completed is None or b"spoofed" not in completed.stdout)
+        self.assertFalse(marker.exists())
+        launched = [item["command"] for item in log.commands if item["outcome"] != "skipped"]
+        for command in calls + launched:
+            self.assertNotIn(command[0], forbidden)
+            self.assertFalse(security._lexically_inside(self.repo, command[0]), command[0])
+        if trusted is None:
+            self.assertEqual(calls, [])
+            self.assertTrue(all(item["outcome"] == "skipped" for item in log.commands))
+        else:
+            self.assertTrue(calls)
+            self.assertFalse(security._inside(self.repo, trusted))
+            for command in calls + launched:
+                self.assertEqual(command[0], str(trusted))
+
+    def test_git_read_ignores_repository_diff_and_textconv_helpers(self):
+        git = security._trusted_git(self.repo)
+        if git is None:
+            self.skipTest("no trusted git is installed at a fixed platform path")
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+
+        def run_git(*args):
+            subprocess.run([str(git), *args], cwd=self.repo, env=env, check=True, capture_output=True)
+
+        run_git("init", "-q")
+        run_git("config", "user.email", "cqa@example.invalid")
+        run_git("config", "user.name", "cqa")
+        (self.repo / ".gitattributes").write_text("*.txt diff=evil\n", encoding="utf-8")
+        (self.repo / "a.txt").write_text("one\n", encoding="utf-8")
+        run_git("add", ".")
+        run_git("commit", "-q", "-m", "one")
+        (self.repo / "a.txt").write_text("two\n", encoding="utf-8")
+        run_git("commit", "-q", "-am", "two")
+        external = self.tmp / "external-diff-ran"
+        textconv = self.tmp / "textconv-ran"
+        external_script = self.tmp / "external-diff"
+        textconv_script = self.tmp / "textconv"
+        command_marker = self.tmp / "diff-command-ran"
+        command_script = self.tmp / "diff-command"
+        _write_executable(external_script, f"#!/bin/sh\n: > {external}\n")
+        _write_executable(textconv_script, f'#!/bin/sh\n: > {textconv}\ncat "$1"\n')
+        _write_executable(command_script, f"#!/bin/sh\n: > {command_marker}\n")
+        run_git("config", "diff.external", str(external_script))
+        run_git("config", "diff.evil.textconv", str(textconv_script))
+        run_git("config", "diff.evil.command", str(command_script))
+        (self.repo / "a.txt").write_text("three\n", encoding="utf-8")
+        os.environ["GIT_EXTERNAL_DIFF"] = str(external_script)
+        log = self._log()
+        calls = {
+            "log": ["log", "--numstat", "--format=%H"],
+            "diff": ["diff", "--name-only"],
+            "show": ["show", "HEAD"],
+            "patch": ["diff", "HEAD~1", "HEAD"],
+        }
+        results = {name: security.git_read(self.repo, args, log) for name, args in calls.items()}
+        self.assertFalse(external.exists())
+        self.assertFalse(textconv.exists())
+        self.assertFalse(command_marker.exists())
+        for name, completed in results.items():
+            self.assertIsNotNone(completed, name)
+        self.assertIn(b"a.txt", results["diff"].stdout)
+        self.assertIn(b"1\t1\ta.txt", results["log"].stdout)
+        log_command = next(item["command"] for item in log.commands if "log" in item["command"])
+        for flag in ("--no-pager", "--no-ext-diff", "--no-textconv"):
+            self.assertIn(flag, log_command)
+        self.assertLess(log_command.index("--no-pager"), log_command.index("log"))
+        self.assertEqual(log_command[log_command.index("log") + 1 : log_command.index("log") + 3], ["--no-ext-diff", "--no-textconv"])
+        for key in ("diff.external=", "diff.evil.command=", "core.sshCommand=", "core.pager=", "credential.helper="):
+            self.assertIn(key, log_command)
+        rev_log = self._log()
+        self.assertIsNotNone(security.git_read(self.repo, ["rev-parse", "HEAD"], rev_log))
+        rev_command = next(item["command"] for item in rev_log.commands if "rev-parse" in item["command"])
+        self.assertIn("--no-pager", rev_command)
+        self.assertNotIn("--no-ext-diff", rev_command)
+        self.assertNotIn("--no-textconv", rev_command)
+
+    def _git_repository(self):
+        git = security._trusted_git(self.repo)
+        if git is None:
+            self.skipTest("no trusted git is installed at a fixed platform path")
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+
+        def run_git(*args):
+            subprocess.run([str(git), *args], cwd=self.repo, env=env, check=True, capture_output=True)
+
+        run_git("init", "-q")
+        run_git("config", "user.email", "cqa@example.invalid")
+        run_git("config", "user.name", "cqa")
+        (self.repo / ".gitattributes").write_text("a.txt filter=evil\nb.txt filter=other\n", encoding="utf-8")
+        (self.repo / "a.txt").write_text("one\n", encoding="utf-8")
+        (self.repo / "b.txt").write_text("one\n", encoding="utf-8")
+        run_git("add", ".")
+        run_git("commit", "-q", "-m", "one")
+        (self.repo / "a.txt").write_text("two\n", encoding="utf-8")
+        (self.repo / "b.txt").write_text("two\n", encoding="utf-8")
+        run_git("commit", "-q", "-am", "two")
+        return run_git
+
+    def _marker_script(self, name):
+        marker = self.tmp / f"{name}-ran"
+        script = self.tmp / name
+        _write_executable(script, f"#!/bin/sh\n: > {marker}\ncat\n")
+        return script, marker
+
+    def _dirty(self):
+        (self.repo / "a.txt").write_text("three, longer\n", encoding="utf-8")
+        (self.repo / "b.txt").write_text("three, longer\n", encoding="utf-8")
+
+    def test_git_read_blanks_repository_filter_drivers(self):
+        run_git = self._git_repository()
+        clean, clean_marker = self._marker_script("evil-clean")
+        process, process_marker = self._marker_script("evil-process")
+        other, other_marker = self._marker_script("other-clean")
+        run_git("config", "filter.evil.clean", str(clean))
+        run_git("config", "filter.evil.process", str(process))
+        run_git("config", "filter.evil.required", "true")
+        run_git("config", "filter.other.clean", str(other))
+        self._dirty()
+        log = self._log()
+        diff = security.git_read(self.repo, ["diff", "--name-only"], log)
+        history = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log)
+        for marker in (clean_marker, process_marker, other_marker):
+            self.assertFalse(marker.exists(), marker.name)
+        self.assertIsNotNone(diff)
+        self.assertEqual(sorted(diff.stdout.decode().split()), ["a.txt", "b.txt"])
+        self.assertIsNotNone(history)
+        command = next(item["command"] for item in log.commands if "log" in item["command"])
+        for name in ("evil", "other"):
+            for key in ("clean=", "smudge=", "process="):
+                self.assertIn(f"filter.{name}.{key}", command)
+
+    def test_git_read_does_not_run_gpg_program_for_signed_history(self):
+        run_git = self._git_repository()
+        script, marker = self._marker_script("fake-gpg")
+        run_git("config", "log.showSignature", "true")
+        run_git("config", "gpg.format", "openpgp")
+        run_git("config", "gpg.program", str(script))
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+        git = security._trusted_git(self.repo)
+        tree = subprocess.run([str(git), "write-tree"], cwd=self.repo, env=env, check=True, capture_output=True, text=True).stdout.strip()
+        signature = "-----BEGIN PGP SIGNATURE-----\n\nnot-a-real-signature\n-----END PGP SIGNATURE-----"
+        body = (
+            f"tree {tree}\n"
+            "author cqa <cqa@example.invalid> 1000000000 +0000\n"
+            "committer cqa <cqa@example.invalid> 1000000000 +0000\n"
+            f"gpgsig {signature.replace(chr(10), chr(10) + ' ')}\n"
+            "\n"
+            "signed\n"
+        )
+        commit = subprocess.run(
+            [str(git), "hash-object", "-t", "commit", "-w", "--stdin"],
+            cwd=self.repo,
+            env=env,
+            input=body.encode(),
+            check=True,
+            capture_output=True,
+        ).stdout.decode().strip()
+        subprocess.run([str(git), "update-ref", "HEAD", commit], cwd=self.repo, env=env, check=True, capture_output=True)
+        marker.unlink(missing_ok=True)
+        log = self._log()
+        completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log)
+        self.assertFalse(marker.exists())
+        self.assertIsNotNone(completed)
+        self.assertIn(commit.encode(), completed.stdout)
+        command = next(item["command"] for item in log.commands if "log" in item["command"])
+        self.assertIn("log.showSignature=false", command)
+        self.assertIn("gpg.program=", command)
+
+    def test_git_read_refuses_config_includes_it_cannot_confirm_inside_the_repository(self):
+        run_git = self._git_repository()
+        script, marker = self._marker_script("included-clean")
+        outside = self.tmp / "outside.gitconfig"
+        outside.write_text(f"[filter \"evil\"]\n\tclean = {script}\n", encoding="utf-8")
+        inside = self.repo / "inside.gitconfig"
+        inside.write_text(f"[filter \"evil\"]\n\tclean = {script}\n", encoding="utf-8")
+        (self.repo / "link.gitconfig").symlink_to(outside)
+        self._dirty()
+        config = self.repo / ".git" / "config"
+        original = config.read_text(encoding="utf-8")
+        refused = {
+            "absolute include": f"[include]\n\tpath = {outside}\n",
+            "relative escape": "[include]\n\tpath = ../../outside.gitconfig\n",
+            "home include": "[includeIf \"gitdir:/\"]\n\tpath = ~/outside.gitconfig\n",
+            "symlink out": "[include]\n\tpath = ../link.gitconfig\n",
+            "missing include": "[include]\n\tpath = ../missing.gitconfig\n",
+            "unsupported driver name": '[filter "bad name"]\n\tclean = x\n',
+            "unparsable": '[filter "evil"\n',
+        }
+        for name, extra in refused.items():
+            with self.subTest(config=name):
+                config.write_text(original + extra, encoding="utf-8")
+                log = self._log()
+                with mock.patch("cqa.security._run_process") as runner:
+                    self.assertIsNone(security.git_read(self.repo, ["diff", "--name-only"], log))
+                    runner.assert_not_called()
+                self.assertEqual([item["outcome"] for item in log.commands], ["skipped"])
+                if "include" in name or name == "symlink out":
+                    self.assertIn("outside the audit root", log.commands[0]["detail"])
+        self.assertFalse(marker.exists())
+        config.write_text(original + "[include]\n\tpath = ../inside.gitconfig\n", encoding="utf-8")
+        log = self._log()
+        diff = security.git_read(self.repo, ["diff", "--name-only"], log)
+        self.assertIsNotNone(diff)
+        self.assertFalse(marker.exists())
+        self.assertIn("filter.evil.clean=", next(item["command"] for item in log.commands if "diff" in item["command"]))
+        config.write_text(original, encoding="utf-8")
+        (self.repo / ".git" / "commondir").write_text(str(self.tmp) + "\n", encoding="utf-8")
+        log = self._log()
+        self.assertIsNone(security.git_read(self.repo, ["rev-parse", "HEAD"], log))
+        self.assertEqual([item["outcome"] for item in log.commands], ["skipped"])
+
+    def test_git_read_never_climbs_to_a_parent_repository(self):
+        run_git = self._git_repository()
+        script, marker = self._marker_script("parent-clean")
+        run_git("config", "filter.evil.clean", str(script))
+        self._dirty()
+        child = self.repo / "child"
+        (child / ".git").mkdir(parents=True)
+        (child / "c.txt").write_text("child\n", encoding="utf-8")
+        log = self._log()
+        self.assertIsNone(security.git_read(child, ["diff", "--name-only"], log))
+        self.assertIsNone(security.git_read(child, ["rev-parse", "--show-toplevel"], log))
+        self.assertFalse(marker.exists())
+
+    def test_git_read_pins_the_work_tree(self):
+        resolved = str(self.repo.resolve())
+        (self.repo / ".git").mkdir()
+        fake = self.tmp / "fake-git"
+        _write_executable(fake, "#!/bin/sh\nprintf 'should-not-run\\n'\n")
+        log = self._log()
+        with mock.patch("cqa.security._trusted_git", return_value=fake.resolve()), mock.patch(
+            "cqa.security._run_process", return_value=subprocess.CompletedProcess(["git"], 0, b"", b"")
+        ) as runner:
+            security.git_read(self.repo, ["diff", "--name-only"], log)
+        command = list(runner.call_args.args[0])
+        self.assertLess(command.index("--work-tree"), command.index("diff"))
+        self.assertEqual(command[command.index("--work-tree") + 1], resolved)
+        self.assertIn(f"core.worktree={resolved}", command)
+        runner.assert_called_once()
+
+        trusted = security._trusted_git(self.repo)
+        if trusted is None:
+            skipped = self._log()
+            with mock.patch("cqa.security._run_process") as real_runner:
+                self.assertIsNone(security.git_read(self.repo, ["diff", "--name-only"], skipped))
+                real_runner.assert_not_called()
+            self.assertEqual([item["outcome"] for item in skipped.commands], ["skipped"])
+            return
+
+        import shutil
+
+        shutil.rmtree(self.repo / ".git")
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+
+        def run_git(*args):
+            subprocess.run([str(trusted), *args], cwd=self.repo, env=env, check=True, capture_output=True)
+
+        run_git("init", "-q")
+        run_git("config", "user.email", "cqa@example.invalid")
+        run_git("config", "user.name", "cqa")
+        sentinel = "cqa-worktree-sentinel.txt"
+        (self.repo / "readme.txt").write_text("inside\n", encoding="utf-8")
+        (self.repo / sentinel).write_text("clean\n", encoding="utf-8")
+        run_git("add", ".")
+        run_git("commit", "-q", "-m", "one")
+        outside = self.tmp / "outside-worktree"
+        outside.mkdir()
+        (outside / "readme.txt").write_text("inside\n", encoding="utf-8")
+        (outside / sentinel).write_text("outside-secret\n", encoding="utf-8")
+        run_git("config", "core.worktree", str(outside.resolve()))
+        log = self._log()
+        completed = security.git_read(self.repo, ["diff", "--name-only"], log)
+        self.assertIsNotNone(completed)
+        stdout = completed.stdout.decode()
+        self.assertNotIn(sentinel, stdout)
+        self.assertNotIn("outside-secret", stdout)
+        recorded = next(item["command"] for item in log.commands if "diff" in item["command"])
+        self.assertEqual(recorded[recorded.index("--work-tree") + 1], resolved)
+        self.assertIn(f"core.worktree={resolved}", recorded)
+        self.assertNotIn(str(outside.resolve()), recorded)
+
+    def test_git_read_does_not_open_an_outside_mailmap(self):
+        run_git = self._git_repository()
+        fifo = self.tmp / "mailmap.fifo"
+        os.mkfifo(fifo)
+        run_git("config", "log.mailmap", "true")
+        run_git("config", "mailmap.file", str(fifo))
+        log = self._log()
+        started = time.monotonic()
+        completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log, timeout=8)
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.returncode, 0)
+        commands = [item["command"] for item in log.commands if "log" in item["command"]]
+        self.assertTrue(commands)
+        for command in commands:
+            self.assertIn("log.mailmap=false", command)
+            self.assertIn("mailmap.file=", command)
+            self.assertIn("mailmap.blob=", command)
+
+    def test_git_read_does_not_open_an_outside_attributes_file(self):
+        run_git = self._git_repository()
+        fifo = self.tmp / "attributes.fifo"
+        os.mkfifo(fifo)
+        run_git("config", "core.attributesFile", str(fifo))
+        log = self._log()
+        started = time.monotonic()
+        completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log, timeout=8)
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.returncode, 0)
+        commands = [item["command"] for item in log.commands if "log" in item["command"]]
+        self.assertTrue(commands)
+        for command in commands:
+            self.assertIn("core.attributesFile=/dev/null", command)
+            self.assertNotIn("core.attributesFile=", command)
+            self.assertNotIn("-O", command)
+            self.assertNotIn("-O/dev/null", command)
+
+    def test_git_read_does_not_open_an_outside_diff_order_file(self):
+        run_git = self._git_repository()
+        fifo = self.tmp / "order.fifo"
+        os.mkfifo(fifo)
+        run_git("config", "diff.orderFile", str(fifo))
+        log = self._log()
+        started = time.monotonic()
+        completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log, timeout=8)
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.returncode, 0)
+        commands = [item["command"] for item in log.commands if "log" in item["command"]]
+        self.assertTrue(commands)
+        for command in commands:
+            self.assertIn("diff.orderFile=/dev/null", command)
+            self.assertNotIn("diff.orderFile=", command)
+            self.assertNotIn("-O", command)
+            self.assertNotIn("-O/dev/null", command)
+
+    def test_git_read_does_not_open_the_default_home_attributes_file(self):
+        self._git_repository()
+        fifo = self.tmp / "home-attributes.fifo"
+        os.mkfifo(fifo)
+        home = self.tmp / "home"
+        attributes = home / ".config" / "git" / "attributes"
+        attributes.parent.mkdir(parents=True)
+        attributes.symlink_to(fifo)
+        saved_home = os.environ.get("HOME")
+        saved_global = os.environ.pop("GIT_CONFIG_GLOBAL", None)
+        os.environ["HOME"] = str(home)
+        try:
+            log = self._log()
+            started = time.monotonic()
+            completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log, timeout=8)
+            self.assertLess(time.monotonic() - started, 8)
+            self.assertIsNotNone(completed)
+            self.assertEqual(completed.returncode, 0)
+            commands = [item["command"] for item in log.commands if "log" in item["command"]]
+            self.assertTrue(commands)
+            for command in commands:
+                self.assertIn("core.attributesFile=/dev/null", command)
+        finally:
+            if saved_home is None:
+                os.environ.pop("HOME", None)
+            else:
+                os.environ["HOME"] = saved_home
+            if saved_global is None:
+                os.environ.pop("GIT_CONFIG_GLOBAL", None)
+            else:
+                os.environ["GIT_CONFIG_GLOBAL"] = saved_global
+
+    def _assert_git_attribute_skipped(self, detail):
+        log = self._log()
+        started = time.monotonic()
+        with mock.patch("cqa.security._run_process") as runner:
+            completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log, timeout=8)
+            runner.assert_not_called()
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertIsNone(completed)
+        self.assertEqual([item["outcome"] for item in log.commands], ["skipped"])
+        self.assertNotIn("started", [item["outcome"] for item in log.commands])
+        self.assertEqual(log.commands[0]["detail"], detail)
+
+    def test_git_read_refuses_a_symlink_info_attributes_file(self):
+        self._git_repository()
+        fifo = self.tmp / "info-attributes.fifo"
+        os.mkfifo(fifo)
+        info = self.repo / ".git" / "info"
+        info.mkdir(exist_ok=True)
+        attributes = info / "attributes"
+        if attributes.exists() or attributes.is_symlink():
+            attributes.unlink()
+        attributes.symlink_to(fifo)
+        self._assert_git_attribute_skipped(".git/info/attributes is a symlink; git was not run")
+
+    def test_git_read_refuses_a_symlink_gitattributes_file(self):
+        self._git_repository()
+        fifo = self.tmp / "gitattributes.fifo"
+        os.mkfifo(fifo)
+        attributes = self.repo / ".gitattributes"
+        attributes.unlink()
+        attributes.symlink_to(fifo)
+        self._assert_git_attribute_skipped(".gitattributes is a symlink; git was not run")
+
+    def test_git_read_refuses_a_non_regular_attributes_file(self):
+        self._git_repository()
+        info = self.repo / ".git" / "info"
+        info.mkdir(exist_ok=True)
+        attributes = info / "attributes"
+        if attributes.exists() or attributes.is_symlink():
+            attributes.unlink()
+        os.mkfifo(attributes)
+        self._assert_git_attribute_skipped(
+            ".git/info/attributes is not a regular file inside the audit root; git was not run"
+        )
+        attributes.unlink()
+        attributes.mkdir()
+        self._assert_git_attribute_skipped(
+            ".git/info/attributes is not a regular file inside the audit root; git was not run"
+        )
+
+    def test_git_read_runs_when_attribute_files_are_missing_or_regular(self):
+        self._git_repository()
+        info_attributes = self.repo / ".git" / "info" / "attributes"
+        info_attributes.parent.mkdir(exist_ok=True)
+        info_attributes.write_text("* -text\n", encoding="utf-8")
+        log = self._log()
+        completed = security.git_read(self.repo, ["rev-parse", "HEAD"], log)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(completed.stdout.strip())
+        self.assertIn("exit 0", [item["outcome"] for item in log.commands])
+
+        info_attributes.unlink()
+        (self.repo / ".gitattributes").unlink()
+        self.assertFalse(os.path.lexists(info_attributes))
+        self.assertFalse(os.path.lexists(self.repo / ".gitattributes"))
+        log = self._log()
+        completed = security.git_read(self.repo, ["rev-parse", "HEAD"], log)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(completed.stdout.strip())
+        self.assertIn("exit 0", [item["outcome"] for item in log.commands])
+
+        nested = self.repo / "nested"
+        nested.mkdir()
+        (nested / ".gitattributes").write_text("* text\n", encoding="utf-8")
+        (self.repo / "alias").symlink_to(nested, target_is_directory=True)
+        object_attributes = self.repo / ".git" / "objects" / ".gitattributes"
+        object_attributes.parent.mkdir(exist_ok=True)
+        object_attributes.symlink_to(self.tmp / "object-attributes.fifo")
+        log = self._log()
+        started = time.monotonic()
+        completed = security.git_read(self.repo, ["rev-parse", "HEAD"], log, timeout=8)
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.returncode, 0)
+        self.assertTrue(completed.stdout.strip())
+        self.assertIn("exit 0", [item["outcome"] for item in log.commands])
+
+    def _assert_git_refused_before_launch(self, detail):
+        log = self._log()
+        started = time.monotonic()
+        with mock.patch("cqa.security._trusted_git", return_value=Path("/usr/bin/git")), mock.patch(
+            "cqa.security._run_process"
+        ) as runner:
+            completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log, timeout=8)
+            runner.assert_not_called()
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertIsNone(completed)
+        self.assertEqual([item["outcome"] for item in log.commands], ["skipped"])
+        self.assertNotIn("started", [item["outcome"] for item in log.commands])
+        self.assertEqual(log.commands[0]["detail"], detail)
+
+    def test_git_read_refuses_a_nested_gitattributes_symlink(self):
+        (self.repo / ".git").mkdir()
+        fifo = self.tmp / "nested-attributes.fifo"
+        os.mkfifo(fifo)
+        attributes = self.repo / "subdir" / ".gitattributes"
+        attributes.parent.mkdir()
+        attributes.symlink_to(fifo)
+        self._assert_git_refused_before_launch("subdir/.gitattributes is a symlink; git was not run")
+
+    def test_git_read_refuses_a_nested_non_regular_gitattributes(self):
+        (self.repo / ".git").mkdir()
+        attributes = self.repo / "nested" / ".gitattributes"
+        attributes.parent.mkdir()
+        os.mkfifo(attributes)
+        detail = "nested/.gitattributes is not a regular file inside the audit root; git was not run"
+        self._assert_git_refused_before_launch(detail)
+        attributes.unlink()
+        attributes.mkdir()
+        self._assert_git_refused_before_launch(detail)
+
+    def test_git_read_refuses_a_directory_symlink_outside_the_audit_root(self):
+        (self.repo / ".git").mkdir()
+        outside = self.tmp / "outside-attrs"
+        outside.mkdir()
+        fifo = self.tmp / "outside-attributes.fifo"
+        os.mkfifo(fifo)
+        (outside / ".gitattributes").symlink_to(fifo)
+        (self.repo / "escape").symlink_to(outside, target_is_directory=True)
+        self._assert_git_refused_before_launch(
+            "escape is a directory symlink outside the audit root; git was not run"
+        )
+
+    def test_git_read_does_not_open_trace2_targets(self):
+        run_git = self._git_repository()
+        keys = ("trace2.eventTarget", "trace2.normalTarget", "trace2.perfTarget")
+        fifo = self.tmp / "trace2.fifo"
+        os.mkfifo(fifo)
+        for key in keys:
+            run_git("config", key, str(fifo))
+        log = self._log()
+        started = time.monotonic()
+        completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log, timeout=8)
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.returncode, 0)
+        command = next(item["command"] for item in log.commands if "log" in item["command"])
+        for key in keys:
+            self.assertIn(f"{key}=", command)
+
+        sentinel = self.tmp / "trace2-sentinel.txt"
+        payload = b"trace2-sentinel-bytes\n"
+        sentinel.write_bytes(payload)
+        for key in keys:
+            run_git("config", key, str(sentinel))
+        log = self._log()
+        started = time.monotonic()
+        completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log, timeout=8)
+        self.assertLess(time.monotonic() - started, 8)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(sentinel.read_bytes(), payload)
+        command = next(item["command"] for item in log.commands if "log" in item["command"])
+        for key in keys:
+            self.assertIn(f"{key}=", command)
+            self.assertNotIn(str(sentinel), command)
+
+    def test_git_read_does_not_inherit_ld_preload(self):
+        self._git_repository()
+        preload = "/no/such/cqa-preload.so"
+        os.environ["LD_PRELOAD"] = preload
+        try:
+            log = self._log()
+            completed = security.git_read(self.repo, ["rev-parse", "HEAD"], log)
+        finally:
+            os.environ.pop("LD_PRELOAD", None)
+        self.assertIsNotNone(completed)
+        self.assertEqual(completed.returncode, 0)
+        self.assertNotIn(preload.encode(), completed.stderr or b"")
+        self.assertNotIn(b"LD_PRELOAD", completed.stderr or b"")
+
+    def test_git_read_does_not_inherit_git_config_environment(self):
+        self._git_repository()
+        fifo = self.tmp / "env-mailmap.fifo"
+        os.mkfifo(fifo)
+        keys = ("GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0")
+        saved = {key: os.environ.get(key) for key in keys}
+        os.environ["GIT_CONFIG_COUNT"] = "1"
+        os.environ["GIT_CONFIG_KEY_0"] = "mailmap.file"
+        os.environ["GIT_CONFIG_VALUE_0"] = str(fifo)
+        try:
+            log = self._log()
+            started = time.monotonic()
+            completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log, timeout=8)
+            self.assertLess(time.monotonic() - started, 8)
+            self.assertIsNotNone(completed)
+            self.assertEqual(completed.returncode, 0)
+        finally:
+            for key, value in saved.items():
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+
+    def _sentinel_yaml(self):
+        sentinel = self.tmp / "sentinel.yaml"
+        sentinel.write_text(
+            'advisories:\n  requests: "2.31.0"\npackages:\n  requests: "9.9.9"\nsymbols: [sentinel_symbol]\nlatency_ms: 5\n',
+            encoding="utf-8",
+        )
+        return sentinel
+
+    def test_repository_config_symlink_out_of_the_repository_is_a_configuration_error(self):
+        sentinel = self.tmp / "sentinel-config.yaml"
+        marker = "cqa-config-sentinel-" + os.urandom(6).hex()
+        sentinel.write_text(f"{marker}: [unclosed\n", encoding="utf-8")
+        outside_dir = self.tmp / "outside-dir"
+        outside_dir.mkdir()
+        (outside_dir / "quality-auditor.yaml").symlink_to(sentinel)
+        sub = self.repo / "sub"
+        sub.mkdir()
+        (sub / "quality-auditor.yaml").symlink_to(sentinel)
+        from cqa import audit as audit_module
+
+        real_load = audit_module.load
+        cases = {
+            "repository": ({}, self.repo / "quality-auditor.yaml"),
+            "directory": ({"directories": ["sub"]}, None),
+            "absolute directory": ({"directories": [str(outside_dir)]}, None),
+        }
+        for name, (kwargs, link) in cases.items():
+            with self.subTest(config=name):
+                if link is not None:
+                    link.symlink_to(sentinel)
+                out = self.tmp / f"out-{name.replace(' ', '-')}"
+                out.mkdir()
+                try:
+                    with mock.patch("cqa.audit.load", side_effect=real_load) as loader:
+                        with self.assertRaises(ValueError) as raised:
+                            auditor.audit(self.repo, skill_root=SKILL, output_dir=out, profile="fast", **kwargs)
+                finally:
+                    if link is not None:
+                        link.unlink()
+                self.assertTrue(str(raised.exception).startswith("configuration error:"))
+                self.assertNotIn(marker, str(raised.exception))
+                loaded = [Path(call.args[0]).resolve() for call in loader.call_args_list]
+                self.assertNotIn(sentinel.resolve(), loaded)
+
+    def test_optional_repository_inputs_never_read_outside_the_repository(self):
+        sentinel = self._sentinel_yaml()
+        inside = self.repo / "sec"
+        inside.mkdir()
+        (inside / "advisories.yaml").write_text('advisories:\n  flask: "1.0"\n', encoding="utf-8")
+        (inside / "perf.json").write_text('{"inside_ms": 1}\n', encoding="utf-8")
+        (self.repo / "bench-numbers.yaml").symlink_to(sentinel)
+        (self.repo / "advisories.yaml").symlink_to(sentinel)
+        (self.repo / "freshness-snapshot.yaml").symlink_to(sentinel)
+        (self.repo / "exports-baseline.yaml").symlink_to(sentinel)
+
+        def ctx(**config):
+            return SimpleNamespace(root=self.repo, config=config)
+
+        self.assertEqual(checks._local_advisories(ctx(advisory_file=str(sentinel))), (None, True))
+        self.assertEqual(checks._local_advisories(ctx(advisory_file="../sentinel.yaml")), (None, True))
+        self.assertEqual(checks._local_advisories(ctx()), (None, False))
+        entries, configured = checks._local_advisories(ctx(advisory_file="sec/advisories.yaml"))
+        self.assertTrue(configured)
+        self.assertTrue(entries)
+        self.assertNotIn("requests", json.dumps(entries, default=str))
+        self.assertIsNone(checks._freshness_snapshot(ctx(freshness_snapshot_file=str(sentinel))))
+        self.assertIsNone(checks._freshness_snapshot(ctx()))
+        self.assertIsNone(checks._baseline_exports(ctx(export_baseline_file="../sentinel.yaml")))
+        self.assertIsNone(checks._baseline_exports(ctx(export_baseline_file=str(sentinel))))
+        self.assertIsNone(checks._baseline_exports(ctx()))
+        self.assertEqual(checks._performance_numbers(ctx()), {"inside_ms": 1.0})
+
+    def test_trusted_git_needs_a_fixed_owner_writable_file_outside_the_repository(self):
+        good = self.tmp / "good" / "git"
+        good.parent.mkdir()
+        _write_executable(good, "#!/bin/sh\nexit 0\n")
+        good.chmod(0o755)
+        shared = self.tmp / "shared" / "git"
+        shared.parent.mkdir()
+        _write_executable(shared, "#!/bin/sh\nexit 0\n")
+        shared.chmod(0o775)
+        _write_executable(self.repo / "git", "#!/bin/sh\nexit 0\n")
+        (self.repo / "git").chmod(0o755)
+        into_repo = self.tmp / "into-repo-git"
+        into_repo.symlink_to(self.repo / "git")
+        directory = self.tmp / "dir" / "git"
+        directory.mkdir(parents=True)
+        to_good = self.tmp / "to-good-git"
+        to_good.symlink_to(good)
+        rejected = {
+            "missing": self.tmp / "missing" / "git",
+            "inside the repository": self.repo / "git",
+            "symlink into the repository": into_repo,
+            "group writable": shared,
+            "directory": directory,
+        }
+        for name, candidate in rejected.items():
+            with self.subTest(candidate=name):
+                with mock.patch("cqa.security._GIT_CANDIDATES", (str(candidate),)):
+                    self.assertIsNone(security._trusted_git(self.repo))
+        if os.geteuid() != 0:
+            with self.subTest(candidate="owned by another user"):
+                with mock.patch("cqa.security._GIT_CANDIDATES", (str(good),)), mock.patch("cqa.security.os.geteuid", return_value=os.geteuid() + 1):
+                    self.assertIsNone(security._trusted_git(self.repo))
+        with mock.patch("cqa.security._GIT_CANDIDATES", (*(str(path) for path in rejected.values()), str(to_good), str(good))):
+            self.assertEqual(security._trusted_git(self.repo), good.resolve())
+        with mock.patch("cqa.security._GIT_CANDIDATES", tuple(str(path) for path in rejected.values())):
+            log = self._log()
+            with mock.patch("cqa.security._run_process") as runner:
+                self.assertIsNone(security.git_read(self.repo, ["rev-parse", "HEAD"], log))
+                runner.assert_not_called()
+        self.assertEqual([item["outcome"] for item in log.commands], ["skipped"])
+
+    def test_install_analyzer_bounds_output_and_logs_no_child_output(self):
+        import hashlib
+
+        sentinel = "cqa-install-sentinel-" + os.urandom(6).hex()
+        artifact = self.tmp / "tool.whl"
+        artifact.write_bytes(b"not a real wheel")
+        digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        tool = {"id": "fake", "version_constraint": "*"}
+        chatty = [sys.executable, "-c", f"import sys\nwhile True:\n    sys.stderr.write({sentinel!r} * 100)\n"]
+        slow = [sys.executable, "-c", f"import sys, time\nsys.stderr.write({sentinel!r})\nsys.stderr.flush()\ntime.sleep(30)\n"]
+        failing = [sys.executable, "-c", f"import sys\nsys.stderr.write({sentinel!r})\nsys.exit(3)\n"]
+        real = security._run_process
+        for name, command, kwargs, exit_code in (("overflow", chatty, {"limit": 4096}, None), ("timeout", slow, {"timeout": 1}, None), ("failure", failing, {}, 3)):
+            with self.subTest(case=name):
+                log = ExecutionLog()
+
+                def run(_command, cwd, env, timeout, limit=security._OUTPUT_LIMIT, text=True, command=command):
+                    return real(command, cwd, env, timeout, limit=limit, text=text)
+
+                with mock.patch("cqa.security._run_process", side_effect=run):
+                    result = security.install_analyzer(tool, approve=True, artifact=artifact, expected_sha256=digest, log=log, execute=True, **kwargs)
+                self.assertEqual(result["status"], "failed")
+                self.assertFalse(result["installed"])
+                self.assertEqual(result["exit_code"], exit_code)
+                self.assertNotIn(sentinel, json.dumps({"result": result, "denied": log.denied, "commands": log.commands}, default=str))
+
+    def test_repository_symlink_to_a_host_binary_is_not_a_host_analyzer(self):
+        self._accept_fake_sandbox()
+        host = Path("/usr/bin/true").resolve()
+        (self.repo / "tool").symlink_to(host)
+        (self.repo / "bin").symlink_to(host.parent, target_is_directory=True)
+        for supplied in (str(self.repo / "tool"), "./tool", str(self.repo / "bin" / host.name), f"bin/{host.name}"):
+            with self.subTest(supplied=supplied):
+                log = self._log()
+                with mock.patch("cqa.security._run_process") as runner:
+                    with self.assertRaises(PermissionError):
+                        run_tool([supplied], self.repo, log)
+                    runner.assert_not_called()
+                self.assertTrue(any(item["operation"] == "external-tool" for item in log.denied))
+
+    def test_relative_path_outside_the_audit_root_is_not_a_host_analyzer(self):
+        fake = self._accept_fake_sandbox()
+        tool = self.tmp / "outside-tool"
+        _write_executable(tool, "#!/bin/sh\nexit 0\n")
+        relative = Path(os.path.relpath(tool, self.repo))
+        self.assertEqual(relative.as_posix(), "../outside-tool")
+        log = self._log()
+        with mock.patch("cqa.security._run_process", return_value=subprocess.CompletedProcess([], 0, "", "")) as runner:
+            with self.assertRaises(PermissionError):
+                run_tool([relative.as_posix()], self.repo, log)
+            runner.assert_not_called()
+        self.assertTrue(any(item["operation"] == "external-tool" for item in log.denied))
+
+        calls = []
+
+        def record(command, cwd, env, timeout):
+            calls.append(list(command))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch("cqa.security._run_process", side_effect=record):
+            run_tool([str(tool)], self.repo, self._log())
+        self.assertEqual(calls[0][0], str(fake))
+        self.assertEqual(calls[0][3], "--")
+        self.assertEqual(calls[0][4], str(tool.resolve()))
+
+    def test_relative_file_in_the_process_cwd_does_not_override_path(self):
+        self._accept_fake_sandbox()
+        elsewhere = self.tmp / "elsewhere"
+        elsewhere.mkdir()
+        marker = self.tmp / "cwd-tool-ran"
+        _write_executable(elsewhere / "true", f"#!/bin/sh\n: > {marker}\n")
+        self._chdir(elsewhere)
+        calls = []
+
+        def record(command, cwd, env, timeout):
+            calls.append(list(command))
+            return subprocess.CompletedProcess(command, 0, "", "")
+
+        with mock.patch("cqa.security._run_process", side_effect=record):
+            run_tool(["true"], self.repo, self._log())
+            with self.assertRaises(PermissionError):
+                run_tool(["./true"], self.repo, self._log())
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][4], str(Path(__import__("shutil").which("true")).resolve()))
+        self.assertNotEqual(calls[0][4], str(elsewhere / "true"))
+        self.assertFalse(marker.exists())
+
+    def test_discover_skips_symlinks_that_leave_the_repository(self):
+        sentinel = "cqa-outside-sentinel-" + os.urandom(6).hex()
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "secret.py").write_text(f'AWS_SECRET_ACCESS_KEY = "{sentinel}"\n', encoding="utf-8")
+        (self.repo / "inside.py").write_text("def main():\n    return 1\n", encoding="utf-8")
+        (self.repo / "alias.py").symlink_to(self.repo / "inside.py")
+        (self.repo / "link.py").symlink_to(outside / "secret.py")
+        files, _counts = auditor.discover(self.repo)
+        self.assertEqual(sorted(path.name for path in files), ["alias.py", "inside.py"])
+        out = self.tmp / "out"
+        out.mkdir()
+        report = auditor.audit(self.repo, skill_root=SKILL, output_dir=out, profile="security")
+        self.assertNotIn(sentinel, json.dumps(report, default=str))
+        for path in out.rglob("*"):
+            if path.is_file():
+                self.assertNotIn(sentinel, path.read_text(encoding="utf-8", errors="replace"), path)
+        self.assertFalse(any(item.get("file") == "link.py" for item in report["findings"]))
+
+    def _outside_sentinel(self, name, text):
+        outside = self.tmp / "outside"
+        outside.mkdir(exist_ok=True)
+        path = outside / name
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    def test_manifest_symlinks_that_leave_the_repository_are_not_read(self):
+        sentinel = "cqa-manifest-sentinel-" + os.urandom(4).hex()
+        requirements = self._outside_sentinel("requirements.txt", f"{sentinel}==1.2.3\n")
+        package = self._outside_sentinel("package.json", '{"dependencies":{"' + sentinel + '":"1.2.3"}}')
+        cmake = self._outside_sentinel("CMakeLists.txt", "rapidcheck\n")
+        (self.repo / "requirements.txt").symlink_to(requirements)
+        (self.repo / "package.json").symlink_to(package)
+        (self.repo / "CMakeLists.txt").symlink_to(cmake)
+        ctx = SimpleNamespace(root=self.repo, config={})
+        declared = checks._declared_versions(ctx)
+        pins = checks._pinned_dependencies(ctx)
+        self.assertEqual(declared, {})
+        self.assertEqual(pins, [])
+        self.assertFalse(checks._property_declared(ctx, []))
+        self.assertEqual(checks._manifests(self.repo), [])
+        blob = json.dumps({"declared": declared, "pins": pins})
+        self.assertNotIn(sentinel, blob)
+
+    def test_init_does_not_write_through_a_quality_config_symlink(self):
+        sentinel = "cqa-init-sentinel-" + os.urandom(4).hex()
+        secret = self._outside_sentinel("quality-auditor.yaml", f"token: {sentinel}\n")
+        original = secret.read_bytes()
+        (self.repo / "quality-auditor.yaml").symlink_to(secret)
+        result = init_repository(self.repo, {"default_profile": "full", "profiles": {}}, approve_write=True)
+        self.assertFalse(result["written"])
+        self.assertEqual(secret.read_bytes(), original)
+        self.assertNotIn(sentinel, json.dumps(result, default=str))
+        self.assertTrue(any(item["operation"] == "config-write" for item in result["log"]))
+
+    def test_config_scan_skips_file_symlinks_that_leave_the_repository(self):
+        sentinel = "cqa-config-sentinel-" + os.urandom(6).hex()
+        secret = self._outside_sentinel("settings.yaml", f"token: {sentinel}\ndebug: true\n")
+        (self.repo / "app.yaml").write_text("debug: false\n", encoding="utf-8")
+        (self.repo / "link.yaml").symlink_to(secret)
+        (self.repo / ".env.local").symlink_to(secret)
+        (self.repo / "dangling.yaml").symlink_to(self.tmp / "missing.yaml")
+        texts = dict(checks._config_texts(SimpleNamespace(root=self.repo, analyses=[])))
+        self.assertEqual(sorted(texts), ["app.yaml"])
+        self.assertNotIn(sentinel, json.dumps(texts))
+
+    def test_requirements_discovery_skips_file_symlinks_that_leave_the_repository(self):
+        sentinel = "cqa-requirement-sentinel-" + os.urandom(6).hex()
+        secret = self._outside_sentinel("requirements.md", f"## REQ-9 {sentinel}\n")
+        docs = self.repo / "docs"
+        docs.mkdir()
+        (docs / "requirements.md").write_text("## REQ-1 Inside requirement\n", encoding="utf-8")
+        (docs / "outside.md").symlink_to(secret)
+        (self.repo / "requirements.yaml").symlink_to(secret)
+        found = checks._discover_requirements(SimpleNamespace(root=self.repo))
+        self.assertNotIn(sentinel, json.dumps(found, default=str))
+        self.assertEqual({(item["id"], item["file"]) for item in found}, {("REQ-1", "docs/requirements.md")})
+
+    def test_revision_fallback_reads_only_a_bounded_prefix_of_files_inside_the_repository(self):
+        from cqa import audit as audit_module
+
+        bound = audit_module._REVISION_PREFIX_BYTES
+        secret = self._outside_sentinel("secret.txt", "cqa-revision-sentinel")
+        (self.repo / "inside.txt").write_text("inside", encoding="utf-8")
+        big = self.repo / "big.bin"
+        big.write_bytes(b"a" * bound + b"tail")
+        (self.repo / "link.txt").symlink_to(secret)
+        expected = hashlib.sha256()
+        for name, data in (("big.bin", b"a" * bound), ("inside.txt", b"inside")):
+            expected.update(name.encode())
+            expected.update(data)
+        reads = []
+        real = audit_module.contained_file
+
+        class Recorder:
+            def __init__(self, path):
+                self.path = path
+
+            @contextlib.contextmanager
+            def open(self, mode):
+                with self.path.open(mode) as handle:
+                    yield SimpleNamespace(read=lambda size=-1: reads.append((self.path.name, size)) or handle.read(size))
+
+        def spy(root, path):
+            resolved = real(root, path)
+            return Recorder(resolved) if resolved is not None else None
+
+        with mock.patch("cqa.audit.git_read", return_value=None), mock.patch("cqa.audit.contained_file", side_effect=spy):
+            revision = audit_module._revision(self.repo, self._log())
+        self.assertEqual(revision, "uncommitted:" + expected.hexdigest()[:16])
+        self.assertEqual(sorted(reads), [("big.bin", bound), ("inside.txt", bound)])
+        with mock.patch("cqa.audit.git_read", return_value=None):
+            self.assertEqual(audit_module._revision(self.repo, self._log()), revision)
+            secret.write_text("changed outside", encoding="utf-8")
+            big.write_bytes(b"a" * bound + b"other tail")
+            self.assertEqual(audit_module._revision(self.repo, self._log()), revision)
 
     def test_interpreter_wrapper_is_rejected(self):
         shell = Path("/bin/bash")
@@ -437,36 +1826,238 @@ class SandboxTrustTests(unittest.TestCase):
         self.assertIn("interpreter or shell", detail)
 
 
-def _read_allowed(profile, path, operation="file-read*"):
-    """Last matching rule wins, which is how seatbelt evaluates a profile.
+class ProductionProbeTests(unittest.TestCase):
+    """probe_sandbox() must run the restrictive production profile on synthetic fixtures."""
 
-    `file-read*` is a wildcard that also covers `file-read-metadata`, so its
-    rules count when evaluating metadata reads.
-    """
-    operations = {"file-read*", operation}
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="cqa-probe-test-")).resolve()
+        self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
+        self._saved = os.environ.copy()
+        os.environ.pop("CQA_SANDBOX_CMD", None)
+        self.fake = self.tmp / "trusted-bin" / "sandbox-exec"
+        self.fake.parent.mkdir()
+        _write_executable(self.fake, PASSTHROUGH)
+        patcher = mock.patch("cqa.security._trusted_sandbox", return_value=self.fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.tokens = []
+
+        def token(_size):
+            value = f"cqa-synthetic-token-{len(self.tokens)}-{os.urandom(4).hex()}"
+            self.tokens.append(value)
+            return value
+
+        patcher = mock.patch("cqa.security.secrets.token_hex", side_effect=token)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.real_run = security._run_process
+        self.sandboxed = []
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self._saved)
+
+    def _emulate(self, behave=None, baseline=None):
+        """Real unsandboxed baseline; the sandboxed run is replaced by an emulation of an enforcing sandbox."""
+
+        def run(command, cwd, env, timeout):
+            if command[0] != str(self.fake):
+                if baseline is not None:
+                    return baseline(command, cwd, env, timeout)
+                return self.real_run(command, cwd, env, timeout)
+            self.sandboxed.append({"command": list(command), "cwd": cwd, "env": dict(env)})
+            allowed = Path(command[-1])
+            context = {"allowed": allowed, "denied": allowed.parent / "denied", "port": int(env["CQA_PROBE_PORT"]), "command": command}
+            if behave is not None:
+                return behave(context)
+            (allowed / "output").write_bytes((allowed / "input").read_bytes())
+            return _reply(command, read_write=True, denied_read=False, denied_write=False, network=False)
+
+        return mock.patch("cqa.security._run_process", side_effect=run)
+
+    def _assert_unavailable(self, detail_part=None):
+        available, detail = probe_sandbox()
+        self.assertFalse(available, detail)
+        if detail_part:
+            self.assertIn(detail_part, detail)
+        for value in self.tokens:
+            self.assertNotIn(value, detail)
+        return detail
+
+    def test_probe_runs_the_production_profile_through_the_trusted_command(self):
+        with self._emulate():
+            available, detail = probe_sandbox()
+        self.assertTrue(available, detail)
+        self.assertEqual(detail, str(self.fake))
+        self.assertEqual(len(self.sandboxed), 1)
+        call = self.sandboxed[0]
+        command = call["command"]
+        self.assertEqual(command[:2], [str(self.fake), "-p"])
+        self.assertEqual(command[3], "--")
+        profile = command[2]
+        self.assertNotIn("(allow default)", profile)
+        self.assertEqual(_unfiltered_file_allows(profile), [])
+        self.assertIn("(deny network*)", profile)
+        allowed = Path(command[-1])
+        denied = allowed.parent / "denied"
+        self.assertTrue(allowed.name == "allowed" and allowed.parent.name.startswith("cqa-probe-"))
+        self.assertEqual(_write_roots(profile), [allowed])
+        self.assertTrue(_read_allowed(profile, allowed / "input"))
+        self.assertFalse(_read_allowed(profile, denied / "sentinel"))
+        self.assertFalse(_allowed(profile, "file-write-data", denied / "escape"))
+        self.assertEqual(call["env"]["TMPDIR"], str(allowed))
+        self.assertFalse(allowed.parent.exists())
+        home = Path.home().resolve()
+        for item in command[4:]:
+            if item.startswith("/") and Path(item).resolve() != Path(sys.executable).resolve():
+                self.assertNotIn(home, Path(item).resolve().parents)
+        for value in self.tokens:
+            self.assertNotIn(value, " ".join(command))
+            self.assertNotIn(value, json.dumps(call["env"]))
+
+    def test_probe_rejects_a_sandbox_that_does_not_enforce_the_profile(self):
+        self._assert_unavailable("containment is unavailable")
+
+    def test_probe_inconclusive_or_escaping_results_are_unavailable(self):
+        def reply(**values):
+            return lambda context: _reply(context["command"], **values)
+
+        def copy_then(**values):
+            def behave(context):
+                (context["allowed"] / "output").write_bytes((context["allowed"] / "input").read_bytes())
+                return _reply(context["command"], **values)
+
+            return behave
+
+        clean = {"read_write": True, "denied_read": False, "denied_write": False, "network": False}
+
+        def silent_write(context):
+            (context["denied"] / "escape").write_bytes(b"x")
+            return copy_then(**clean)(context)
+
+        def silent_network(context):
+            socket.create_connection(("127.0.0.1", context["port"]), timeout=2).close()
+            return copy_then(**clean)(context)
+
+        def leak(context):
+            secret = (context["denied"] / "sentinel").read_text(encoding="utf-8")
+            completed = copy_then(**clean)(context)
+            completed.stderr = secret
+            return completed
+
+        def wrong_content(context):
+            (context["allowed"] / "output").write_bytes(b"other")
+            return _reply(context["command"], **clean)
+
+        def timeout(context):
+            raise subprocess.TimeoutExpired(context["command"], 15)
+
+        cases = {
+            "malformed": lambda context: subprocess.CompletedProcess(context["command"], 0, "not json\n", ""),
+            "extra output": lambda context: subprocess.CompletedProcess(context["command"], 0, json.dumps(clean) + "\nmore\n", ""),
+            "incomplete": copy_then(read_write=True, denied_read=False, denied_write=False),
+            "extra key": copy_then(**clean, other=False),
+            "non-boolean": copy_then(read_write=True, denied_read="false", denied_write=False, network=False),
+            "status 71": lambda context: subprocess.CompletedProcess(context["command"], 71, "", "sandbox_apply: Operation not permitted"),
+            "nonzero exit": lambda context: subprocess.CompletedProcess(context["command"], 1, json.dumps(clean) + "\n", ""),
+            "timeout": timeout,
+            "denied read": copy_then(read_write=True, denied_read=True, denied_write=False, network=False),
+            "denied write": copy_then(read_write=True, denied_read=False, denied_write=True, network=False),
+            "network": copy_then(read_write=True, denied_read=False, denied_write=False, network=True),
+            "silent write escape": silent_write,
+            "silent network escape": silent_network,
+            "sentinel leak": leak,
+            "allowed write missing": reply(**clean),
+            "allowed write wrong": wrong_content,
+            "allowed read failed": copy_then(read_write=False, denied_read=False, denied_write=False, network=False),
+        }
+        for name, behave in cases.items():
+            with self.subTest(case=name):
+                self.tokens.clear()
+                with self._emulate(behave):
+                    self._assert_unavailable("containment is unavailable")
+
+    def test_probe_requires_a_viable_unsandboxed_baseline(self):
+        def no_network(command, cwd, env, timeout):
+            return subprocess.CompletedProcess(command, 0, json.dumps({"network": False}) + "\n", "")
+
+        def claims_network(command, cwd, env, timeout):
+            return subprocess.CompletedProcess(command, 0, json.dumps({"network": True}) + "\n", "")
+
+        def broken(command, cwd, env, timeout):
+            raise subprocess.TimeoutExpired(command, timeout)
+
+        for name, baseline in (("no network", no_network), ("unverified claim", claims_network), ("timeout", broken)):
+            with self.subTest(case=name):
+                self.sandboxed.clear()
+                with self._emulate(baseline=baseline):
+                    self._assert_unavailable("baseline")
+                self.assertEqual(self.sandboxed, [])
+
+    def test_probe_baseline_runs_unsandboxed_with_only_synthetic_inputs(self):
+        baselines = []
+
+        def record(command, cwd, env, timeout):
+            baselines.append({"command": list(command), "env": dict(env)})
+            return self.real_run(command, cwd, env, timeout)
+
+        with self._emulate(baseline=record):
+            available, detail = probe_sandbox()
+        self.assertTrue(available, detail)
+        self.assertEqual(len(baselines), 1)
+        command = baselines[0]["command"]
+        self.assertEqual(command[0], sys.executable)
+        self.assertEqual(baselines[0]["env"]["CQA_PROBE_MODE"], "baseline")
+        self.assertTrue(Path(command[-1]).parent.name.startswith("cqa-probe-"))
+
+
+def _reply(command, **values):
+    return subprocess.CompletedProcess(command, 0, json.dumps(values) + "\n", "")
+
+
+_RULE = re.compile(r'^\((allow|deny) ([\w*-]+)(?: \((subpath|literal) "(.*)"\))?\)$')
+
+
+def _rules(profile):
+    for raw in profile.splitlines():
+        match = _RULE.match(raw.strip())
+        if match:
+            yield match.groups()
+
+
+def _covers(rule, operation):
+    if rule == "default":
+        return True
+    if rule.endswith("*"):
+        return operation.startswith(rule[:-1])
+    return rule == operation
+
+
+def _allowed(profile, operation, path):
+    """Last matching rule wins over `(deny default)`, which is how seatbelt evaluates a profile."""
     decision = False
     target = Path(path)
-    for raw in profile.splitlines():
-        line = raw.strip()
-        for verb, allowed in (("allow", True), ("deny", False)):
-            for op in operations:
-                if line == f"({verb} {op})":
-                    decision = allowed
-                    continue
-                for kind in ("subpath", "literal"):
-                    prefix = f'({verb} {op} ({kind} "'
-                    if not line.startswith(prefix) or not line.endswith('"))'):
-                        continue
-                    root = Path(line[len(prefix):-3])
-                    if target == root or (kind == "subpath" and root in target.parents):
-                        decision = allowed
+    for verb, rule, kind, value in _rules(profile):
+        if not _covers(rule, operation):
+            continue
+        if kind == "subpath" and not (target == Path(value) or Path(value) in target.parents):
+            continue
+        if kind == "literal" and target != Path(value):
+            continue
+        decision = verb == "allow"
     return decision
 
 
-def subprocess_timeout():
-    import subprocess
+def _read_allowed(profile, path):
+    return _allowed(profile, "file-read-data", path)
 
-    return subprocess.TimeoutExpired
+
+def _unfiltered_file_allows(profile):
+    return [f"(allow {rule})" for verb, rule, kind, _value in _rules(profile) if verb == "allow" and kind is None and (rule.startswith("file") or rule == "default")]
+
+
+def _write_roots(profile):
+    return [Path(value) for verb, rule, kind, value in _rules(profile) if verb == "allow" and rule.startswith("file-write")]
 
 
 def _alive(pid):
@@ -475,3 +2066,12 @@ def _alive(pid):
     except OSError:
         return False
     return True
+
+
+def _running(pid):
+    """Alive and not a zombie waiting for its new parent to reap it."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="ascii", errors="replace")
+    except OSError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] not in {"Z", "X"}
