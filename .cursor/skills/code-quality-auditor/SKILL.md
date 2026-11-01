@@ -19,8 +19,11 @@ The internal runner is `.cursor/skills/code-quality-auditor/scripts/auditor.py`.
 
 - Inspect source read-only. Do not modify the repository, install runtimes, or install analyzers unless the user explicitly approves that action.
 - Do not infer installation approval from `/code-quality-auditor init`.
-- External analyzers require `--allow-tools` and must already be installed. The tool registry does not authorize a download.
-- Repository tests, mutation, benchmarks, and build scripts are untrusted. Run them only with both `--allow-repo-execution` and `--sandbox-confirmed`, and only when containment actually applies. If containment is unavailable, stop that execution and continue with static checks.
+- External analyzers require `--allow-tools` and must already be installed outside the audited repository. The tool registry does not authorize a download.
+- An approved host analyzer is eligible to run, not trusted to run unsandboxed: it reads repository-controlled content, so it always runs under containment. Repository executables, plugins, and executable analyzer configuration are never treated as host analyzers.
+- Repository tests, mutation, benchmarks, and build scripts are untrusted. Run them only with both `--allow-repo-execution` and `--sandbox-confirmed`, and only when containment actually applies.
+- Containment is the root-owned `/usr/bin/sandbox-exec` on macOS with a deny-by-default profile, and it is used only after a probe confirms that profile blocks a sibling read, a sibling write, and loopback network. Linux and Windows report containment unavailable. `CQA_SANDBOX_CMD` and other custom wrappers cannot authorize containment.
+- If containment is unavailable or fails to apply, the command is not run or rerun outside it. Report the analyzer or execution as unavailable and continue with built-in static checks.
 - If Python 3.12+ is missing, ask before any installation and offer a limited file inspection instead of pretending the engine ran.
 - Write reports outside the audited repository.
 - A failed, unavailable, or inconclusive blocking check is `INCOMPLETE` or `FAIL`, never `PASS`.

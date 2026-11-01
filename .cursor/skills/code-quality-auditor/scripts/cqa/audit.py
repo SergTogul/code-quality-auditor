@@ -386,8 +386,8 @@ def audit(
             "runtime": detect_runtime(),
             "limitations": sorted(set(limitations)),
             "platform_limitations": [
-                "Windows containment uses CQA_SANDBOX_CMD when sandbox-exec is absent.",
-                "External analyzers run only when they are already installed and tool execution is approved.",
+                "Containment is available only on macOS through /usr/bin/sandbox-exec. Linux and Windows fail closed, and CQA_SANDBOX_CMD cannot authorize containment.",
+                "External analyzers run only when they are already installed, tool execution is approved, and containment applies.",
             ],
         },
         "configuration_precedence": PRECEDENCE,
