@@ -1217,14 +1217,14 @@ def _version_tuple(value):
 def _declared_versions(ctx):
     declared = {}
     root = Path(ctx.root)
-    requirements = root / "requirements.txt"
-    if requirements.is_file():
+    requirements = _root_manifest(root, "requirements.txt")
+    if requirements is not None:
         for line in requirements.read_text(encoding="utf-8", errors="replace").splitlines():
             match = re.match(r"\s*([A-Za-z0-9_.-]+)==([^\s#]+)", line)
             if match:
                 declared[match.group(1).lower()] = match.group(2)
-    package = root / "package.json"
-    if package.is_file():
+    package = _root_manifest(root, "package.json")
+    if package is not None:
         try:
             import json
 
@@ -1243,6 +1243,11 @@ def _repository_input(ctx, raw):
     if not raw or Path(str(raw)).is_absolute():
         return None
     return contained_file(ctx.root, Path(ctx.root) / str(raw))
+
+
+def _root_manifest(root, name):
+    """A manifest at the audit root, or None when it is missing or a symlink that leaves the root."""
+    return contained_file(root, Path(root) / name)
 
 
 def _freshness_snapshot(ctx):
@@ -1681,14 +1686,14 @@ def _local_advisories(ctx):
 def _pinned_dependencies(ctx):
     pins = []
     root = Path(ctx.root)
-    requirements = root / "requirements.txt"
-    if requirements.is_file():
+    requirements = _root_manifest(root, "requirements.txt")
+    if requirements is not None:
         for index, line in enumerate(requirements.read_text(encoding="utf-8", errors="replace").splitlines(), start=1):
             match = re.match(r"\s*([A-Za-z0-9_.-]+)==([^\s#]+)", line)
             if match:
                 pins.append({"file": "requirements.txt", "line": index, "name": match.group(1).lower(), "version": match.group(2)})
-    package = root / "package.json"
-    if package.is_file():
+    package = _root_manifest(root, "package.json")
+    if package is not None:
         try:
             import json
 
@@ -1708,8 +1713,9 @@ def _manifests(root):
     root = Path(root)
     for dirpath, dirnames, filenames in os_walk_limited(root):
         for name in filenames:
-            if name in names:
-                found.append(str(Path(dirpath) / name))
+            path = Path(dirpath) / name
+            if name in names and contained_file(root, path) is not None:
+                found.append(str(path))
     return found
 
 
@@ -2024,15 +2030,15 @@ def _property_declared(ctx, specs):
     if any("property" in f"{item.get('text', '')} {item.get('id', '')}".lower() for item in specs):
         return True
     root = Path(ctx.root)
-    requirements = root / "requirements.txt"
-    if requirements.is_file() and re.search(r"(?im)^\s*hypothesis(?:\s|==|>=|~=|\[|$)", requirements.read_text(encoding="utf-8", errors="replace")):
+    requirements = _root_manifest(root, "requirements.txt")
+    if requirements is not None and re.search(r"(?im)^\s*hypothesis(?:\s|==|>=|~=|\[|$)", requirements.read_text(encoding="utf-8", errors="replace")):
         return True
-    package = root / "package.json"
-    if package.is_file() and re.search(r"fast-check|rapidcheck", package.read_text(encoding="utf-8", errors="replace"), re.I):
+    package = _root_manifest(root, "package.json")
+    if package is not None and re.search(r"fast-check|rapidcheck", package.read_text(encoding="utf-8", errors="replace"), re.I):
         return True
     for name in ("CMakeLists.txt", "conanfile.txt", "vcpkg.json"):
-        path = root / name
-        if path.is_file() and re.search(r"rapidcheck", path.read_text(encoding="utf-8", errors="replace"), re.I):
+        path = _root_manifest(root, name)
+        if path is not None and re.search(r"rapidcheck", path.read_text(encoding="utf-8", errors="replace"), re.I):
             return True
     return False
 

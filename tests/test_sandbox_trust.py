@@ -856,6 +856,43 @@ class SandboxTrustTests(unittest.TestCase):
             for key in ("clean=", "smudge=", "process="):
                 self.assertIn(f"filter.{name}.{key}", command)
 
+    def test_git_read_does_not_run_gpg_program_for_signed_history(self):
+        run_git = self._git_repository()
+        script, marker = self._marker_script("fake-gpg")
+        run_git("config", "log.showSignature", "true")
+        run_git("config", "gpg.format", "openpgp")
+        run_git("config", "gpg.program", str(script))
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull, "GIT_CONFIG_SYSTEM": os.devnull}
+        git = security._trusted_git(self.repo)
+        tree = subprocess.run([str(git), "write-tree"], cwd=self.repo, env=env, check=True, capture_output=True, text=True).stdout.strip()
+        signature = "-----BEGIN PGP SIGNATURE-----\n\nnot-a-real-signature\n-----END PGP SIGNATURE-----"
+        body = (
+            f"tree {tree}\n"
+            "author cqa <cqa@example.invalid> 1000000000 +0000\n"
+            "committer cqa <cqa@example.invalid> 1000000000 +0000\n"
+            f"gpgsig {signature.replace(chr(10), chr(10) + ' ')}\n"
+            "\n"
+            "signed\n"
+        )
+        commit = subprocess.run(
+            [str(git), "hash-object", "-t", "commit", "-w", "--stdin"],
+            cwd=self.repo,
+            env=env,
+            input=body.encode(),
+            check=True,
+            capture_output=True,
+        ).stdout.decode().strip()
+        subprocess.run([str(git), "update-ref", "HEAD", commit], cwd=self.repo, env=env, check=True, capture_output=True)
+        marker.unlink(missing_ok=True)
+        log = self._log()
+        completed = security.git_read(self.repo, ["log", "--numstat", "--format=%H"], log)
+        self.assertFalse(marker.exists())
+        self.assertIsNotNone(completed)
+        self.assertIn(commit.encode(), completed.stdout)
+        command = next(item["command"] for item in log.commands if "log" in item["command"])
+        self.assertIn("log.showSignature=false", command)
+        self.assertIn("gpg.program=", command)
+
     def test_git_read_refuses_config_includes_it_cannot_confirm_inside_the_repository(self):
         run_git = self._git_repository()
         script, marker = self._marker_script("included-clean")
@@ -1112,6 +1149,35 @@ class SandboxTrustTests(unittest.TestCase):
         path = outside / name
         path.write_text(text, encoding="utf-8")
         return path
+
+    def test_manifest_symlinks_that_leave_the_repository_are_not_read(self):
+        sentinel = "cqa-manifest-sentinel-" + os.urandom(4).hex()
+        requirements = self._outside_sentinel("requirements.txt", f"{sentinel}==1.2.3\n")
+        package = self._outside_sentinel("package.json", '{"dependencies":{"' + sentinel + '":"1.2.3"}}')
+        cmake = self._outside_sentinel("CMakeLists.txt", "rapidcheck\n")
+        (self.repo / "requirements.txt").symlink_to(requirements)
+        (self.repo / "package.json").symlink_to(package)
+        (self.repo / "CMakeLists.txt").symlink_to(cmake)
+        ctx = SimpleNamespace(root=self.repo, config={})
+        declared = checks._declared_versions(ctx)
+        pins = checks._pinned_dependencies(ctx)
+        self.assertEqual(declared, {})
+        self.assertEqual(pins, [])
+        self.assertFalse(checks._property_declared(ctx, []))
+        self.assertEqual(checks._manifests(self.repo), [])
+        blob = json.dumps({"declared": declared, "pins": pins})
+        self.assertNotIn(sentinel, blob)
+
+    def test_init_does_not_write_through_a_quality_config_symlink(self):
+        sentinel = "cqa-init-sentinel-" + os.urandom(4).hex()
+        secret = self._outside_sentinel("quality-auditor.yaml", f"token: {sentinel}\n")
+        original = secret.read_bytes()
+        (self.repo / "quality-auditor.yaml").symlink_to(secret)
+        result = init_repository(self.repo, {"default_profile": "full", "profiles": {}}, approve_write=True)
+        self.assertFalse(result["written"])
+        self.assertEqual(secret.read_bytes(), original)
+        self.assertNotIn(sentinel, json.dumps(result, default=str))
+        self.assertTrue(any(item["operation"] == "config-write" for item in result["log"]))
 
     def test_config_scan_skips_file_symlinks_that_leave_the_repository(self):
         sentinel = "cqa-config-sentinel-" + os.urandom(6).hex()

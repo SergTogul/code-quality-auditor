@@ -743,7 +743,21 @@ def run_tool(command, cwd, log, timeout=60):
 
 
 _GIT_CANDIDATES = ("/usr/bin/git", "/usr/local/bin/git", "/opt/homebrew/bin/git")
-_GIT_HELPER_KEYS = ("diff.external", "core.sshCommand", "core.pager", "credential.helper")
+_GIT_HELPER_KEYS = (
+    "diff.external",
+    "core.sshCommand",
+    "core.pager",
+    "credential.helper",
+    "gpg.program",
+    "gpg.ssh.program",
+    "gpg.x509.program",
+)
+# log.showSignature makes git log run gpg.program. Submodule recursion would enter another config.
+_GIT_FORCED_CONFIG = (
+    ("log.showSignature", "false"),
+    ("diff.submodule", "short"),
+    ("submodule.recurse", "false"),
+)
 _GIT_DIFF_COMMANDS = {"log", "diff", "show"}
 
 
@@ -976,6 +990,8 @@ def git_read(repo, args, log, timeout=20, limit=_OUTPUT_LIMIT):
     command = [str(git), "--no-pager", "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=", "-c", "protocol.allow=never", "--no-optional-locks"]
     for key in _GIT_HELPER_KEYS:
         command.extend(["-c", f"{key}="])
+    for key, value in _GIT_FORCED_CONFIG:
+        command.extend(["-c", f"{key}={value}"])
     command.extend(overrides)
     for alias in GIT_ALIASES:
         command.extend(["-c", f"alias.{alias}="])
