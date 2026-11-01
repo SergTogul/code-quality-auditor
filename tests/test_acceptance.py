@@ -31,7 +31,7 @@ spec.loader.exec_module(auditor)
 
 from cqa.catalog import load  # noqa: E402
 from cqa.executor import TransientFailure, execute  # noqa: E402
-from cqa.security import ExecutionLog, install_analyzer, install_skill, run_contained, runtime_probe  # noqa: E402
+from cqa.security import ExecutionLog, install_analyzer, install_skill, probe_sandbox, run_contained, runtime_probe  # noqa: E402
 from cqa.project import init_repository, manage_profile  # noqa: E402
 from cqa.reporting import compare_history, render_html, trends  # noqa: E402
 from cqa import checks as check_module  # noqa: E402
@@ -540,6 +540,7 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(denied_line["status"], "UNAVAILABLE")
         self.assertIn("not approved", denied_line["reason"])
         before = (repo / "app.py").read_text(encoding="utf-8")
+        self._require_native_containment()
         approved = self.audit(repo, profile="lines", allow_repo_execution=True, sandbox_confirmed=True)
         metrics = {item["metric_id"]: item for item in approved["metrics"]}
         self.assertEqual(metrics["TEST-003"]["status"], "NOT_APPLICABLE")
@@ -893,9 +894,35 @@ class AcceptanceTests(unittest.TestCase):
         files = {item["file"] for item in report["findings"] if "REL-001" in item["metric_ids"]}
         self.assertEqual(files, {"app.py", "app.js", "app.cpp"})
 
+    def _fake_clang(self, diagnostics):
+        """Stands in for a contained clang run so diagnostic parsing does not depend on native containment."""
+        real_which = shutil.which
+
+        def which(name, *args, **kwargs):
+            return "/usr/bin/clang" if name == "clang" else real_which(name, *args, **kwargs)
+
+        def run(command, cwd, log, timeout=60):
+            self.assertEqual(command[:2], ["/usr/bin/clang", "-fsyntax-only"])
+            return subprocess.CompletedProcess(command, 1, "", diagnostics.get(command[-1], ""))
+
+        stack = mock.patch("cqa.checks.shutil.which", side_effect=which), mock.patch("cqa.checks.run_tool", side_effect=run)
+        for patcher in stack:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _require_native_containment(self):
+        available, detail = probe_sandbox()
+        if not available:
+            self.skipTest(f"repository execution needs native containment, which is unavailable here: {detail}")
+
     def test_clang_syntax_requires_tool_approval(self):
         """Requirements: 4.4, 8.7."""
-        self.assertIsNotNone(shutil.which("clang"))
+        self._fake_clang(
+            {
+                "broken.cpp": "broken.cpp:3:1: error: expected ';' after return statement\n",
+                "name.cpp": "name.cpp:2:10: error: use of undeclared identifier 'missing'\n",
+            }
+        )
         repo = self.repo("clang-syntax")
         _write(repo / "quality-auditor.yaml", """
         version: 1
@@ -936,6 +963,48 @@ class AcceptanceTests(unittest.TestCase):
         semantic_metrics = {item["metric_id"]: item for item in semantic_report["metrics"]}
         self.assertEqual(semantic_metrics["REL-004"]["measured_value"], 0)
         self.assertEqual(semantic_report["decision"], "PASS")
+
+    def test_clang_without_containment_keeps_static_syntax(self):
+        """Requirements: 4.4, 8.7."""
+        marker = self.tmp / "clang-ran"
+        clang = self.tmp / "host-bin" / "clang"
+        clang.parent.mkdir()
+        clang.write_text(f"#!/bin/sh\n: > {marker}\necho 'broken.cpp:3:1: error: expected ;' >&2\nexit 1\n", encoding="utf-8")
+        clang.chmod(0o755)
+        real_which = shutil.which
+
+        def which(name, *args, **kwargs):
+            return str(clang) if name == "clang" else real_which(name, *args, **kwargs)
+
+        repo = self.repo("clang-uncontained")
+        _write(repo / "quality-auditor.yaml", """
+        version: 1
+        default_profile: syntax
+        profiles:
+          syntax:
+            include: [syntax_static]
+        """)
+        _write(repo / "broken.cpp", """
+        int run() {
+          return 1
+        }
+        """)
+        _write(repo / "other.cpp", "int other() { return 2; }\n")
+        _write(repo / "broken.py", "def broken(:\n    return 1\n")
+        with mock.patch("cqa.checks.shutil.which", side_effect=which), mock.patch("cqa.security._trusted_sandbox", return_value=None):
+            report = self.audit(repo, profile="syntax", allow_tools=True)
+        self.assertFalse(marker.exists())
+        metrics = {item["metric_id"]: item for item in report["metrics"]}
+        self.assertEqual(metrics["REL-004"]["measured_value"], 1)
+        self.assertEqual(metrics["REL-004"]["status"], "FAIL")
+        self.assertEqual({item["file"] for item in report["findings"] if "REL-004" in item["metric_ids"]}, {"broken.py"})
+        self.assertFalse(any("clang:" in item["observation"] for item in report["findings"]))
+        limits = [item for item in report["execution"]["limitations"] if "clang syntax checking was not run" in item]
+        self.assertEqual(len(limits), 1)
+        self.assertIn("containment", limits[0])
+        self.assertTrue(any(item["operation"] == "containment" for item in report["execution"]["denied"]))
+        self.assertFalse(any(item["command"] and item["command"][0] == str(clang) for item in report["execution"]["commands"]))
+        self.assertTrue(next(task for task in report["execution"]["tasks"] if task["task_id"] == "syntax_static")["ok"])
 
     def test_concurrency_primitives_need_a_concurrency_test(self):
         """Requirements: 8.3."""
@@ -1840,6 +1909,7 @@ class AcceptanceTests(unittest.TestCase):
         denied_metrics = {item["metric_id"]: item for item in denied["metrics"]}
         self.assertEqual(denied_metrics["REQ-008"]["measured_value"], 1)
         self.assertEqual(denied_metrics["REQ-008"]["status"], "FAIL")
+        self._require_native_containment()
         approved = self.audit(repo, profile="accept", allow_repo_execution=True, sandbox_confirmed=True)
         metrics = {item["metric_id"]: item for item in approved["metrics"]}
         self.assertEqual(metrics["REQ-008"]["measured_value"], 2)
@@ -1849,6 +1919,7 @@ class AcceptanceTests(unittest.TestCase):
 
     def test_pytest_project_uses_its_runner(self):
         """Requirements: 4.4, 7.6, 8.3."""
+        self._require_native_containment()
         repo = self.repo("pyrunner")
         _write(repo / "quality-auditor.yaml", """
         version: 1
@@ -1895,6 +1966,7 @@ class AcceptanceTests(unittest.TestCase):
 
     def test_pytest_collection_error_stays_unavailable(self):
         """Requirements: 4.4, 7.6, 8.3."""
+        self._require_native_containment()
         repo = self.repo("pycollect")
         _write(repo / "quality-auditor.yaml", """
         version: 1
