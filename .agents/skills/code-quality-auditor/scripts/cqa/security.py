@@ -1199,18 +1199,12 @@ def git_read(repo, args, log, timeout=20, limit=_OUTPUT_LIMIT):
 
 
 def install_skill(target, source, approve=False, log=None):
-    log = log or ExecutionLog()
-    if not approve:
-        log.deny("skill-install", "skill installation needs explicit approval")
-        return {"status": "approval_required", "installed": False, "path": None}
-    destination = Path(target) / ".cursor" / "skills" / "code-quality-auditor"
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    if destination.exists():
-        shutil.rmtree(destination)
-    shutil.copytree(source, destination, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-    log.approvals.append({"action": "install-skill", "path": str(destination), "approved": True})
-    log.record(["copy", str(source), str(destination)], "installed")
-    return {"status": "installed", "installed": True, "path": str(destination)}
+    """Install the Cursor project slot. The legacy result keeps status, installed, and path."""
+    from cqa.skill_install import install_agents
+
+    result = install_agents(target, source, agent="cursor", scope="project", approve=approve, log=log)
+    installed = result["status"] in {"installed", "updated", "unchanged"}
+    return {"status": result["status"], "installed": installed, "path": result["path"] if installed else None}
 
 
 def install_analyzer(tool, approve=False, artifact=None, expected_sha256=None, log=None, execute=False, timeout=600, limit=_OUTPUT_LIMIT):

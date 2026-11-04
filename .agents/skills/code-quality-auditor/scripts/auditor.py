@@ -23,7 +23,8 @@ from cqa.profiles import explain_profile as _explain_profile  # noqa: E402
 from cqa.profiles import merge_profiles, resolve_profile as _resolve_profile  # noqa: E402
 from cqa.project import discover_repository, init_repository, manage_profile  # noqa: E402
 from cqa.reporting import compare_history, trends  # noqa: E402
-from cqa.security import install_analyzer, install_skill, runtime_probe  # noqa: E402
+from cqa.security import runtime_probe  # noqa: E402
+from cqa.skill_install import install_agents, uninstall_agents, update_agents  # noqa: E402
 
 
 def _checks():
@@ -68,6 +69,7 @@ def _build_parser():
     audit_parser.add_argument("--allow-repo-execution", action="store_true")
     audit_parser.add_argument("--sandbox-confirmed", action="store_true")
     audit_parser.add_argument("--cache-dir", default=None)
+    audit_parser.add_argument("--allow-skill-target", action="store_true")
 
     init_parser = sub.add_parser("init")
     init_parser.add_argument("--repo", required=True)
@@ -75,9 +77,13 @@ def _build_parser():
     init_parser.add_argument("--languages", default="")
     init_parser.add_argument("--directories", default="")
 
-    install = sub.add_parser("install")
-    install.add_argument("--target", required=True)
-    install.add_argument("--approve", action="store_true")
+    for name in ("install", "update", "uninstall"):
+        command = sub.add_parser(name)
+        command.add_argument("--target", required=True)
+        command.add_argument("--agent", default="cursor", choices=("cursor", "claude", "codex", "all"))
+        command.add_argument("--scope", default="project", choices=("project", "global"))
+        command.add_argument("--approve", action="store_true")
+        command.add_argument("--destination", default=None)
 
     profiles = sub.add_parser("profiles")
     profiles.add_argument("--config", required=True)
@@ -97,10 +103,56 @@ def _build_parser():
     return parser
 
 
+def _print_skill_result(result):
+    print(result["status"])
+    for item in result["destinations"]:
+        print(f"{item['agent']}\t{item['scope']}\t{item['method']}\t{item['status']}\t{item['path']}")
+
+
+def _skill_exit(operation, status):
+    if status in {"approval_required", "installed", "updated", "unchanged", "removed"}:
+        return 0
+    if status == "absent" and operation == "uninstall":
+        return 0
+    return 1
+
+
+def _run_skill_command(args):
+    try:
+        if args.command == "uninstall":
+            result = uninstall_agents(
+                args.target,
+                agent=args.agent,
+                scope=args.scope,
+                destination=args.destination,
+                approve=args.approve,
+            )
+        else:
+            runner = install_agents if args.command == "install" else update_agents
+            result = runner(
+                args.target,
+                HERE,
+                agent=args.agent,
+                scope=args.scope,
+                destination=args.destination,
+                approve=args.approve,
+            )
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
+        return 2
+    _print_skill_result(result)
+    return _skill_exit(args.command, result["status"])
+
+
 def main(argv=None):
     parser = _build_parser()
     args = parser.parse_args(argv)
     if args.command == "audit":
+        repo = Path(args.repo).resolve()
+        here = HERE.resolve()
+        if not args.allow_skill_target and (repo == here or here in repo.parents):
+            print("refusing to audit the skill package; pass the host project as --repo")
+            return 2
         report = audit(
             args.repo,
             skill_root=HERE,
@@ -129,10 +181,8 @@ def main(argv=None):
         )
         print(result["written"], result["path"])
         return 0
-    if args.command == "install":
-        result = install_skill(args.target, HERE, approve=args.approve)
-        print(result["status"])
-        return 0 if result.get("installed") or result["status"] == "approval_required" else 1
+    if args.command in {"install", "update", "uninstall"}:
+        return _run_skill_command(args)
     if args.command == "profiles":
         result = manage_profile(args.config, args.action, _checks(), name=args.name, approve_write=args.approve_write)
         print(result.get("explanation") or result)

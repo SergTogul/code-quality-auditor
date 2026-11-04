@@ -2,7 +2,7 @@
 
 Source: `docs/requirements-v1.1.docx` (146 numbered requirements).
 Checklist: `docs/traceability.yaml`.
-Catalog: `.cursor/skills/code-quality-auditor/config/metrics.yaml` (112 metrics).
+Catalog: `.agents/skills/code-quality-auditor/config/metrics.yaml` (112 metrics).
 
 ## Test result
 
