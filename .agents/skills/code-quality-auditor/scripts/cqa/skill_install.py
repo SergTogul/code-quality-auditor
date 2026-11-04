@@ -26,7 +26,17 @@ _AGENTS = ("cursor", "claude", "codex", "all")
 _SCOPES = ("project", "global")
 _ALL_ORDER = ("codex", "cursor", "claude")
 _APPROVAL_DETAIL = "skill installation needs explicit approval"
-_COPY_IGNORE = shutil.ignore_patterns("__pycache__", "*.pyc")
+_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+if hasattr(os, "O_CLOEXEC"):
+    _DIR_FLAGS |= os.O_CLOEXEC
+
+
+class _TreeRefused(Exception):
+    """The source tree cannot be copied without following a symlink."""
+
+
+class _ContainmentError(Exception):
+    """The slot is not a real directory under the operator-named root."""
 
 
 def plan_slots(root, agent="cursor", scope="project", destination=None) -> list[dict]:
@@ -49,14 +59,14 @@ def plan_slots(root, agent="cursor", scope="project", destination=None) -> list[
         dest = _absolute(destination)
         if dest.name != SKILL_NAME:
             raise ValueError("the last path component must be code-quality-auditor")
-        return [_slot(agent, scope, dest, link=False, link_target=None)]
+        return [_slot(agent, scope, dest, link=False, link_target=None, fixed=True)]
     root_path = _absolute(root)
     names = _ALL_ORDER if agent == "all" else (agent,)
     slots = []
     for name in names:
         link = agent == "all" and name == "claude"
         target = root_path / LAYOUTS["codex"] if link else None
-        slots.append(_slot(name, scope, root_path / LAYOUTS[name], link=link, link_target=target))
+        slots.append(_slot(name, scope, root_path / LAYOUTS[name], link=link, link_target=target, fixed=False))
     return slots
 
 
@@ -98,13 +108,16 @@ def is_our_skill(path) -> bool:
     return _frontmatter_name(skill_md) == SKILL_NAME
 
 
-def _slot(agent, scope, path, link, link_target):
+def _slot(agent, scope, path, link, link_target, fixed):
     return {
         "agent": agent,
         "scope": scope,
         "path": Path(path),
         "link": bool(link),
         "link_target": None if link_target is None else Path(link_target),
+        "fixed": bool(fixed),
+        "root": None,
+        "safe": None,
     }
 
 
@@ -202,24 +215,38 @@ def _fingerprint(root: Path) -> bytes:
     root = Path(root)
     if root.is_symlink():
         root = root.resolve(strict=True)
-    digest = hashlib.sha256()
-    paths = []
+    records = []
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
-        dirnames[:] = sorted(name for name in dirnames if name != "__pycache__")
+        current = Path(dirpath)
+        real_dirs = []
+        for name in sorted(dirnames):
+            path = current / name
+            if path.is_symlink():
+                records.append((path.relative_to(root).as_posix(), b"link", os.readlink(path).encode()))
+                continue
+            if name == "__pycache__":
+                continue
+            real_dirs.append(name)
+        dirnames[:] = real_dirs
         for name in sorted(filenames):
+            path = current / name
+            rel = path.relative_to(root).as_posix()
+            if path.is_symlink():
+                records.append((rel, b"link", os.readlink(path).encode()))
+                continue
             if name.endswith(".pyc"):
                 continue
-            paths.append(Path(dirpath) / name)
-    for path in paths:
-        rel = path.relative_to(root).as_posix()
+            if path.is_file():
+                records.append((rel, b"file", path.read_bytes()))
+                continue
+            records.append((rel, b"other", b""))
+    digest = hashlib.sha256()
+    for rel, kind, payload in sorted(records):
         digest.update(rel.encode())
         digest.update(b"\0")
-        if path.is_symlink():
-            digest.update(b"link\0")
-            digest.update(os.readlink(path).encode())
-        else:
-            digest.update(b"file\0")
-            digest.update(path.read_bytes())
+        digest.update(kind)
+        digest.update(b"\0")
+        digest.update(payload)
         digest.update(b"\0")
     return digest.digest()
 
@@ -231,12 +258,224 @@ def _same_tree(source, dest) -> bool:
         return False
 
 
+def _inside_root(root: Path, path: Path) -> bool:
+    try:
+        real = Path(path).resolve()
+        real_root = Path(root).resolve()
+    except OSError:
+        return False
+    return real == real_root or real_root in real.parents
+
+
+def _named_parent_escapes(parent: Path) -> bool:
+    """True when a symlink in the destination parent would leave the named directory.
+
+    A first path component such as ``/tmp`` → ``/private/tmp`` is prefix
+    canonicalization of the operator-named root and is allowed. A symlink in
+    any deeper component is refused, including when that component is the
+    parent directory itself.
+    """
+    parent = _absolute(parent)
+    if parent.is_symlink():
+        return True
+    current = Path(parent.parts[0])
+    for part in parent.parts[1:]:
+        current = current / part
+        try:
+            linked = current.is_symlink()
+        except OSError:
+            return True
+        if not linked:
+            if current.exists():
+                continue
+            return False
+        if len(current.parts) > 2:
+            return True
+        try:
+            target = current.resolve()
+            container = current.parent.resolve()
+        except OSError:
+            return True
+        if target != container and container not in target.parents:
+            return True
+    return False
+
+
+def _intermediate_escape(root: Path, slot: Path) -> bool:
+    """True when a component between root and the skill directory is unsafe.
+
+    ``root`` is the resolved operator-named directory. Only the final slot
+    component may be a symlink. ``lstat`` does not follow that component.
+    """
+    root = Path(root)
+    slot = Path(slot)
+    try:
+        relative = slot.relative_to(root)
+    except ValueError:
+        return True
+    parts = relative.parts
+    if not parts:
+        return True
+    current = root
+    for part in parts[:-1]:
+        current = current / part
+        try:
+            info = os.lstat(current)
+        except FileNotFoundError:
+            return not _inside_root(root, current.parent)
+        except OSError:
+            return True
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            return True
+        flags = _DIR_FLAGS
+        try:
+            fd = os.open(current, flags)
+        except OSError:
+            return True
+        os.close(fd)
+    return not _inside_root(root, slot.parent)
+
+
+def _locate_slot(slot) -> tuple[Path, Path, bool]:
+    """Return the resolved containment root, the safe slot path, and whether it escapes."""
+    lexical = Path(slot["path"])
+    if slot.get("fixed"):
+        parent = lexical.parent
+        if _named_parent_escapes(parent):
+            return parent, lexical, True
+        root = parent.resolve()
+        safe = root / lexical.name
+    else:
+        relative = LAYOUTS[slot["agent"]]
+        lexical_root = lexical
+        for _part in relative.parts:
+            lexical_root = lexical_root.parent
+        root = lexical_root.resolve()
+        safe = root.joinpath(*relative.parts)
+    if root.exists() and (root.is_symlink() or not root.is_dir()):
+        return root, lexical, True
+    return root, safe, _intermediate_escape(root, safe)
+
+
+def _ensure_real_directory(path: Path):
+    """Create a resolved operator root. Its path no longer contains symlink components."""
+    if path.is_symlink():
+        raise _ContainmentError(path)
+    if path.is_dir():
+        return
+    if path.exists():
+        raise _ContainmentError(path)
+    path.mkdir(parents=True, exist_ok=True)
+    if path.is_symlink() or not path.is_dir():
+        raise _ContainmentError(path)
+
+
+def _mkdir_under(root: Path, directory: Path):
+    """Create real directories from root through directory. Do not follow symlinks."""
+    if directory == root:
+        return
+    relative = directory.relative_to(root)
+    fd = os.open(root, _DIR_FLAGS)
+    opened = [fd]
+    try:
+        for part in relative.parts:
+            try:
+                child = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            except FileNotFoundError:
+                os.mkdir(part, 0o755, dir_fd=fd)
+                child = os.open(part, _DIR_FLAGS, dir_fd=fd)
+            except OSError as exc:
+                raise _ContainmentError(part) from exc
+            opened.append(child)
+            fd = child
+    finally:
+        for handle in reversed(opened):
+            os.close(handle)
+
+
+def _prepare_parent(root: Path, slot: Path):
+    if _intermediate_escape(root, slot):
+        raise _ContainmentError(slot)
+    _ensure_real_directory(root)
+    _mkdir_under(root, slot.parent)
+
+
+def _link_stays_inside(link: Path, source_root: Path) -> bool:
+    raw = os.readlink(link)
+    candidate = Path(raw) if os.path.isabs(raw) else link.parent / raw
+    try:
+        resolved = candidate.resolve(strict=True)
+    except OSError:
+        return False
+    root = source_root.resolve()
+    return resolved == root or root in resolved.parents
+
+
+def _assert_tree_copyable(source: Path):
+    source = Path(source)
+    if source.is_symlink() or not source.is_dir():
+        raise _TreeRefused(source)
+    _assert_children(source, source.resolve())
+
+
+def _assert_children(directory: Path, source_root: Path):
+    for name in sorted(os.listdir(directory)):
+        path = directory / name
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            if not _link_stays_inside(path, source_root):
+                raise _TreeRefused(path)
+            continue
+        if stat.S_ISDIR(info.st_mode):
+            if name == "__pycache__":
+                continue
+            _assert_children(path, source_root)
+            continue
+        if stat.S_ISREG(info.st_mode):
+            continue
+        raise _TreeRefused(path)
+
+
 def _copy_tree(source, destination):
+    """Copy source without following symlinks. An outside link refuses the copy."""
+    source = Path(source)
     destination = Path(destination)
     if destination.exists() or destination.is_symlink():
         raise FileExistsError(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(source, destination, ignore=_COPY_IGNORE, symlinks=False, dirs_exist_ok=False)
+    source_root = source.resolve()
+    os.mkdir(destination, 0o755)
+    try:
+        _copy_children(source, destination, source_root)
+    except Exception:
+        if destination.is_symlink():
+            destination.unlink()
+        elif destination.exists():
+            shutil.rmtree(destination)
+        raise
+
+
+def _copy_children(src: Path, dst: Path, source_root: Path):
+    for name in sorted(os.listdir(src)):
+        src_child = src / name
+        dst_child = dst / name
+        info = src_child.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            if not _link_stays_inside(src_child, source_root):
+                raise _TreeRefused(src_child)
+            os.symlink(os.readlink(src_child), dst_child)
+            continue
+        if stat.S_ISDIR(info.st_mode):
+            if name == "__pycache__":
+                continue
+            os.mkdir(dst_child, 0o755)
+            _copy_children(src_child, dst_child, source_root)
+            continue
+        if stat.S_ISREG(info.st_mode):
+            if name.endswith(".pyc"):
+                continue
+            shutil.copy2(src_child, dst_child, follow_symlinks=False)
+            continue
+        raise _TreeRefused(src_child)
 
 
 def _discard_node(path: Path):
@@ -251,12 +490,12 @@ def _discard_node(path: Path):
         path.unlink()
 
 
-def _replace_tree(source, slot: Path):
+def _replace_tree(source, slot: Path, root: Path):
     """Copy to a sibling temp directory, then swap it in. The source is not the slot."""
     if _same_node(source, slot):
         raise RuntimeError("refusing to replace the live skill source")
+    _prepare_parent(root, slot)
     parent = slot.parent
-    parent.mkdir(parents=True, exist_ok=True)
     staging_root = Path(tempfile.mkdtemp(prefix=".cqa-install-", dir=parent))
     staging = staging_root / SKILL_NAME
     try:
@@ -294,9 +533,9 @@ def _link_points_at(path: Path, target: Path) -> bool:
         return False
 
 
-def _place_symlink(path: Path, target: Path):
+def _place_symlink(path: Path, target: Path, root: Path):
     """Create a relative symlink. On failure the existing node is left in place."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    _prepare_parent(root, path)
     relative = os.path.relpath(str(target), str(path.parent))
     temporary = path.parent / f".{path.name}.{os.getpid()}.link"
     if temporary.is_symlink() or temporary.exists():
@@ -351,8 +590,32 @@ def _blocked_rows(states):
         elif state == "missing":
             rows.append(_row("none", "absent"))
         else:
-            rows.append(_row("none", "unchanged"))
+            rows.append(_row("none", "skipped"))
     return rows
+
+
+def _bind_slots(slots):
+    """Attach a resolved root and a safe slot path. Report the lexical path."""
+    bound = []
+    escaped = False
+    for slot in slots:
+        root, safe, bad = _locate_slot(slot)
+        copied = dict(slot)
+        copied["root"] = root
+        copied["safe"] = safe
+        if bad:
+            escaped = True
+        bound.append(copied)
+    if not escaped:
+        safe_by_agent = {slot["agent"]: slot["safe"] for slot in bound}
+        for slot in bound:
+            if slot["link"]:
+                slot["link_target"] = safe_by_agent.get("codex")
+    return bound, escaped
+
+
+def _refused(slots):
+    return _result("refused", slots, [_row("none", "refused") for _slot in slots], installed=False)
 
 
 def _dispatch(slots, source, approve, log, operation):
@@ -361,7 +624,15 @@ def _dispatch(slots, source, approve, log, operation):
         log.deny("skill-install", _APPROVAL_DETAIL)
         rows = [_row("none", "approval_required") for _planned in slots]
         return _result("approval_required", slots, rows, installed=False)
-    states = [_classify(slot["path"]) for slot in slots]
+    slots, escaped = _bind_slots(slots)
+    if escaped:
+        return _refused(slots)
+    if operation != "uninstall":
+        try:
+            _assert_tree_copyable(Path(source))
+        except _TreeRefused:
+            return _refused(slots)
+    states = [_classify(slot["safe"]) for slot in slots]
     if any(state == "foreign" for state in states):
         return _result("refused", slots, _blocked_rows(states), installed=False)
     if operation == "update" and any(state == "missing" for state in states):
@@ -389,7 +660,8 @@ def _write(slots, states, source: Path, log):
 
 
 def _install_copy(slot, source: Path, state, log):
-    path = slot["path"]
+    path = slot["safe"]
+    root = slot["root"]
     if _same_node(source, path):
         # This slot is the package being copied. Codex is planned first, so an
         # --agent all install has already copied this tree. Do not delete it.
@@ -401,17 +673,18 @@ def _install_copy(slot, source: Path, state, log):
         _succeed(log, method, source, path, "unchanged")
         return _row(method, "unchanged")
     if state == "missing":
-        path.parent.mkdir(parents=True, exist_ok=True)
+        _prepare_parent(root, path)
         _copy_tree(source, path)
         _succeed(log, "copy", source, path, "installed")
         return _row("copy", "installed")
-    _replace_tree(source, path)
+    _replace_tree(source, path, root)
     _succeed(log, "copy", source, path, "updated")
     return _row("copy", "updated")
 
 
 def _install_link(slot, source: Path, state, log):
-    path = slot["path"]
+    path = slot["safe"]
+    root = slot["root"]
     target = Path(slot["link_target"])
     if _same_node(source, path):
         method = "symlink" if path.is_symlink() else "copy"
@@ -424,13 +697,13 @@ def _install_link(slot, source: Path, state, log):
         _succeed(log, "copy", source, path, "unchanged")
         return _row("copy", "unchanged")
     try:
-        _place_symlink(path, target)
+        _place_symlink(path, target, root)
     except OSError:
-        read_from = target if target.is_dir() else source
+        read_from = target if target.is_dir() and not target.is_symlink() else source
         if path.is_symlink() or path.exists():
-            _replace_tree(read_from, path)
+            _replace_tree(read_from, path, root)
         else:
-            path.parent.mkdir(parents=True, exist_ok=True)
+            _prepare_parent(root, path)
             _copy_tree(read_from, path)
         status = "installed" if state == "missing" else "updated"
         _succeed(log, "copy", read_from, path, status)
@@ -447,7 +720,7 @@ def _uninstall(slots, states):
         if state == "missing":
             rows.append(_row("none", "absent"))
             continue
-        path = slot["path"]
+        path = slot["safe"]
         if path.is_symlink():
             path.unlink()
             rows.append(_row("symlink", "removed"))

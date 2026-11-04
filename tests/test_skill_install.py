@@ -546,6 +546,218 @@ class SkillInstallTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             auditor.audit(repo, skill_root=SKILL, output_dir=repo / "inside")
 
+    def test_ancestor_symlink_refuses_missing_slot(self):
+        outside = self.tmp / "outside-tree"
+        outside.mkdir()
+        (outside / "marker.txt").write_text("keep", encoding="utf-8")
+        for agent, link in {
+            "cursor": self.root / ".cursor",
+            "claude": self.root / ".claude",
+            "codex": self.root / ".agents",
+        }.items():
+            link.symlink_to(outside, target_is_directory=True)
+            completed = self.run_cli("install", "--agent", agent, "--target", str(self.root), "--approve")
+            self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+            self.assertEqual(self.parse(completed)[0], "refused")
+            self.assertEqual((outside / "marker.txt").read_text(encoding="utf-8"), "keep")
+            self.assertFalse((outside / "skills").exists())
+            link.unlink()
+        (self.root / ".cursor").mkdir()
+        (self.root / ".cursor" / "skills").symlink_to(outside, target_is_directory=True)
+        completed = self.run_cli("install", "--agent", "all", "--target", str(self.root), "--approve")
+        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+        self.assertEqual(self.parse(completed)[0], "refused")
+        self.assertFalse((outside / NAME).exists())
+        self.assertFalse((self.root / ".agents").exists())
+        self.assertFalse((self.root / ".claude").exists())
+        self.assertEqual((outside / "marker.txt").read_text(encoding="utf-8"), "keep")
+
+    def test_ancestor_symlink_refuses_existing_skill(self):
+        outside = self.tmp / "outside-home"
+        real = outside / "skills" / NAME
+        shutil.copytree(SKILL, real, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        marker = real / "config" / "metrics.yaml"
+        before = marker.read_bytes()
+        (self.root / ".cursor").symlink_to(outside, target_is_directory=True)
+        for command in ("install", "update", "uninstall"):
+            completed = self.run_cli(command, "--target", str(self.root), "--approve")
+            self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+            self.assertEqual(self.parse(completed)[0], "refused")
+            self.assertEqual(marker.read_bytes(), before)
+            self.assertTrue((real / "scripts" / "auditor.py").is_file())
+        (self.root / ".cursor").unlink()
+        (self.root / ".cursor").mkdir()
+        skills = self.tmp / "real-skills"
+        skills.mkdir()
+        moved = skills / NAME
+        real.rename(moved)
+        (self.root / ".cursor" / "skills").symlink_to(skills, target_is_directory=True)
+        for command in ("install", "update", "uninstall"):
+            completed = self.run_cli(command, "--target", str(self.root), "--approve")
+            self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+            self.assertEqual(self.parse(completed)[0], "refused")
+            self.assertEqual((moved / "config" / "metrics.yaml").read_bytes(), before)
+            self.assertTrue((moved / "SKILL.md").is_file())
+
+    def test_operator_root_symlink_prefix_is_resolved(self):
+        real = self.tmp / "private-tmp"
+        real.mkdir()
+        alias = self.tmp / "tmp-alias"
+        alias.symlink_to(real, target_is_directory=True)
+        target = alias / "proj"
+        completed = self.run_cli("install", "--target", str(target), "--approve")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        slot = real / "proj" / ".cursor" / "skills" / NAME
+        self.assertTrue((slot / "config" / "metrics.yaml").is_file())
+        self.assertTrue((target / ".cursor" / "skills" / NAME / "scripts" / "auditor.py").is_file())
+
+    def test_destination_parent_symlink_is_refused(self):
+        outside = self.tmp / "outside-dest"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("keep", encoding="utf-8")
+        parent = self.root / "custom"
+        parent.symlink_to(outside, target_is_directory=True)
+        destination = parent / NAME
+        for command in ("install", "update", "uninstall"):
+            completed = self.run_cli(
+                command,
+                "--agent",
+                "claude",
+                "--target",
+                str(self.root),
+                "--destination",
+                str(destination),
+                "--approve",
+            )
+            self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+            self.assertEqual(self.parse(completed)[0], "refused")
+            self.assertFalse((outside / NAME).exists())
+            self.assertEqual((outside / "secret.txt").read_text(encoding="utf-8"), "keep")
+            self.assertFalse((self.root / ".claude").exists())
+
+    def test_source_symlink_is_not_followed(self):
+        outside = self.tmp / "outside-secret.txt"
+        outside.write_text("SECRET-BYTES", encoding="utf-8")
+        source = self.tmp / "source-skill"
+        shutil.copytree(SKILL, source, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        (source / "leak.txt").symlink_to(outside)
+        refused = install_agents(self.root, source, approve=True)
+        self.assertEqual(refused["status"], "refused")
+        self.assertFalse(refused["installed"])
+        self.assertFalse(self.slot("cursor").exists())
+        leaked = [
+            path
+            for path in self.root.rglob("*")
+            if path.is_file() and not path.is_symlink() and b"SECRET-BYTES" in path.read_bytes()
+        ]
+        self.assertEqual(leaked, [])
+
+        source_dir = self.tmp / "source-dirlink"
+        shutil.copytree(SKILL, source_dir, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        outside_dir = self.tmp / "outside-dir"
+        outside_dir.mkdir()
+        (outside_dir / "hidden.txt").write_text("HIDDEN-DIR", encoding="utf-8")
+        (source_dir / "sub").symlink_to(outside_dir, target_is_directory=True)
+        refused_dir = install_agents(self.root, source_dir, approve=True)
+        self.assertEqual(refused_dir["status"], "refused")
+        self.assertFalse(self.slot("cursor").exists())
+        self.assertFalse(any(path.name == "hidden.txt" for path in self.root.rglob("*")))
+        self.assertEqual((outside_dir / "hidden.txt").read_text(encoding="utf-8"), "HIDDEN-DIR")
+
+        inside = self.tmp / "source-inside"
+        shutil.copytree(SKILL, inside, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+        (inside / "README.link").symlink_to("SKILL.md")
+        installed = install_agents(self.root, inside, approve=True)
+        self.assertEqual(installed["status"], "installed")
+        link = self.slot("cursor") / "README.link"
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(os.readlink(link), "SKILL.md")
+        self.assertEqual(link.resolve(), (self.slot("cursor") / "SKILL.md").resolve())
+
+    def test_reinstall_replaces_extra_directory_symlink(self):
+        installed = install_skill(self.root, SKILL, approve=True)
+        self.assertTrue(installed["installed"])
+        slot = self.slot("cursor")
+        outside = self.tmp / "linked-outside"
+        outside.mkdir()
+        (outside / "secret.txt").write_text("keep-secret", encoding="utf-8")
+        (slot / "linked-dir").symlink_to(outside, target_is_directory=True)
+        completed = self.run_cli("install", "--target", str(self.root), "--approve")
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(self.parse(completed)[0], "updated")
+        self.assertFalse(os.path.lexists(slot / "linked-dir"))
+        self.assertEqual((outside / "secret.txt").read_text(encoding="utf-8"), "keep-secret")
+        self.assertEqual((slot / "SKILL.md").read_bytes(), (SKILL / "SKILL.md").read_bytes())
+
+    def test_uninstall_refused_on_foreign_occupant(self):
+        slot = self.slot("cursor")
+        slot.mkdir(parents=True)
+        kept = slot / "keep.txt"
+        kept.write_bytes(b"foreign-bytes")
+        completed = self.run_cli("uninstall", "--target", str(self.root), "--approve")
+        self.assertEqual(completed.returncode, 1, completed.stdout + completed.stderr)
+        status, rows = self.parse(completed)
+        self.assertEqual(status, "refused")
+        self.assertEqual(rows[0]["status"], "refused")
+        self.assertEqual(rows[0]["method"], "none")
+        self.assertEqual(kept.read_bytes(), b"foreign-bytes")
+
+    def test_blocked_rows_are_skipped(self):
+        installed = self.run_cli("install", "--target", str(self.root), "--approve")
+        self.assertEqual(installed.returncode, 0, installed.stderr)
+        metrics = (self.slot("cursor") / "config" / "metrics.yaml").read_bytes()
+        updated = self.run_cli("update", "--agent", "all", "--target", str(self.root), "--approve")
+        self.assertEqual(updated.returncode, 1, updated.stdout + updated.stderr)
+        status, rows = self.parse(updated)
+        self.assertEqual(status, "absent")
+        by_agent = {row["agent"]: row for row in rows}
+        self.assertEqual(by_agent["cursor"]["status"], "skipped")
+        self.assertEqual(by_agent["cursor"]["method"], "none")
+        self.assertEqual(by_agent["codex"]["status"], "absent")
+        self.assertEqual(by_agent["claude"]["status"], "absent")
+        self.assertFalse(self.slot("codex").exists())
+        self.assertEqual((self.slot("cursor") / "config" / "metrics.yaml").read_bytes(), metrics)
+
+        foreign = self.slot("claude")
+        foreign.parent.mkdir(parents=True)
+        foreign.write_text("not-the-skill", encoding="utf-8")
+        refused = self.run_cli("install", "--agent", "all", "--target", str(self.root), "--approve")
+        self.assertEqual(refused.returncode, 1, refused.stdout + refused.stderr)
+        status, rows = self.parse(refused)
+        self.assertEqual(status, "refused")
+        by_agent = {row["agent"]: row for row in rows}
+        self.assertEqual(by_agent["claude"]["status"], "refused")
+        self.assertEqual(by_agent["cursor"]["status"], "skipped")
+        self.assertEqual(by_agent["codex"]["status"], "absent")
+        self.assertEqual(foreign.read_text(encoding="utf-8"), "not-the-skill")
+        self.assertEqual((self.slot("cursor") / "config" / "metrics.yaml").read_bytes(), metrics)
+        self.assertFalse(self.slot("codex").exists())
+
+    def test_global_scope_installs_under_the_given_target(self):
+        home = self.tmp / "fake-home"
+        completed = self.run_cli(
+            "install",
+            "--scope",
+            "global",
+            "--target",
+            str(home),
+            "--agent",
+            "cursor",
+            "--approve",
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        status, rows = self.parse(completed)
+        self.assertEqual(status, "installed")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["scope"], "global")
+        self.assertEqual(rows[0]["agent"], "cursor")
+        slot = home / ".cursor" / "skills" / NAME
+        self.assertEqual(Path(rows[0]["path"]), slot)
+        self.assertTrue((slot / "config" / "metrics.yaml").is_file())
+        self.assertTrue(str(Path(rows[0]["path"]).resolve()).startswith(str(home.resolve())))
+        self.assertFalse((home / ".claude").exists())
+        self.assertFalse((home / ".agents").exists())
+
 
 def _normalize(report):
     findings = []
