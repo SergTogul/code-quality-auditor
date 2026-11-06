@@ -660,12 +660,50 @@ def _dispatch(slots, source, approve, log, operation):
 
 
 def _write(slots, states, source: Path, log):
+    """Apply all slots as one transaction; restore existing installs on failure."""
+    backups = []
+    changed = []
     rows = []
-    for slot, state in zip(slots, states):
-        if slot["link"]:
-            rows.append(_install_link(slot, source, state, log))
-        else:
-            rows.append(_install_copy(slot, source, state, log))
+    try:
+        for slot, state in zip(slots, states):
+            path = slot["safe"]
+            # The source itself must never be renamed or staged for replacement.
+            same_source = _same_node(source, path)
+            if state == "ours" and not same_source:
+                _prepare_parent(slot["root"], path)
+                backup_root = Path(tempfile.mkdtemp(prefix=".cqa-rollback-", dir=path.parent))
+                backup = backup_root / "original"
+                try:
+                    if path.is_symlink():
+                        os.symlink(os.readlink(path), backup)
+                    else:
+                        shutil.copytree(path, backup, symlinks=True)
+                except Exception:
+                    shutil.rmtree(backup_root)
+                    raise
+                backups.append((path, backup_root, backup))
+            if slot["link"]:
+                method, status = _install_link(slot, source, state, log)
+            else:
+                method, status = _install_copy(slot, source, state, log)
+            rows.append((method, status))
+            if status != "unchanged":
+                changed.append(path)
+    except Exception as exc:
+        for path in reversed(changed):
+            _discard_node(path)
+        for path, backup_root, backup in reversed(backups):
+            _discard_node(path)
+            if backup.is_symlink() or backup.exists():
+                backup.rename(path)
+        for _path, backup_root, _backup in backups:
+            if backup_root.exists():
+                shutil.rmtree(backup_root)
+        raise RuntimeError("multi-agent installation failed; prior slots restored") from exc
+    finally:
+        for _path, backup_root, _backup in backups:
+            if backup_root.exists():
+                shutil.rmtree(backup_root)
     statuses = [status for _method, status in rows]
     if "updated" in statuses:
         overall = "updated"
