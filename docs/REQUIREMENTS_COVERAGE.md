@@ -20,7 +20,7 @@ A requirement is `verified` when a passing acceptance test names that ID and ass
 
 ## Acceptance run (14.10)
 
-Command: `.venv/bin/python .cursor/skills/code-quality-auditor/scripts/auditor.py audit --repo /Users/user/Desktop/src/quantlineage --profile full --allow-tools --allow-repo-execution --sandbox-confirmed --history "$HOME/.code-quality-auditor/history/quantlineage.csv"`
+Command: `.venv/bin/python .agents/skills/code-quality-auditor/scripts/auditor.py audit --repo /Users/user/Desktop/src/quantlineage --profile full --allow-tools --allow-repo-execution --sandbox-confirmed --history "$HOME/.code-quality-auditor/history/quantlineage.csv"`
 
 Repository: `https://github.com/SergTogul/quantlineage`, revision `ba664b203688c83ea393c10fbb4dfce91e9c3d38` (206 commits). The skill scripts do not mention this repository.
 
