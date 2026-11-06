@@ -635,6 +635,31 @@ class SkillInstallTests(unittest.TestCase):
             self.assertEqual((outside / "secret.txt").read_text(encoding="utf-8"), "keep")
             self.assertFalse((self.root / ".claude").exists())
 
+    def test_multi_agent_failure_rolls_back_existing_installations(self):
+        from cqa import skill_install
+
+        first = install_agents(self.root, SKILL, agent="all", approve=True)
+        self.assertTrue(first["installed"], first)
+        before = self.snapshot()
+        updated_source = self.tmp / "new-source"
+        shutil.copytree(SKILL, updated_source)
+        (updated_source / "SKILL.md").write_text(
+            (updated_source / "SKILL.md").read_text(encoding="utf-8") + "\\n# update\\n",
+            encoding="utf-8",
+        )
+        with mock.patch.object(skill_install, "_install_link", side_effect=OSError("simulated link failure")):
+            with self.assertRaises(RuntimeError):
+                install_agents(self.root, updated_source, agent="all", approve=True)
+        self.assertEqual(self.snapshot(), before)
+
+    def test_absolute_source_symlink_is_refused_without_modifying_slot(self):
+        source = self.tmp / "absolute-source"
+        shutil.copytree(SKILL, source)
+        (source / "absolute.link").symlink_to(source / "SKILL.md")
+        result = install_agents(self.root, source, approve=True)
+        self.assertEqual(result["status"], "refused")
+        self.assertFalse(self.slot("cursor").exists())
+
     def test_source_symlink_is_not_followed(self):
         outside = self.tmp / "outside-secret.txt"
         outside.write_text("SECRET-BYTES", encoding="utf-8")
