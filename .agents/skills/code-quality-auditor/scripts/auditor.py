@@ -137,8 +137,8 @@ def _run_skill_command(args):
                 destination=args.destination,
                 approve=args.approve,
             )
-    except ValueError as exc:
-        print(exc, file=sys.stderr)
+    except (ValueError, RuntimeError, OSError) as exc:
+        print(f"skill operation failed: {exc}", file=sys.stderr)
         return 2
     _print_skill_result(result)
     return _skill_exit(args.command, result["status"])
