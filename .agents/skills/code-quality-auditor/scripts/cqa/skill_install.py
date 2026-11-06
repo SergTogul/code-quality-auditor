@@ -26,7 +26,8 @@ _AGENTS = ("cursor", "claude", "codex", "all")
 _SCOPES = ("project", "global")
 _ALL_ORDER = ("codex", "cursor", "claude")
 _APPROVAL_DETAIL = "skill installation needs explicit approval"
-_DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+_SAFE_DIR_FLAGS_AVAILABLE = all(hasattr(os, name) for name in ('O_DIRECTORY', 'O_NOFOLLOW'))
+_DIR_FLAGS = os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0) | getattr(os, 'O_NOFOLLOW', 0)
 if hasattr(os, "O_CLOEXEC"):
     _DIR_FLAGS |= os.O_CLOEXEC
 
@@ -151,6 +152,8 @@ def _regular_file(path: Path) -> bool:
 
 def _frontmatter_name(path: Path):
     try:
+        if not hasattr(os, 'O_NOFOLLOW'):
+            return None
         flags = os.O_RDONLY | os.O_NOFOLLOW
         if hasattr(os, "O_CLOEXEC"):
             flags |= os.O_CLOEXEC
@@ -462,7 +465,11 @@ def _copy_children(src: Path, dst: Path, source_root: Path):
         if stat.S_ISLNK(info.st_mode):
             if not _link_stays_inside(src_child, source_root):
                 raise _TreeRefused(src_child)
-            os.symlink(os.readlink(src_child), dst_child)
+            raw = os.readlink(src_child)
+            if os.path.isabs(raw):
+                # Absolute links would point back to the source after installation.
+                raise _TreeRefused(src_child)
+            os.symlink(raw, dst_child)
             continue
         if stat.S_ISDIR(info.st_mode):
             if name == "__pycache__":
@@ -534,23 +541,31 @@ def _link_points_at(path: Path, target: Path) -> bool:
 
 
 def _place_symlink(path: Path, target: Path, root: Path):
-    """Create a relative symlink. On failure the existing node is left in place."""
+    """Install a relative link, restoring the prior node if replacement fails."""
     _prepare_parent(root, path)
     relative = os.path.relpath(str(target), str(path.parent))
     temporary = path.parent / f".{path.name}.{os.getpid()}.link"
     if temporary.is_symlink() or temporary.exists():
-        temporary.unlink()
+        raise FileExistsError(temporary)
     os.symlink(relative, temporary)
+    backup_root = None
     try:
         if path.is_symlink() or path.exists():
-            _discard_node(path)
-        temporary.rename(path)
-    except Exception:
-        if not (path.exists() or path.is_symlink()) and temporary.is_symlink():
+            backup_root = Path(tempfile.mkdtemp(prefix=".cqa-old-link-", dir=path.parent))
+            path.rename(backup_root / "old")
+        try:
             temporary.rename(path)
-        elif temporary.is_symlink() or temporary.exists():
+        except Exception:
+            if backup_root is not None:
+                (backup_root / "old").rename(path)
+            raise
+        if backup_root is not None:
+            _discard_node(backup_root / "old")
+    finally:
+        if temporary.is_symlink() or temporary.exists():
             temporary.unlink()
-        raise
+        if backup_root is not None and backup_root.exists():
+            shutil.rmtree(backup_root)
 
 
 def _succeed(log, method, source, dest, status):
@@ -624,6 +639,8 @@ def _dispatch(slots, source, approve, log, operation):
         log.deny("skill-install", _APPROVAL_DETAIL)
         rows = [_row("none", "approval_required") for _planned in slots]
         return _result("approval_required", slots, rows, installed=False)
+    if not _SAFE_DIR_FLAGS_AVAILABLE:
+        return _refused(slots)
     slots, escaped = _bind_slots(slots)
     if escaped:
         return _refused(slots)
