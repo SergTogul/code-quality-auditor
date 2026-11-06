@@ -426,7 +426,7 @@ def _assert_children(directory: Path, source_root: Path):
         path = directory / name
         info = path.lstat()
         if stat.S_ISLNK(info.st_mode):
-            if not _link_stays_inside(path, source_root):
+            if os.path.isabs(os.readlink(path)) or not _link_stays_inside(path, source_root):
                 raise _TreeRefused(path)
             continue
         if stat.S_ISDIR(info.st_mode):
