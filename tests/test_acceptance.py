@@ -21,7 +21,7 @@ from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-SKILL = ROOT / ".cursor" / "skills" / "code-quality-auditor"
+SKILL = ROOT / ".agents" / "skills" / "code-quality-auditor"
 SCRIPT = SKILL / "scripts" / "auditor.py"
 sys.path.insert(0, str(SKILL / "scripts"))
 
@@ -67,6 +67,9 @@ class AcceptanceTests(unittest.TestCase):
         """Requirements: 1.1, 1.3, 1.4, 13.1, 13.5."""
         text = (SKILL / "SKILL.md").read_text(encoding="utf-8")
         self.assertIn("name: code-quality-auditor", text)
+        self.assertNotIn(".cursor/skills/code-quality-auditor/scripts/auditor.py", text)
+        self.assertIn("scripts/auditor.py", text)
+        self.assertIn("host project", text)
         self.assertIn("/code-quality-auditor", text)
         self.assertIn("full", text)
         self.assertIn("natural-language", text.lower())

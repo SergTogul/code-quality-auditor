@@ -30,7 +30,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-SKILL = ROOT / ".cursor" / "skills" / "code-quality-auditor"
+SKILL = ROOT / ".agents" / "skills" / "code-quality-auditor"
 sys.path.insert(0, str(SKILL / "scripts"))
 
 spec = importlib.util.spec_from_file_location("auditor", SKILL / "scripts" / "auditor.py")

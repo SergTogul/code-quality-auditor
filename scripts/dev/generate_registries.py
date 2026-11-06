@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Regenerate the authoritative YAML registries from the agreed metric set.
 
-The files under `.cursor/skills/code-quality-auditor/config/` are what the
+The files under `.agents/skills/code-quality-auditor/config/` are what the
 engine loads. This script only rewrites them so the 112 metrics stay aligned
 with the check map. Do not treat this script as a second runtime catalog.
 """
@@ -12,7 +12,7 @@ import json
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-SKILL = ROOT / ".cursor" / "skills" / "code-quality-auditor"
+SKILL = ROOT / ".agents" / "skills" / "code-quality-auditor"
 CONFIG = SKILL / "config"
 REF = SKILL / "references"
 

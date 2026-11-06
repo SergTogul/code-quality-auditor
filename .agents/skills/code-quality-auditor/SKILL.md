@@ -2,23 +2,25 @@
 name: code-quality-auditor
 description: >-
   Audit a repository's code quality with the universal code-quality-auditor
-  skill. Use when the user invokes /code-quality-auditor, asks for a quality
-  audit, dead-code or duplication analysis, security or coverage review,
-  mutation or requirements tracing, or repository initialization for quality
-  checks. Supports profiles full, fast, expensive, pr-review, security, and
+  skill. Use when the user invokes /code-quality-auditor (Cursor or Claude
+  Code) or $code-quality-auditor (Codex), asks for a quality audit, dead-code
+  or duplication analysis, security or coverage review, mutation or
+  requirements tracing, or repository initialization for quality checks.
+  Supports profiles full, fast, expensive, pr-review, security, and
   user-defined profiles.
 ---
 
 # Code Quality Auditor
 
-Invoke as `/code-quality-auditor [profile]`. When the profile is omitted, use `full`. Natural-language requests such as "audit this repository", "run the quality auditor", "initialize code quality", and "explain the fast profile" use this skill.
+Invoke as `/code-quality-auditor [profile]` on Cursor and Claude Code, or `$code-quality-auditor [profile]` on Codex. When the profile is omitted, use `full`. Natural-language requests such as "audit this repository", "run the quality auditor", "initialize code quality", and "explain the fast profile" use this skill.
 
-The internal runner is `.cursor/skills/code-quality-auditor/scripts/auditor.py`. Reports, catalogs, and the DAG stay behind this skill. Do not ask the user to drive a standalone product.
+Run `scripts/auditor.py` from the directory that contains this file. That directory is the engine location. Pass `--repo` as the host project, not as this skill directory, unless the user explicitly asks to audit the skill package (`--allow-skill-target`). Reports, catalogs, and the DAG stay behind this skill. Do not ask the user to drive a standalone product. Reports stay outside the host project unless the user explicitly asks for in-repo reports.
 
 ## Safety defaults
 
 - Inspect source read-only. Do not modify the repository, install runtimes, or install analyzers unless the user explicitly approves that action.
 - Do not infer installation approval from `/code-quality-auditor init`.
+- `install`, `update`, and `uninstall` do not approve external analyzers or repository execution. Those still require `--allow-tools` or both `--allow-repo-execution` and `--sandbox-confirmed` on an audit, and only when the user approves that run.
 - External analyzers require `--allow-tools` and must already be installed outside the audited repository. The tool registry does not authorize a download.
 - An approved host analyzer is eligible to run, not trusted to run unsandboxed: it reads repository-controlled content, so it always runs under containment. Repository executables, plugins, and executable analyzer configuration are never treated as host analyzers.
 - Repository tests, mutation, benchmarks, and build scripts are untrusted. Run them only with both `--allow-repo-execution` and `--sandbox-confirmed`, and only when containment actually applies.
@@ -34,11 +36,11 @@ The internal runner is `.cursor/skills/code-quality-auditor/scripts/auditor.py`.
 
 ## Commands
 
-From the skill directory, the host agent runs:
+From the directory that contains this file, the host agent runs:
 
-- `python scripts/auditor.py audit --repo <path> --profile <name>`
-- `python scripts/auditor.py init --repo <path>` and, only after approval, `--approve-write`
-- `python scripts/auditor.py install --target <project>` only after approval with `--approve`
+- `python scripts/auditor.py audit --repo <host-project> --profile <fast|full|expensive|pr-review|security>`
+- `python scripts/auditor.py init --repo <host-project>` and, only after approval, `--approve-write`
+- `python scripts/auditor.py install|update|uninstall --agent <cursor|claude|codex|all> --scope <project|global> --target <root>` and, only after approval, `--approve`
 - `python scripts/auditor.py profiles --config <quality-auditor.yaml> list|explain|create|edit|delete`
 - `python scripts/auditor.py checks`
 - `python scripts/auditor.py explain-profile --profile <name>`

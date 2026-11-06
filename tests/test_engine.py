@@ -1,7 +1,7 @@
 import importlib.util, tempfile, unittest
 from pathlib import Path
 import yaml
-SCRIPT=Path(__file__).resolve().parents[1]/'.cursor/skills/code-quality-auditor/scripts/auditor.py'
+SCRIPT=Path(__file__).resolve().parents[1]/'.agents/skills/code-quality-auditor/scripts/auditor.py'
 spec=importlib.util.spec_from_file_location('auditor',SCRIPT);a=importlib.util.module_from_spec(spec);spec.loader.exec_module(a)
 class AuditorTests(unittest.TestCase):
  def setUp(self):
