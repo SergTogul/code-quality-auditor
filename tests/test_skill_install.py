@@ -647,7 +647,7 @@ class SkillInstallTests(unittest.TestCase):
             (updated_source / "SKILL.md").read_text(encoding="utf-8") + "\\n# update\\n",
             encoding="utf-8",
         )
-        with mock.patch.object(skill_install, "_install_link", side_effect=OSError("simulated link failure")):
+        with mock.patch.object(skill_install, "_install_link", side_effect=RuntimeError("simulated link failure")):
             with self.assertRaises(RuntimeError):
                 install_agents(self.root, updated_source, agent="all", approve=True)
         self.assertEqual(self.snapshot(), before)
