@@ -30,4 +30,4 @@ Custom wrappers, including `CQA_SANDBOX_CMD`, cannot authorize containment. A sa
 
 A confirmed blocking breach includes repository revision, location, source check/metric, observation, analysis tool, profile/configuration hash, and evidence reference. Reports are written outside the audited repository by default. Unmeasured values are not synthesized, and suggestions are not represented as applied changes.
 
-For security and native integration work, check [issue #10](https://github.com/SergTogul/code-quality-auditor/issues/10). See [requirements coverage](REQUIREMENTS_COVERAGE.md) for documented implementation status.
+For security and native integration work, check [issue #10](https://github.com/SergTogul/code-quality-auditor/issues/10).

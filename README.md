@@ -129,7 +129,5 @@ CI runs Linux tests on supported Python versions and reports skipped platform-de
 - [Installation, upgrades, and agent-specific paths](docs/INSTALLATION.md)
 - [Profiles, YAML configuration, and metric registries](docs/CONFIGURATION.md)
 - [Security model and known limitations](docs/SECURITY.md)
-- [Requirements coverage](docs/REQUIREMENTS_COVERAGE.md)
-- [Requirements v1.1](docs/requirements-v1.1.docx)
 
 **Scope and honesty:** The 112 metrics are *registered*, not a guarantee that every metric can be measured on every repository. Missing data, unsupported platforms, or unapproved execution are surfaced in the report rather than presented as successful checks.
