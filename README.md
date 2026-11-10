@@ -1,84 +1,133 @@
 # Code Quality Auditor
 
-One skill package, `.agents/skills/code-quality-auditor/`, is the engine. Cursor, Claude Code, and Codex install that same tree. The YAML registries live only there: `config/metrics.yaml` (112 metrics), `config/checks.yaml`, `config/tools.yaml`, `config/policy.yaml`, `config/schema.yaml`, and `quality-auditor.yaml`.
+**Evidence-driven code quality auditing for Cursor, Claude Code, and Codex.**
 
-This repository includes metric-to-check mapping, registered tool capabilities, user profiles, a safe DAG runner, a cross-language code graph, reporting, and CSV history. Quantitative risk checks run when the source declares those calculations. No repository name is special-cased. For complete security and correctness testing, grant explicit approval and provide approved analyzer environments; unavailable checks are never called PASS.
+Code Quality Auditor is a reusable agent skill backed by a Python analysis engine. It evaluates repositories against **112 registered metrics** using configurable checks, source-code evidence, and a dependency-aware execution plan. It helps identify quality risks while distinguishing *confirmed failures* from *checks that could not be completed*.
 
-Run the commands below from the directory that contains `SKILL.md`. `--repo` is the host project. Installing does not approve analyzers or repository execution. Without `--approve`, the command prints `approval_required`, exits 0, and writes nothing.
+- **Languages:** Python, JavaScript, TypeScript, and C++ (depth varies by language and available analyzers).
+- **Checks:** syntax, architecture, maintainability, dependency and dead-code analysis, security, tests, coverage, duplication, requirements traceability, and selected quantitative-risk calculations.
+- **Outputs:** JSON, Markdown, HTML, and optional CSV history.
+- **Principle:** missing required evidence is **INCOMPLETE**, never silently PASS.
 
-## Install
+> **Execution limits:** By default, the skill reads source without running repository code or external analyzers. Those actions require explicit approval and working containment. The current containment implementation is macOS-only, with native enforcement still under verification. See [Security and limitations](docs/SECURITY.md).
 
-Cursor project slot (the default, and the same destination earlier releases used):
+## Quick start
+
+**Prerequisite:** Python 3.12+.
+
+1. Clone this repository and enter the canonical skill directory:
+
+   ```bash
+   git clone https://github.com/SergTogul/code-quality-auditor.git
+   cd code-quality-auditor/.agents/skills/code-quality-auditor
+   ```
+
+2. Install the skill in your target project (choose **one** agent):
+
+   ```bash
+   # Cursor (default project installation)
+   python scripts/auditor.py install --target /path/to/project --approve
+
+   # Or Claude Code
+   python scripts/auditor.py install --agent claude --scope project --target /path/to/project --approve
+
+   # Or Codex
+   python scripts/auditor.py install --agent codex --scope project --target /path/to/project --approve
+   ```
+
+3. Open the target project in the agent and invoke:
+
+   | Agent | Skill invocation |
+   | --- | --- |
+   | Cursor | `/code-quality-auditor fast` |
+   | Claude Code | `/code-quality-auditor fast` |
+   | Codex | `$code-quality-auditor fast` |
+
+   Omit the profile to select `full`. Skill discovery depends on the agent's supported skill paths; see [Installation and migration](docs/INSTALLATION.md).
+
+**Direct engine invocation** (for development or diagnostics, from the skill directory):
 
 ```bash
-python scripts/auditor.py install --target /path/to/project --approve
+python scripts/auditor.py audit --repo /path/to/project --profile fast
 ```
 
-That writes `/path/to/project/.cursor/skills/code-quality-auditor/` and does not create `.claude` or `.agents`.
+The command prints the overall decision and JSON report path; other report formats are written alongside it. By default, output is outside the audited repository. A non-PASS decision gives a nonzero command exit status. Built-in static analysis can run without permitting arbitrary project execution.
 
-Claude Code, project:
+## What you get
+
+The result includes selected metrics, measured values where available, source-linked findings, execution limitations, and a consolidated decision.
+
+| Decision | Meaning |
+| --- | --- |
+| `PASS` | No confirmed blocking breach among the **selected and evaluated** checks |
+| `FAIL` | At least one blocking metric breaches its threshold |
+| `INCOMPLETE` | Mandatory evidence is unavailable, erroneous, or inconclusive |
+
+For each confirmed blocking finding, the engine records source location, check and metric IDs, tool, revision, profile, configuration hash, observation, and evidence pointer.
+
+**Example of how to inspect a generated report** (not a claimed audit result):
 
 ```bash
-python scripts/auditor.py install --agent claude --scope project --target /path/to/project --approve
+python scripts/auditor.py audit --repo /path/to/project --profile fast --out /tmp/cqa-report
+python -m json.tool /tmp/cqa-report/report.json
 ```
 
-Codex, project:
+The JSON includes a `decision`, `metrics`, `findings`, and `execution` details. Check actual output for measurements and `UNAVAILABLE` or `SKIPPED` statuses; no example counts are invented here.
 
-```bash
-python scripts/auditor.py install --agent codex --scope project --target /path/to/project --approve
+## Choose a profile
+
+| Profile | Intended use | Important behavior |
+| --- | --- | --- |
+| `fast` | Feedback during development | Changed-code scope; excludes mutation testing, semantic duplication, and performance benchmarks |
+| `full` | Default repository assessment | All registered checks selected, subject to applicability and execution permissions |
+| `expensive` | Deeper analysis | Larger time budget; includes expensive checks where available and authorized |
+| `pr-review` | Pull request review | Changed-code scope; excludes mutation testing and performance benchmarks |
+| `security` | Security-focused assessment | Selects configured security checks |
+
+Profile selection does not override safety approvals. You can create custom profiles in YAML. For example, extend `fast` to exclude one additional check:
+
+```yaml
+version: 1
+default_profile: fast
+profiles:
+  team-fast:
+    extends: fast
+    exclude:
+      - performance_benchmarks
 ```
 
-All three, project:
+Use `python scripts/auditor.py explain-profile --profile fast` to inspect the effective selection. See [Configuration](docs/CONFIGURATION.md) for the registry and precedence model.
 
-```bash
-python scripts/auditor.py install --agent all --scope project --target /path/to/project --approve
+## How it works
+
+```mermaid
+flowchart TD
+    A[Skill invocation and profile] --> B[YAML configuration and check registry]
+    B --> C[Dependency-aware DAG executor]
+    C --> D[Built-in code and graph analysis]
+    C --> E[Approved, contained analyzers and tests]
+    D --> F[Measurements and source evidence]
+    E --> F
+    F --> G[Metric evaluation and provenance]
+    G --> H[JSON, Markdown, HTML and CSV history]
 ```
 
-`--agent all` writes a real copy at `.agents/skills/code-quality-auditor/`, a real copy at `.cursor/skills/code-quality-auditor/`, and a symlink at `.claude/skills/code-quality-auditor/` (a copy if the symlink cannot be created).
+The single canonical engine lives in `.agents/skills/code-quality-auditor/`. Its registry files are `config/metrics.yaml` (112 metrics), `config/checks.yaml`, `config/tools.yaml`, `config/policy.yaml`, `config/schema.yaml`, and `quality-auditor.yaml`. The DAG coordinates dependencies, concurrency, retries, and timeouts. Check availability depends on the language, environment, approvals, and toolchain.
 
-Global installs use the same relative suffixes. `--target` is the directory standing in for the home directory, shown here as `"$HOME"`:
+## Customize and verify
 
-```bash
-python scripts/auditor.py install --agent cursor --scope global --target "$HOME" --approve
-python scripts/auditor.py install --agent claude --scope global --target "$HOME" --approve
-python scripts/auditor.py install --agent codex --scope global --target "$HOME" --approve
-```
+- List registered checks: `python scripts/auditor.py checks`
+- Validate catalogs and configuration: `python scripts/auditor.py validate`
+- Initialize project configuration (write requires explicit approval): `python scripts/auditor.py init --repo /path/to/project --approve-write`
+- Compare historical runs: `python scripts/auditor.py compare --history /path/to/history.csv --baseline RUN_A --current RUN_B`
+- Run repository tests from the repository root: `python -m unittest discover -s tests -v`
 
-Update and uninstall take the same selector flags:
+CI runs Linux tests on supported Python versions and reports skipped platform-dependent tests explicitly. **Linux CI success is not native macOS sandbox verification.** See [Security and limitations](docs/SECURITY.md) and [macOS integration issue #10](https://github.com/SergTogul/code-quality-auditor/issues/10).
 
-```bash
-python scripts/auditor.py update --agent claude --scope project --target /path/to/project --approve
-python scripts/auditor.py uninstall --agent all --scope project --target /path/to/project --approve
-```
+## Documentation
 
-## Invocation
+- [Installation, upgrades, and agent-specific paths](docs/INSTALLATION.md)
+- [Profiles, YAML configuration, and metric registries](docs/CONFIGURATION.md)
+- [Security model and known limitations](docs/SECURITY.md)
 
-Cursor: `/code-quality-auditor`. Project skills load from `.agents/skills/` and `.cursor/skills/`. User skills load from `~/.agents/skills/` and `~/.cursor/skills/`. See [Cursor skills](https://cursor.com/docs/skills).
-
-Claude Code: `/code-quality-auditor`. Project: `.claude/skills/code-quality-auditor/SKILL.md`. Personal: `~/.claude/skills/code-quality-auditor/SKILL.md`. A skill directory in those locations may be a symlink; Claude loads the target once. See [Claude Code skills](https://code.claude.com/docs/en/skills).
-
-Codex: `$code-quality-auditor` (`/skills` or `$` in the CLI). Project skills load from `$REPO_ROOT/.agents/skills` and ancestors up to the repo root. User skills load from `$HOME/.agents/skills`. Codex follows symlinked skill folders. See [Codex skills](https://learn.chatgpt.com/docs/build-skills.md).
-
-## Migration
-
-An existing `.cursor/skills/code-quality-auditor/` install remains a Cursor slot. To refresh it from this repository, run the default install from `.agents/skills/code-quality-auditor/` with `--target` set to the project root. That replaces this skill's Cursor directory and leaves every other skill where it is. Use `--agent all` when Claude Code and Codex should see the same package: the Codex copy is `.agents/skills/code-quality-auditor/`, and Claude's slot is a symlink to that copy.
-
-## Known limitations
-
-- Claude Code does not document `.agents/skills`. A checkout of this repository is not a Claude install until the Claude slot exists. This was checked against [Claude Code skills](https://code.claude.com/docs/en/skills), which lists `.claude/skills` only.
-- `--agent all` can show the skill twice in Cursor, once from `.agents/skills` and once from `.cursor/skills`. Both directories are documented at [Cursor skills](https://cursor.com/docs/skills).
-- `~/.agents/skills` is not synced to Cursor Cloud Agents. `~/.cursor/skills/` is the documented sync location.
-- Personal Claude skills are not loaded in Cowork or Claude cloud sessions.
-- Codex admin skills live at `/etc/codex/skills`, and `~/.codex/skills` is a legacy path. This installer does not write either one. Codex's documented locations are `$REPO_ROOT/.agents/skills` and `$HOME/.agents/skills` ([Codex skills](https://learn.chatgpt.com/docs/build-skills.md)).
-- Installing does not approve analyzers or repository execution.
-- Native agent discovery was not verified by the presence of a directory. CI does not treat directory layout as native agent invocation. The manual check is: Cursor Customize → Skills, Claude `/code-quality-auditor` after `claude plugin validate`, Codex `$code-quality-auditor` (restart if it does not appear).
-
-## Safety defaults
-The engine only inspects files by default. External analyzers need `--allow-tools`; repository tests and scripts need `--allow-repo-execution` plus `--sandbox-confirmed`. Installation is never automatic. Reports are written outside the audited repository by default.
-
-Approved analyzers and repository code both run only under containment, because analyzers read repository-controlled content. The only supported containment is the root-owned `/usr/bin/sandbox-exec` on macOS. Its profile denies by default and allows scoped reads, writes to one scratch directory, and no network. A probe must show that the profile blocks sibling files and loopback network before anything runs. On Linux and Windows containment is unavailable, so external analyzers and repository execution are reported unavailable while built-in static checks continue. `CQA_SANDBOX_CMD` and other custom wrappers cannot authorize containment, and a containment failure is never retried unsandboxed.
-
-The profile still allows `sysctl-read`, `mach-lookup`, and `ipc-posix*` without filters. These are compatibility exceptions so that macOS processes can start, not least privilege, and `mach-lookup` in particular reaches system services outside the file and network rules. Native enforcement of the profile has not been verified yet; that is tracked in issue #10. The sandbox trust tests mock `_trusted_sandbox()` and check policy text, probe decisions, and the launch path; they are not evidence that macOS Seatbelt enforces the profile. On timeout or output overflow the engine kills the command's session, and on Linux also its remaining `/proc` children, but this cleanup is best effort: a process that calls `setsid` or is reparented can survive, especially on macOS, so it is not part of the containment guarantee.
-
-## Local verification
-`.venv/bin/python -m unittest discover -s tests -v`
+**Scope and honesty:** The 112 metrics are *registered*, not a guarantee that every metric can be measured on every repository. Missing data, unsupported platforms, or unapproved execution are surfaced in the report rather than presented as successful checks.
